@@ -44,6 +44,7 @@ use tempfile::TempDir;
 use tokio::{
     fs,
     io::{self, AsyncBufReadExt, BufReader},
+    time::{timeout, Duration},
 };
 use tracing::warn;
 use tracing::{debug, error, info};
@@ -900,7 +901,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             }
         }
         Cmd::SyncContacts => {
-            let mut manager = load_registered_and_receive(store).await?;
+            let mut manager = Manager::load_registered(store).await?;
             manager.request_contacts().await?;
 
             let messages = manager
@@ -911,11 +912,28 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
 
             println!("synchronizing messages until we get contacts (dots are messages synced from the past timeline)");
 
-            while let Some(content) = messages.next().await {
-                match content {
-                    Received::QueueEmpty => break,
-                    Received::Contacts => println!("got contacts! thank you, come again."),
-                    Received::Content(_) => print!("."),
+            let sync = async {
+                while let Some(content) = messages.next().await {
+                    match content {
+                        Received::QueueEmpty => {
+                            // Backlog is drained; keep the stream open and wait for the phone's
+                            // contacts response — it arrives after the queue is empty.
+                        }
+                        Received::Contacts => {
+                            println!("got contacts! thank you, come again.");
+                            return true;
+                        }
+                        Received::Content(_) => print!("."),
+                    }
+                }
+                false
+            };
+
+            match timeout(Duration::from_secs(30), sync).await {
+                Ok(true) => {}
+                Ok(false) => eprintln!("\nstream ended before contacts were received"),
+                Err(_) => {
+                    eprintln!("\ntimed out after 30s: primary device did not respond with contacts")
                 }
             }
         }
