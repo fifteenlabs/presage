@@ -2387,7 +2387,7 @@ dependencies = [
 [[package]]
 name = "libsignal-service"
 version = "0.1.0"
-source = "git+https://github.com/whisperfish/libsignal-service-rs?rev=7237603184943a6f436f2f2c9763122011856b1f#7237603184943a6f436f2f2c9763122011856b1f"
+source = "git+https://github.com/fifteenlabs/libsignal-service-rs?branch=fifteen#bed67a9b560d7d5915e2e4b8722014b512dc8d59"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2408,6 +2408,7 @@ dependencies = [
  "libsignal-net",
  "libsignal-net-infra",
  "libsignal-protocol",
+ "percent-encoding",
  "phonenumber",
  "prost",
  "prost-build",

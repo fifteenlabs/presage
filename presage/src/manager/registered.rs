@@ -577,6 +577,7 @@ impl<S: Store> Manager<S, Registered> {
             service_cipher_pni: ServiceCipher<PniStore>,
             groups_manager: GroupsManager<InMemoryCredentialsCache>,
             service_ids: ServiceIds,
+            device_id: DeviceId,
             message_sender: MessageSender<AciStore>,
             master_key: MasterKey,
         }
@@ -627,6 +628,7 @@ impl<S: Store> Manager<S, Registered> {
             service_cipher_pni: self.new_service_cipher_pni(),
             groups_manager: Box::pin(self.groups_manager()).await?,
             service_ids: self.state.data.service_ids.clone(),
+            device_id: self.state.device_id(),
             message_sender: self.new_message_sender().await?,
             master_key: self.master_key().await?,
         };
@@ -682,46 +684,56 @@ impl<S: Store> Manager<S, Registered> {
 
                                         match request.r#type() {
                                             RequestType::Contacts => {
-                                                let contacts = state
-                                                    .store
-                                                    .contacts()
-                                                    .await
-                                                    .map(|i| {
-                                                        i.collect::<Result<Vec<_>, _>>()
-                                                            .unwrap_or_default()
-                                                    })
-                                                    .unwrap_or_default();
+                                                // Ignore contacts requests that originated from
+                                                // our own device — these are echoes of the sync
+                                                // request we just sent to ourselves. Responding
+                                                // with our local (possibly empty) store would
+                                                // overwrite the real contacts on all devices.
+                                                if content.metadata.sender_device == state.device_id
+                                                {
+                                                    trace!("ignoring contacts request echoed from our own device");
+                                                } else {
+                                                    let contacts = state
+                                                        .store
+                                                        .contacts()
+                                                        .await
+                                                        .map(|i| {
+                                                            i.collect::<Result<Vec<_>, _>>()
+                                                                .unwrap_or_default()
+                                                        })
+                                                        .unwrap_or_default();
 
-                                                let mut message_sender =
-                                                    state.message_sender.clone();
-                                                let aci = state.service_ids.aci();
-                                                tokio::task::spawn_local(async move {
-                                                    let result = message_sender
-                                                    .send_contact_details(
-                                                        &ServiceId::Aci(aci),
-                                                        None,
-                                                        contacts.into_iter().map(|c| libsignal_service::sender::ContactDetails {
-                                                            number: c.phone_number.map(|p| p.to_string()),
-                                                            aci: Some(c.uuid.to_string()),
-                                                            aci_binary: Some(c.uuid.into_bytes().into()),
-                                                            name: Some(c.name),
-                                                            avatar: c.avatar.map(|a| libsignal_service::proto::contact_details::Avatar {
-                                                                content_type: Some(a.content_type),
-                                                                length: a.reader.len().try_into().ok(),
+                                                    let mut message_sender =
+                                                        state.message_sender.clone();
+                                                    let aci = state.service_ids.aci();
+                                                    tokio::task::spawn_local(async move {
+                                                        let result = message_sender
+                                                        .send_contact_details(
+                                                            &ServiceId::Aci(aci),
+                                                            None,
+                                                            contacts.into_iter().map(|c| libsignal_service::sender::ContactDetails {
+                                                                number: c.phone_number.map(|p| p.to_string()),
+                                                                aci: Some(c.uuid.to_string()),
+                                                                aci_binary: Some(c.uuid.into_bytes().into()),
+                                                                name: Some(c.name),
+                                                                avatar: c.avatar.map(|a| libsignal_service::proto::contact_details::Avatar {
+                                                                    content_type: Some(a.content_type),
+                                                                    length: a.reader.len().try_into().ok(),
+                                                                }),
+                                                                expire_timer: Some(c.expire_timer),
+                                                                expire_timer_version: Some(c.expire_timer_version),
+                                                                inbox_position: None,
                                                             }),
-                                                            expire_timer: Some(c.expire_timer),
-                                                            expire_timer_version: Some(c.expire_timer_version),
-                                                            inbox_position: None,
-                                                        }),
-                                                        false,
-                                                        true,
-                                                    )
-                                                    .await;
+                                                            false,
+                                                            true,
+                                                        )
+                                                        .await;
 
-                                                    if let Err(error) = result {
-                                                        warn!(%error, "Error sending contact details to other devices");
-                                                    }
-                                                });
+                                                        if let Err(error) = result {
+                                                            warn!(%error, "Error sending contact details to other devices");
+                                                        }
+                                                    });
+                                                }
                                             }
                                             RequestType::Keys => {
                                                 let mut message_sender =
@@ -773,14 +785,31 @@ impl<S: Store> Manager<S, Registered> {
                                         ..
                                     }) = &content.body
                                     {
+                                        debug!(
+                                            "received contacts sync: blob={}, complete={:?}",
+                                            contacts.blob.is_some(),
+                                            contacts.complete
+                                        );
                                         match state
                                             .message_receiver
                                             .retrieve_contacts(contacts)
                                             .await
                                         {
                                             Ok(contacts) => {
+                                                let contacts: Vec<_> = contacts
+                                                    .filter_map(|r| {
+                                                        r.map_err(|e| {
+                                                            warn!("failed to parse contact: {e}")
+                                                        })
+                                                        .ok()
+                                                    })
+                                                    .collect();
+                                                debug!(
+                                                    "contacts retrieved: {} contacts",
+                                                    contacts.len()
+                                                );
                                                 info!("saving contacts");
-                                                for contact in contacts.filter_map(Result::ok) {
+                                                for contact in contacts {
                                                     if let Err(error) = state
                                                         .store
                                                         .save_contact(&contact.into())
@@ -1865,7 +1894,8 @@ async fn upsert_contact_from_profile<S: Store>(
     sender: ServiceId,
     profile_key: ProfileKey,
 ) -> Result<(), Error<<S as Store>::Error>> {
-    if store.contact_by_id(&sender).await?.is_none()
+    let existing_contact = store.contact_by_id(&sender).await?;
+    if existing_contact.is_none()
         || store
             .profile_key(&sender)
             .await?
@@ -1881,7 +1911,7 @@ async fn upsert_contact_from_profile<S: Store>(
 
             let contact = Contact {
                 uuid: sender_uuid,
-                phone_number: None,
+                phone_number: existing_contact.and_then(|c| c.phone_number),
                 name: decrypted_profile
                     .name
                     // FIXME: this assumes [firstname] [lastname]
