@@ -33,10 +33,28 @@ pub struct SqlContact {
     pub expire_timer_version: i64,
     pub inbox_position: i64,
     pub avatar: Option<Vec<u8>>,
-
+    // from contacts_verification_state join
     pub destination_aci: Option<String>,
     pub identity_key: Option<Vec<u8>>,
     pub is_verified: Option<bool>,
+    // storage service fields
+    pub pni: Option<String>,
+    pub username: Option<String>,
+    pub blocked: bool,
+    pub whitelisted: bool,
+    pub archived: bool,
+    pub marked_unread: bool,
+    pub muted_until_timestamp: i64,
+    pub hide_story: bool,
+    pub hidden: bool,
+    pub unregistered_at_timestamp: i64,
+    pub pni_signature_verified: bool,
+    pub system_given_name: Option<String>,
+    pub system_family_name: Option<String>,
+    pub system_nickname: Option<String>,
+    pub nickname_given_name: Option<String>,
+    pub nickname_family_name: Option<String>,
+    pub note: Option<String>,
 }
 
 impl TryInto<Contact> for SqlContact {
@@ -76,10 +94,23 @@ impl TryInto<Contact> for SqlContact {
                 content_type: "application/octet-stream".to_owned(),
                 reader: Bytes::from(b),
             }),
-            blocked: false,
-            archived: false,
-            muted_until_timestamp: 0,
-            hidden: false,
+            pni: self.pni.and_then(|p| p.parse().ok()),
+            username: self.username,
+            blocked: self.blocked,
+            whitelisted: self.whitelisted,
+            archived: self.archived,
+            marked_unread: self.marked_unread,
+            muted_until_timestamp: self.muted_until_timestamp as u64,
+            hide_story: self.hide_story,
+            hidden: self.hidden,
+            unregistered_at_timestamp: self.unregistered_at_timestamp as u64,
+            pni_signature_verified: self.pni_signature_verified,
+            system_given_name: self.system_given_name.unwrap_or_default(),
+            system_family_name: self.system_family_name.unwrap_or_default(),
+            system_nickname: self.system_nickname.unwrap_or_default(),
+            nickname_given_name: self.nickname_given_name.unwrap_or_default(),
+            nickname_family_name: self.nickname_family_name.unwrap_or_default(),
+            note: self.note.unwrap_or_default(),
         })
     }
 }

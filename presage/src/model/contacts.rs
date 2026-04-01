@@ -30,13 +30,39 @@ pub struct Contact {
     pub avatar: Option<Attachment<Bytes>>,
     // storage service fields
     #[serde(default)]
+    pub pni: Option<Uuid>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
     pub blocked: bool,
+    #[serde(default)]
+    pub whitelisted: bool,
     #[serde(default)]
     pub archived: bool,
     #[serde(default)]
+    pub marked_unread: bool,
+    #[serde(default)]
     pub muted_until_timestamp: u64,
     #[serde(default)]
+    pub hide_story: bool,
+    #[serde(default)]
     pub hidden: bool,
+    #[serde(default)]
+    pub unregistered_at_timestamp: u64,
+    #[serde(default)]
+    pub pni_signature_verified: bool,
+    #[serde(default)]
+    pub system_given_name: String,
+    #[serde(default)]
+    pub system_family_name: String,
+    #[serde(default)]
+    pub system_nickname: String,
+    #[serde(default)]
+    pub nickname_given_name: String,
+    #[serde(default)]
+    pub nickname_family_name: String,
+    #[serde(default)]
+    pub note: String,
 }
 
 impl From<libsignal_service::models::Contact> for Contact {
@@ -51,10 +77,23 @@ impl From<libsignal_service::models::Contact> for Contact {
             expire_timer_version: c.expire_timer_version,
             inbox_position: c.inbox_position,
             avatar: c.avatar,
+            pni: None,
+            username: None,
             blocked: false,
+            whitelisted: false,
             archived: false,
+            marked_unread: false,
             muted_until_timestamp: 0,
+            hide_story: false,
             hidden: false,
+            unregistered_at_timestamp: 0,
+            pni_signature_verified: false,
+            system_given_name: String::new(),
+            system_family_name: String::new(),
+            system_nickname: String::new(),
+            nickname_given_name: String::new(),
+            nickname_family_name: String::new(),
+            note: String::new(),
         }
     }
 }
@@ -72,6 +111,18 @@ impl From<libsignal_service::proto::ContactRecord> for Contact {
         }
         .unwrap_or_else(Uuid::nil);
 
+        let pni = if !r.pni_binary.is_empty() {
+            r.pni_binary
+                .as_slice()
+                .try_into()
+                .ok()
+                .map(Uuid::from_bytes)
+        } else if !r.pni.is_empty() {
+            r.pni.parse().ok()
+        } else {
+            None
+        };
+
         let phone_number = r
             .e164
             .as_str()
@@ -79,27 +130,57 @@ impl From<libsignal_service::proto::ContactRecord> for Contact {
             .ok()
             .map(|e| phonenumber_from_signal(&e));
 
-        let name = match (r.given_name.is_empty(), r.family_name.is_empty()) {
-            (false, false) => format!("{} {}", r.given_name, r.family_name),
-            (false, true) => r.given_name,
-            (true, false) => r.family_name,
-            (true, true) => String::new(),
+        let name = libsignal_service::profile_name::ProfileName {
+            given_name: r.given_name,
+            family_name: if r.family_name.is_empty() {
+                None
+            } else {
+                Some(r.family_name)
+            },
+        }
+        .to_string();
+
+        let username = if r.username.is_empty() {
+            None
+        } else {
+            Some(r.username)
         };
 
         Self {
             uuid,
             phone_number,
             name,
-            verified: Default::default(),
+            verified: Verified::default(),
             profile_key: r.profile_key,
             expire_timer: 0,
             expire_timer_version: default_expire_timer_version(),
             inbox_position: 0,
             avatar: None,
+            pni,
+            username,
             blocked: r.blocked,
+            whitelisted: r.whitelisted,
             archived: r.archived,
+            marked_unread: r.marked_unread,
             muted_until_timestamp: r.muted_until_timestamp,
+            hide_story: r.hide_story,
             hidden: r.hidden,
+            unregistered_at_timestamp: r.unregistered_at_timestamp,
+            pni_signature_verified: r.pni_signature_verified,
+            system_given_name: r.system_given_name,
+            system_family_name: r.system_family_name,
+            system_nickname: r.system_nickname,
+            nickname_given_name: r
+                .nickname
+                .as_ref()
+                .map(|n| n.given.clone())
+                .unwrap_or_default(),
+            nickname_family_name: r
+                .nickname
+                .as_ref()
+                .map(|n| n.family.clone())
+                .unwrap_or_default(),
+            note: r.note,
         }
     }
 }

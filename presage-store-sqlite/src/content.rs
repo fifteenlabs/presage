@@ -296,12 +296,28 @@ impl ContentsStore for SqliteStore {
         let profile_key: &[u8] = contact.profile_key.as_ref();
         let avatar_bytes = contact.avatar.as_ref().map(|a| a.reader.to_vec());
         let phone_number = contact.phone_number.as_ref().map(|p| p.to_string());
+        let pni = contact.pni.map(|p| p.to_string());
+        let muted_until_timestamp = contact.muted_until_timestamp as i64;
+        let unregistered_at_timestamp = contact.unregistered_at_timestamp as i64;
 
         let mut tx = self.db.begin().await?;
 
         query!(
-            "INSERT OR REPLACE INTO contacts
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO contacts(
+                uuid, phone_number, name, profile_key,
+                expire_timer, expire_timer_version, inbox_position, avatar,
+                pni, username, blocked, whitelisted, archived, marked_unread,
+                muted_until_timestamp, hide_story, hidden, unregistered_at_timestamp,
+                pni_signature_verified, system_given_name, system_family_name,
+                system_nickname, nickname_given_name, nickname_family_name, note
+            ) VALUES(
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?, ?
+            )",
             contact.uuid,
             phone_number,
             contact.name,
@@ -310,6 +326,23 @@ impl ContentsStore for SqliteStore {
             contact.expire_timer_version,
             contact.inbox_position,
             avatar_bytes,
+            pni,
+            contact.username,
+            contact.blocked,
+            contact.whitelisted,
+            contact.archived,
+            contact.marked_unread,
+            muted_until_timestamp,
+            contact.hide_story,
+            contact.hidden,
+            unregistered_at_timestamp,
+            contact.pni_signature_verified,
+            contact.system_given_name,
+            contact.system_family_name,
+            contact.system_nickname,
+            contact.nickname_given_name,
+            contact.nickname_family_name,
+            contact.note,
         )
         .execute(&mut *tx)
         .await?;
@@ -360,7 +393,24 @@ impl ContentsStore for SqliteStore {
                 avatar,
                 destination_aci AS "destination_aci: _",
                 identity_key,
-                is_verified
+                is_verified,
+                pni,
+                username,
+                blocked,
+                whitelisted,
+                archived,
+                marked_unread,
+                muted_until_timestamp,
+                hide_story,
+                hidden,
+                unregistered_at_timestamp,
+                pni_signature_verified,
+                system_given_name,
+                system_family_name,
+                system_nickname,
+                nickname_given_name,
+                nickname_family_name,
+                note
             FROM contacts c
             LEFT JOIN contacts_verification_state cv ON c.uuid = cv.destination_aci
             ORDER BY c.inbox_position"#
@@ -388,7 +438,24 @@ impl ContentsStore for SqliteStore {
                 avatar,
                 destination_aci AS "destination_aci: _",
                 identity_key,
-                is_verified
+                is_verified,
+                pni,
+                username,
+                blocked,
+                whitelisted,
+                archived,
+                marked_unread,
+                muted_until_timestamp,
+                hide_story,
+                hidden,
+                unregistered_at_timestamp,
+                pni_signature_verified,
+                system_given_name,
+                system_family_name,
+                system_nickname,
+                nickname_given_name,
+                nickname_family_name,
+                note
             FROM contacts c
             LEFT JOIN contacts_verification_state cv ON c.uuid = cv.destination_aci
             WHERE c.uuid = ?"#,

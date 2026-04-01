@@ -1879,33 +1879,45 @@ async fn upsert_contact_from_profile<S: Store>(
             let profile_cipher = ProfileCipher::new(profile_key);
             let decrypted_profile = profile_cipher.decrypt(encrypted_profile).unwrap();
 
-            let contact = Contact {
+            let mut contact = existing_contact.unwrap_or(Contact {
                 uuid: sender_uuid,
-                phone_number: existing_contact.and_then(|c| c.phone_number),
-                name: decrypted_profile
-                    .name
-                    // FIXME: this assumes [firstname] [lastname]
-                    .map(|pn| {
-                        if let Some(family_name) = pn.family_name {
-                            format!("{} {}", pn.given_name, family_name)
-                        } else {
-                            pn.given_name
-                        }
-                    })
-                    .unwrap_or_default(),
-                profile_key: profile_key.bytes.to_vec(),
-                expire_timer: data_message.expire_timer.unwrap_or_default(),
-                expire_timer_version: data_message.expire_timer_version.unwrap_or(1),
+                phone_number: None,
+                name: String::new(),
+                verified: Verified::default(),
+                profile_key: Vec::new(),
+                expire_timer: 0,
+                expire_timer_version: 2,
                 inbox_position: 0,
                 avatar: None,
-                verified: Verified::default(),
+                pni: None,
+                username: None,
                 blocked: false,
+                whitelisted: false,
                 archived: false,
+                marked_unread: false,
                 muted_until_timestamp: 0,
+                hide_story: false,
                 hidden: false,
-            };
+                unregistered_at_timestamp: 0,
+                pni_signature_verified: false,
+                system_given_name: String::new(),
+                system_family_name: String::new(),
+                system_nickname: String::new(),
+                nickname_given_name: String::new(),
+                nickname_family_name: String::new(),
+                note: String::new(),
+            });
+
+            contact.name = decrypted_profile
+                .name
+                .map(|pn| pn.to_string())
+                .unwrap_or_default();
+            contact.profile_key = profile_key.bytes.to_vec();
+            contact.expire_timer = data_message.expire_timer.unwrap_or_default();
+            contact.expire_timer_version = data_message.expire_timer_version.unwrap_or(1);
 
             info!(%sender_uuid, "saved contact on first sight");
+
             store.save_contact(&contact).await?;
             store.upsert_profile_key(&sender_uuid, profile_key).await?;
         } else {
