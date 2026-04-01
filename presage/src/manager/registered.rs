@@ -10,6 +10,7 @@ use libsignal_service::{
     content::{Content, ContentBody, DataMessageFlags, Metadata},
     encrypt_device_name,
     groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
+    master_key::StorageServiceKey,
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
     prelude::{phonenumber::PhoneNumber, MasterKey, MessageSenderError, ProtobufMessage, Uuid},
     profile_cipher::ProfileCipher,
@@ -542,6 +543,7 @@ impl<S: Store> Manager<S, Registered> {
             device_id: DeviceId,
             message_sender: MessageSender<AciStore>,
             master_key: MasterKey,
+            push_service: PushService,
         }
 
         let identified_push_service = self.identified_push_service();
@@ -585,7 +587,7 @@ impl<S: Store> Manager<S, Registered> {
             identified_websocket,
             unidentified_websocket: self.unidentified_websocket().await?,
             encrypted_messages: Box::pin(encrypted_messages.stream()),
-            message_receiver: MessageReceiver::new(identified_push_service),
+            message_receiver: MessageReceiver::new(identified_push_service.clone()),
             service_cipher_aci: self.new_service_cipher_aci(),
             service_cipher_pni: self.new_service_cipher_pni(),
             groups_manager: Box::pin(self.groups_manager()).await?,
@@ -593,6 +595,7 @@ impl<S: Store> Manager<S, Registered> {
             device_id: self.state.device_id(),
             message_sender: self.new_message_sender().await?,
             master_key: self.master_key().await?,
+            push_service: identified_push_service,
         };
 
         debug!("starting to consume incoming message stream");
@@ -836,6 +839,60 @@ impl<S: Store> Manager<S, Registered> {
                                                     }
                                                 },
                                             }
+                                        }
+                                    }
+
+                                    // keys sync — update stored master key when primary device sends it
+                                    if let ContentBody::SynchronizeMessage(SyncMessage {
+                                        keys: Some(keys),
+                                        ..
+                                    }) = &content.body
+                                    {
+                                        if let Some(master_bytes) = &keys.master {
+                                            match MasterKey::from_slice(master_bytes) {
+                                                Ok(master_key) => {
+                                                    if let Err(e) = state
+                                                        .store
+                                                        .store_master_key(Some(&master_key))
+                                                        .await
+                                                    {
+                                                        warn!(%e, "failed to store updated master key");
+                                                    } else {
+                                                        state.master_key = master_key;
+                                                        debug!("updated master key from sync");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(?e, "received invalid master key in sync")
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // storage manifest fetch request — trigger a full storage sync
+                                    if let ContentBody::SynchronizeMessage(SyncMessage {
+                                        fetch_latest: Some(fetch_latest),
+                                        ..
+                                    }) = &content.body
+                                    {
+                                        use libsignal_service::content::sync_message::fetch_latest::Type as FetchType;
+                                        if fetch_latest.r#type() == FetchType::StorageManifest {
+                                            let mut store = state.store.clone();
+                                            let mut push_service = state.push_service.clone();
+                                            let storage_key = StorageServiceKey::from_master_key(
+                                                &state.master_key,
+                                            );
+                                            tokio::task::spawn_local(async move {
+                                                if let Err(e) = sync_storage_service(
+                                                    &mut store,
+                                                    &mut push_service,
+                                                    &storage_key,
+                                                )
+                                                .await
+                                                {
+                                                    warn!(%e, "storage service sync failed");
+                                                }
+                                            });
                                         }
                                     }
 
@@ -1492,6 +1549,12 @@ impl<S: Store> Manager<S, Registered> {
 
         Ok(account_manager.linked_devices(&aci_protocol_store).await?)
     }
+
+    pub async fn sync_storage_contacts(&mut self) -> Result<(), Error<S::Error>> {
+        let storage_key = StorageServiceKey::from_master_key(&self.master_key().await?);
+        let mut push_service = self.identified_push_service();
+        sync_storage_service(&mut self.store, &mut push_service, &storage_key).await
+    }
 }
 
 /// Set the timestamp in any DataMessage so it matches its envelope's
@@ -1836,6 +1899,10 @@ async fn upsert_contact_from_profile<S: Store>(
                 inbox_position: 0,
                 avatar: None,
                 verified: Verified::default(),
+                blocked: false,
+                archived: false,
+                muted_until_timestamp: 0,
+                hidden: false,
             };
 
             info!(%sender_uuid, "saved contact on first sight");
@@ -1904,5 +1971,107 @@ async fn register_pre_keys<S: Store>(
         .await?;
 
     trace!("registered pre keys");
+    Ok(())
+}
+
+async fn sync_storage_service<S: Store>(
+    store: &mut S,
+    push_service: &mut PushService,
+    storage_key: &StorageServiceKey,
+) -> Result<(), Error<S::Error>> {
+    use libsignal_service::{
+        proto::{manifest_record::identifier::Type as StorageType, ReadOperation},
+        push_service::storage::{decrypt_manifest, decrypt_storage_record},
+    };
+
+    debug!("storage sync: fetching credentials");
+    let credentials = push_service
+        .get_storage_credentials()
+        .await
+        .map_err(Error::ServiceError)?;
+    debug!(
+        "storage sync: got credentials username={}",
+        credentials.username
+    );
+
+    debug!("storage sync: fetching manifest");
+    let Some(manifest) = push_service
+        .get_storage_manifest(&credentials, None)
+        .await
+        .map_err(Error::ServiceError)?
+    else {
+        debug!("storage sync: manifest is empty, nothing to sync");
+        return Ok(());
+    };
+    debug!(version = manifest.version, "storage sync: got manifest");
+
+    let manifest_record = decrypt_manifest(&manifest, storage_key).map_err(Error::ServiceError)?;
+    debug!(
+        identifiers = manifest_record.identifiers.len(),
+        has_record_ikm = !manifest_record.record_ikm.is_empty(),
+        "storage sync: decrypted manifest"
+    );
+
+    let record_ikm: Option<Vec<u8>> = if manifest_record.record_ikm.is_empty() {
+        None
+    } else {
+        Some(manifest_record.record_ikm.clone())
+    };
+
+    let contact_keys: Vec<Vec<u8>> = manifest_record
+        .identifiers
+        .iter()
+        .filter(|id| id.r#type() == StorageType::Contact)
+        .map(|id| id.raw.clone())
+        .collect();
+    debug!(
+        count = contact_keys.len(),
+        "storage sync: contact keys in manifest"
+    );
+
+    if contact_keys.is_empty() {
+        debug!("storage sync: no contacts in manifest, done");
+        return Ok(());
+    }
+
+    debug!("storage sync: fetching storage records");
+    let items = push_service
+        .get_storage_records(
+            &credentials,
+            ReadOperation {
+                read_key: contact_keys,
+            },
+        )
+        .await
+        .map_err(Error::ServiceError)?;
+    debug!(count = items.len(), "storage sync: got storage items");
+
+    for item in &items {
+        let record = match decrypt_storage_record(item, storage_key, record_ikm.as_deref()) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(%e, "storage sync: failed to decrypt storage item, skipping");
+                continue;
+            }
+        };
+
+        match record.record {
+            Some(libsignal_service::proto::storage_record::Record::Contact(cr)) => {
+                debug!(aci = %cr.aci, name = %cr.given_name, "storage sync: saving contact");
+                let contact: Contact = cr.into();
+                if let Err(e) = store.save_contact(&contact).await {
+                    warn!(%e, "storage sync: failed to save contact");
+                }
+            }
+            Some(other) => {
+                debug!(?other, "storage sync: skipping non-contact record");
+            }
+            None => {
+                debug!("storage sync: empty record, skipping");
+            }
+        }
+    }
+
+    info!(count = items.len(), "storage service contact sync complete");
     Ok(())
 }

@@ -76,6 +76,10 @@ impl TryInto<Contact> for SqlContact {
                 content_type: "application/octet-stream".to_owned(),
                 reader: Bytes::from(b),
             }),
+            blocked: false,
+            archived: false,
+            muted_until_timestamp: 0,
+            hidden: false,
         })
     }
 }

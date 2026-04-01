@@ -3,7 +3,7 @@ use libsignal_service::{
     models::Attachment,
     prelude::{phonenumber::PhoneNumber, Uuid},
     proto::Verified,
-    utils::phonenumber_from_signal,
+    utils::{phonenumber_from_signal, TryIntoE164},
 };
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,15 @@ pub struct Contact {
     pub inbox_position: u32,
     #[serde(skip)]
     pub avatar: Option<Attachment<Bytes>>,
+    // storage service fields
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub muted_until_timestamp: u64,
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 impl From<libsignal_service::models::Contact> for Contact {
@@ -42,6 +51,55 @@ impl From<libsignal_service::models::Contact> for Contact {
             expire_timer_version: c.expire_timer_version,
             inbox_position: c.inbox_position,
             avatar: c.avatar,
+            blocked: false,
+            archived: false,
+            muted_until_timestamp: 0,
+            hidden: false,
+        }
+    }
+}
+
+impl From<libsignal_service::proto::ContactRecord> for Contact {
+    fn from(r: libsignal_service::proto::ContactRecord) -> Self {
+        let uuid = if !r.aci_binary.is_empty() {
+            r.aci_binary
+                .as_slice()
+                .try_into()
+                .ok()
+                .map(Uuid::from_bytes)
+        } else {
+            r.aci.parse().ok()
+        }
+        .unwrap_or_else(Uuid::nil);
+
+        let phone_number = r
+            .e164
+            .as_str()
+            .try_into_e164()
+            .ok()
+            .map(|e| phonenumber_from_signal(&e));
+
+        let name = match (r.given_name.is_empty(), r.family_name.is_empty()) {
+            (false, false) => format!("{} {}", r.given_name, r.family_name),
+            (false, true) => r.given_name,
+            (true, false) => r.family_name,
+            (true, true) => String::new(),
+        };
+
+        Self {
+            uuid,
+            phone_number,
+            name,
+            verified: Default::default(),
+            profile_key: r.profile_key,
+            expire_timer: 0,
+            expire_timer_version: default_expire_timer_version(),
+            inbox_position: 0,
+            avatar: None,
+            blocked: r.blocked,
+            archived: r.archived,
+            muted_until_timestamp: r.muted_until_timestamp,
+            hidden: r.hidden,
         }
     }
 }

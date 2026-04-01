@@ -143,6 +143,8 @@ enum Cmd {
         )]
         stop_after_empty_queue: bool,
     },
+    #[clap(about = "Sync contacts from Signal's storage service")]
+    SyncStorageService,
     #[clap(about = "List groups")]
     ListGroups {
         /// Name filter to only list groups which name contains this string
@@ -685,6 +687,11 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
         } => {
             let manager = Manager::load_registered(store).await?;
             receive(manager, notifications, stop_after_empty_queue).await?;
+        }
+        Cmd::SyncStorageService => {
+            let mut manager = Manager::load_registered(store).await?;
+            manager.sync_storage_contacts().await?;
+            println!("storage service sync complete");
         }
         Cmd::AddDevice { url } => {
             let mut manager = load_registered_and_receive(store).await?;
