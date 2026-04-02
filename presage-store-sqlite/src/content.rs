@@ -487,7 +487,14 @@ impl ContentsStore for SqliteStore {
         let g = SqlGroup::from_group(&master_key, group.into());
         let master_key = g.master_key.as_ref();
         query!(
-            "INSERT OR REPLACE INTO groups VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            r#"INSERT OR REPLACE INTO groups (
+                master_key, title, revision, invite_link_password,
+                access_control, avatar, description,
+                members, pending_members, requesting_members,
+                needs_hydration, blocked, whitelisted, archived, marked_unread,
+                muted_until_timestamp, dont_notify_for_mentions_if_muted,
+                hide_story, story_send_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             master_key,
             g.title,
             g.revision,
@@ -498,6 +505,15 @@ impl ContentsStore for SqliteStore {
             g.members,
             g.pending_members,
             g.requesting_members,
+            g.needs_hydration,
+            g.blocked,
+            g.whitelisted,
+            g.archived,
+            g.marked_unread,
+            g.muted_until_timestamp,
+            g.dont_notify_for_mentions_if_muted,
+            g.hide_story,
+            g.story_send_mode,
         )
         .execute(&self.db)
         .await?;
@@ -517,7 +533,13 @@ impl ContentsStore for SqliteStore {
                 description,
                 members AS "members: _",
                 pending_members AS "pending_members: _",
-                requesting_members AS "requesting_members: _"
+                requesting_members AS "requesting_members: _",
+                needs_hydration,
+                blocked, whitelisted, archived, marked_unread,
+                muted_until_timestamp,
+                dont_notify_for_mentions_if_muted,
+                hide_story,
+                story_send_mode
             FROM groups"#,
         )
         .fetch_all(&self.db)
@@ -542,7 +564,13 @@ impl ContentsStore for SqliteStore {
                 description,
                 members AS "members: _",
                 pending_members AS "pending_members: _",
-                requesting_members AS "requesting_members: _"
+                requesting_members AS "requesting_members: _",
+                needs_hydration,
+                blocked, whitelisted, archived, marked_unread,
+                muted_until_timestamp,
+                dont_notify_for_mentions_if_muted,
+                hide_story,
+                story_send_mode
             FROM groups
             WHERE master_key = ?
             LIMIT 1"#,

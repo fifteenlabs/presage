@@ -143,8 +143,10 @@ enum Cmd {
         )]
         stop_after_empty_queue: bool,
     },
-    #[clap(about = "Sync contacts from Signal's storage service")]
+    #[clap(about = "Sync contacts and groups from Signal's storage service")]
     SyncStorageService,
+    #[clap(about = "Fetch full group state for stubs created by storage service sync")]
+    HydrateGroups,
     #[clap(about = "List groups")]
     ListGroups {
         /// Name filter to only list groups which name contains this string
@@ -470,7 +472,7 @@ async fn print_message<S: Store>(
             .await
             .ok()
             .flatten()
-            .map(|g| g.title)
+            .map(|g| g.title.unwrap_or_else(|| "<no title>".to_string()))
             .unwrap_or_else(|| "<missing group>".to_string())
     }
 
@@ -690,8 +692,13 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
         }
         Cmd::SyncStorageService => {
             let mut manager = Manager::load_registered(store).await?;
-            manager.sync_storage_contacts().await?;
+            manager.sync_storage_service().await?;
             println!("storage service sync complete");
+        }
+        Cmd::HydrateGroups => {
+            let mut manager = Manager::load_registered(store).await?;
+            manager.hydrate_groups().await?;
+            println!("group hydration complete");
         }
         Cmd::AddDevice { url } => {
             let mut manager = load_registered_and_receive(store).await?;
@@ -808,11 +815,12 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                         },
                     )) => {
                         if let Some(name_filter) = name_filter.as_ref() {
-                            if !title.contains(name_filter) {
+                            if !title.as_deref().is_some_and(|t| t.contains(name_filter)) {
                                 continue;
                             }
                         }
                         let key = hex::encode(group_master_key);
+                        let title = title.as_deref().unwrap_or("<not yet fetched>");
                         if verbose {
                             println!("{key} (revision {revision})");
                             println!("\tTitle: {title}");

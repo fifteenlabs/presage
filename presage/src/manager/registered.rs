@@ -440,13 +440,13 @@ impl<S: Store> Manager<S, Registered> {
         };
 
         // Empty path means no avatar was set.
-        if group.avatar.is_empty() {
+        let Some(avatar_path) = group.avatar.as_deref().filter(|s| !s.is_empty()) else {
             return Ok(None);
-        }
+        };
 
         let avatar = gm
             .retrieve_avatar(
-                &group.avatar,
+                avatar_path,
                 GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key_bytes)),
             )
             .await?;
@@ -1480,7 +1480,7 @@ impl<S: Store> Manager<S, Registered> {
                 })
             }
             Thread::Group(id) => match self.store.group(*id).await? {
-                Some(group) => Ok(group.title),
+                Some(group) => Ok(group.title.unwrap_or_default()),
                 None => Ok("".to_string()),
             },
         }
@@ -1550,10 +1550,31 @@ impl<S: Store> Manager<S, Registered> {
         Ok(account_manager.linked_devices(&aci_protocol_store).await?)
     }
 
-    pub async fn sync_storage_contacts(&mut self) -> Result<(), Error<S::Error>> {
+    pub async fn sync_storage_service(&mut self) -> Result<(), Error<S::Error>> {
         let storage_key = StorageServiceKey::from_master_key(&self.master_key().await?);
         let mut push_service = self.identified_push_service();
         sync_storage_service(&mut self.store, &mut push_service, &storage_key).await
+    }
+
+    pub async fn hydrate_groups(&mut self) -> Result<(), Error<S::Error>> {
+        let stubs: Vec<libsignal_service::zkgroup::GroupMasterKeyBytes> = self
+            .store
+            .groups()
+            .await?
+            .filter_map(|r| r.ok())
+            .filter(|(_, g)| g.needs_hydration)
+            .map(|(mk, _)| mk)
+            .collect();
+
+        info!(count = stubs.len(), "hydrating groups");
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+
+        for master_key in stubs {
+            if let Err(e) = hydrate_group(&mut self.store, &mut groups_manager, master_key).await {
+                warn!(%e, "failed to hydrate group, continuing");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1591,7 +1612,7 @@ async fn upsert_group<S: Store>(
 ) -> Result<Option<Group>, Error<S::Error>> {
     let upsert_group = match store.group(master_key_bytes.try_into()?).await {
         Ok(Some(group)) => {
-            debug!(group_name =% group.title, "loaded group from local db");
+            debug!(group_name =? group.title, "loaded group from local db");
             group.revision < *revision
         }
         Ok(None) => true,
@@ -1620,6 +1641,29 @@ async fn upsert_group<S: Store>(
     }
 
     Ok(store.group(master_key_bytes.try_into()?).await?)
+}
+
+async fn hydrate_group<S: Store>(
+    store: &mut S,
+    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    master_key: libsignal_service::zkgroup::GroupMasterKeyBytes,
+) -> Result<(), Error<S::Error>> {
+    match groups_manager
+        .fetch_encrypted_group(&mut rand::rng(), master_key.as_ref())
+        .await
+    {
+        Ok(encrypted_group) => {
+            let mut group: Group = decrypt_group(master_key.as_ref(), encrypted_group)?.into();
+            group.needs_hydration = false;
+            if let Err(e) = store.save_group(master_key, group).await {
+                error!(%e, "hydrate_group: failed to save group");
+            }
+        }
+        Err(e) => {
+            warn!(%e, "hydrate_group: failed to fetch from group server, skipping");
+        }
+    }
+    Ok(())
 }
 
 /// Download and decrypt a sticker manifest
@@ -2030,30 +2074,33 @@ async fn sync_storage_service<S: Store>(
         Some(manifest_record.record_ikm.clone())
     };
 
-    let contact_keys: Vec<Vec<u8>> = manifest_record
-        .identifiers
-        .iter()
-        .filter(|id| id.r#type() == StorageType::Contact)
-        .map(|id| id.raw.clone())
-        .collect();
+    let mut contact_keys: Vec<Vec<u8>> = Vec::new();
+    let mut group_keys: Vec<Vec<u8>> = Vec::new();
+    for id in &manifest_record.identifiers {
+        match id.r#type() {
+            StorageType::Contact => contact_keys.push(id.raw.clone()),
+            StorageType::Groupv2 => group_keys.push(id.raw.clone()),
+            _ => {}
+        }
+    }
     debug!(
         count = contact_keys.len(),
         "storage sync: contact keys in manifest"
     );
+    debug!(
+        count = group_keys.len(),
+        "storage sync: group keys in manifest"
+    );
 
-    if contact_keys.is_empty() {
-        debug!("storage sync: no contacts in manifest, done");
+    if contact_keys.is_empty() && group_keys.is_empty() {
+        debug!("storage sync: nothing to sync");
         return Ok(());
     }
 
+    let all_keys: Vec<Vec<u8>> = contact_keys.into_iter().chain(group_keys).collect();
     debug!("storage sync: fetching storage records");
     let items = push_service
-        .get_storage_records(
-            &credentials,
-            ReadOperation {
-                read_key: contact_keys,
-            },
-        )
+        .get_storage_records(&credentials, ReadOperation { read_key: all_keys })
         .await
         .map_err(Error::ServiceError)?;
     debug!(count = items.len(), "storage sync: got storage items");
@@ -2075,8 +2122,50 @@ async fn sync_storage_service<S: Store>(
                     warn!(%e, "storage sync: failed to save contact");
                 }
             }
+            Some(libsignal_service::proto::storage_record::Record::GroupV2(gr)) => {
+                let master_key: libsignal_service::zkgroup::GroupMasterKeyBytes =
+                    match gr.master_key.as_slice().try_into() {
+                        Ok(mk) => mk,
+                        Err(_) => {
+                            warn!("storage sync: invalid group master key length, skipping");
+                            continue;
+                        }
+                    };
+                match store.group(master_key).await {
+                    Ok(Some(_)) => {
+                        debug!("storage sync: group already known, skipping");
+                    }
+                    _ => {
+                        debug!("storage sync: saving group stub");
+                        let stub = Group {
+                            title: None,
+                            avatar: None,
+                            disappearing_messages_timer: None,
+                            access_control: None,
+                            revision: 0,
+                            members: Vec::new(),
+                            pending_members: Vec::new(),
+                            requesting_members: Vec::new(),
+                            invite_link_password: Vec::new(),
+                            description: None,
+                            needs_hydration: true,
+                            blocked: gr.blocked,
+                            whitelisted: gr.whitelisted,
+                            archived: gr.archived,
+                            marked_unread: gr.marked_unread,
+                            muted_until_timestamp: gr.muted_until_timestamp,
+                            dont_notify_for_mentions_if_muted: gr.dont_notify_for_mentions_if_muted,
+                            hide_story: gr.hide_story,
+                            story_send_mode: gr.story_send_mode,
+                        };
+                        if let Err(e) = store.save_group(master_key, stub).await {
+                            warn!(%e, "storage sync: failed to save group stub");
+                        }
+                    }
+                }
+            }
             Some(other) => {
-                debug!(?other, "storage sync: skipping non-contact record");
+                debug!(?other, "storage sync: skipping non-contact/group record");
             }
             None => {
                 debug!("storage sync: empty record, skipping");
@@ -2084,6 +2173,6 @@ async fn sync_storage_service<S: Store>(
         }
     }
 
-    info!(count = items.len(), "storage service contact sync complete");
+    info!(count = items.len(), "storage service sync complete");
     Ok(())
 }

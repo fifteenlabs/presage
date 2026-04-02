@@ -152,15 +152,24 @@ impl From<SqlProfile> for Profile {
 #[derive(Debug)]
 pub(crate) struct SqlGroup<'a> {
     pub(crate) master_key: Cow<'a, [u8]>,
-    pub(crate) title: String,
+    pub(crate) title: Option<String>,
     pub(crate) revision: u32,
     pub(crate) invite_link_password: Option<Vec<u8>>,
     pub(crate) access_control: Option<Json<AccessControl>>,
-    pub(crate) avatar: String,
+    pub(crate) avatar: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) members: Json<Vec<Member>>,
     pub(crate) pending_members: Json<Vec<PendingMember>>,
     pub(crate) requesting_members: Json<Vec<RequestingMember>>,
+    pub(crate) needs_hydration: bool,
+    pub(crate) blocked: bool,
+    pub(crate) whitelisted: bool,
+    pub(crate) archived: bool,
+    pub(crate) marked_unread: bool,
+    pub(crate) muted_until_timestamp: i64,
+    pub(crate) dont_notify_for_mentions_if_muted: bool,
+    pub(crate) hide_story: bool,
+    pub(crate) story_send_mode: i64,
 }
 
 impl SqlGroup<'_> {
@@ -177,6 +186,15 @@ impl SqlGroup<'_> {
             members: Json(group.members),
             pending_members: Json(group.pending_members),
             requesting_members: Json(group.requesting_members),
+            needs_hydration: group.needs_hydration,
+            blocked: group.blocked,
+            whitelisted: group.whitelisted,
+            archived: group.archived,
+            marked_unread: group.marked_unread,
+            muted_until_timestamp: group.muted_until_timestamp as i64,
+            dont_notify_for_mentions_if_muted: group.dont_notify_for_mentions_if_muted,
+            hide_story: group.hide_story,
+            story_send_mode: group.story_send_mode as i64,
         }
     }
 
@@ -193,6 +211,15 @@ impl SqlGroup<'_> {
             members: Json(members),
             pending_members: Json(pending_members),
             requesting_members: Json(requesting_members),
+            needs_hydration,
+            blocked,
+            whitelisted,
+            archived,
+            marked_unread,
+            muted_until_timestamp,
+            dont_notify_for_mentions_if_muted,
+            hide_story,
+            story_send_mode,
         } = self;
         let master_key = master_key
             .as_ref()
@@ -210,6 +237,15 @@ impl SqlGroup<'_> {
             requesting_members,
             invite_link_password: invite_link_password.unwrap_or_default(),
             description,
+            needs_hydration,
+            blocked,
+            whitelisted,
+            archived,
+            marked_unread,
+            muted_until_timestamp: muted_until_timestamp as u64,
+            dont_notify_for_mentions_if_muted,
+            hide_story,
+            story_send_mode: story_send_mode as i32,
         };
         Ok((master_key, group))
     }
