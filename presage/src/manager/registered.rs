@@ -1561,7 +1561,10 @@ impl<S: Store> Manager<S, Registered> {
             .store
             .groups()
             .await?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| {
+                r.map_err(|e| warn!(%e, "failed to load group, skipping"))
+                    .ok()
+            })
             .filter(|(_, g)| g.needs_hydration)
             .map(|(mk, _)| mk)
             .collect();
@@ -2037,7 +2040,7 @@ async fn sync_storage_service<S: Store>(
 ) -> Result<(), Error<S::Error>> {
     use libsignal_service::{
         proto::{manifest_record::identifier::Type as StorageType, ReadOperation},
-        push_service::storage::{decrypt_manifest, decrypt_storage_record},
+        push_service::{decrypt_manifest, decrypt_storage_record},
     };
 
     debug!("storage sync: fetching credentials");
@@ -2097,6 +2100,8 @@ async fn sync_storage_service<S: Store>(
         return Ok(());
     }
 
+    // TODO: batch requests in chunks (~1000 keys) to avoid hitting request size limits
+    // for accounts with large contact/group lists, matching Signal clients' behaviour.
     let all_keys: Vec<Vec<u8>> = contact_keys.into_iter().chain(group_keys).collect();
     debug!("storage sync: fetching storage records");
     let items = push_service
@@ -2117,7 +2122,23 @@ async fn sync_storage_service<S: Store>(
         match record.record {
             Some(libsignal_service::proto::storage_record::Record::Contact(cr)) => {
                 debug!(aci = %cr.aci, name = %cr.given_name, "storage sync: saving contact");
-                let contact: Contact = cr.into();
+                let mut contact: Contact = match Contact::try_from(cr) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("storage sync: skipping contact record: {e}");
+                        continue;
+                    }
+                };
+
+                // Preserve locally-derived fields not present in ContactRecord
+                let service_id = ServiceId::Aci(Aci::from(contact.uuid));
+                if let Ok(Some(existing)) = store.contact_by_id(&service_id).await {
+                    contact.expire_timer = existing.expire_timer;
+                    contact.expire_timer_version = existing.expire_timer_version;
+                    contact.inbox_position = existing.inbox_position;
+                    contact.avatar = existing.avatar;
+                    contact.verified = existing.verified;
+                }
                 if let Err(e) = store.save_contact(&contact).await {
                     warn!(%e, "storage sync: failed to save contact");
                 }
@@ -2131,13 +2152,23 @@ async fn sync_storage_service<S: Store>(
                             continue;
                         }
                     };
-                match store.group(master_key).await {
-                    Ok(Some(_)) => {
-                        debug!("storage sync: group already known, skipping");
+                let group = match store.group(master_key).await {
+                    Ok(Some(mut existing)) => {
+                        // Preserve locally-derived fields; update storage-service-owned fields
+                        existing.blocked = gr.blocked;
+                        existing.whitelisted = gr.whitelisted;
+                        existing.archived = gr.archived;
+                        existing.marked_unread = gr.marked_unread;
+                        existing.muted_until_timestamp = gr.muted_until_timestamp;
+                        existing.dont_notify_for_mentions_if_muted =
+                            gr.dont_notify_for_mentions_if_muted;
+                        existing.hide_story = gr.hide_story;
+                        existing.story_send_mode = gr.story_send_mode.into();
+                        existing
                     }
                     _ => {
                         debug!("storage sync: saving group stub");
-                        let stub = Group {
+                        Group {
                             title: None,
                             avatar: None,
                             disappearing_messages_timer: None,
@@ -2156,12 +2187,12 @@ async fn sync_storage_service<S: Store>(
                             muted_until_timestamp: gr.muted_until_timestamp,
                             dont_notify_for_mentions_if_muted: gr.dont_notify_for_mentions_if_muted,
                             hide_story: gr.hide_story,
-                            story_send_mode: gr.story_send_mode,
-                        };
-                        if let Err(e) = store.save_group(master_key, stub).await {
-                            warn!(%e, "storage sync: failed to save group stub");
+                            story_send_mode: gr.story_send_mode.into(),
                         }
                     }
+                };
+                if let Err(e) = store.save_group(master_key, group).await {
+                    warn!(%e, "storage sync: failed to save group");
                 }
             }
             Some(other) => {

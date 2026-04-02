@@ -6,6 +6,7 @@ use libsignal_service::{
     utils::{phonenumber_from_signal, TryIntoE164},
 };
 use serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
 
 const fn default_expire_timer_version() -> u32 {
     2
@@ -98,8 +99,10 @@ impl From<libsignal_service::models::Contact> for Contact {
     }
 }
 
-impl From<libsignal_service::proto::ContactRecord> for Contact {
-    fn from(r: libsignal_service::proto::ContactRecord) -> Self {
+impl TryFrom<libsignal_service::proto::ContactRecord> for Contact {
+    type Error = &'static str;
+
+    fn try_from(r: libsignal_service::proto::ContactRecord) -> Result<Self, Self::Error> {
         let uuid = if !r.aci_binary.is_empty() {
             r.aci_binary
                 .as_slice()
@@ -109,7 +112,7 @@ impl From<libsignal_service::proto::ContactRecord> for Contact {
         } else {
             r.aci.parse().ok()
         }
-        .unwrap_or_else(Uuid::nil);
+        .ok_or("missing or invalid ACI")?;
 
         let pni = if !r.pni_binary.is_empty() {
             r.pni_binary
@@ -146,7 +149,7 @@ impl From<libsignal_service::proto::ContactRecord> for Contact {
             Some(r.username)
         };
 
-        Self {
+        Ok(Self {
             uuid,
             phone_number,
             name,
@@ -181,6 +184,6 @@ impl From<libsignal_service::proto::ContactRecord> for Contact {
                 .map(|n| n.family.clone())
                 .unwrap_or_default(),
             note: r.note,
-        }
+        })
     }
 }

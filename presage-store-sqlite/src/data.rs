@@ -94,7 +94,11 @@ impl TryInto<Contact> for SqlContact {
                 content_type: "application/octet-stream".to_owned(),
                 reader: Bytes::from(b),
             }),
-            pni: self.pni.and_then(|p| p.parse().ok()),
+            pni: self.pni.and_then(|p| {
+                p.parse()
+                    .map_err(|e| tracing::warn!("failed to parse stored PNI {p:?}: {e}"))
+                    .ok()
+            }),
             username: self.username,
             blocked: self.blocked,
             whitelisted: self.whitelisted,
@@ -194,7 +198,7 @@ impl SqlGroup<'_> {
             muted_until_timestamp: group.muted_until_timestamp as i64,
             dont_notify_for_mentions_if_muted: group.dont_notify_for_mentions_if_muted,
             hide_story: group.hide_story,
-            story_send_mode: group.story_send_mode as i64,
+            story_send_mode: group.story_send_mode,
         }
     }
 
@@ -245,7 +249,7 @@ impl SqlGroup<'_> {
             muted_until_timestamp: muted_until_timestamp as u64,
             dont_notify_for_mentions_if_muted,
             hide_story,
-            story_send_mode: story_send_mode as i32,
+            story_send_mode,
         };
         Ok((master_key, group))
     }

@@ -38,7 +38,7 @@ pub struct Group {
     #[serde(default)]
     pub hide_story: bool,
     #[serde(default)]
-    pub story_send_mode: i32, // 0=Default, 1=Disabled, 2=Enabled
+    pub story_send_mode: i64, // 0=Default, 1=Disabled, 2=Enabled
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
