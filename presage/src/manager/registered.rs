@@ -2057,16 +2057,23 @@ async fn sync_storage_service<S: Store>(
         credentials.username
     );
 
-    debug!("storage sync: fetching manifest");
+    let local_version = store.fetch_storage_manifest_version().await?;
+    debug!(local_version, "storage sync: fetching manifest");
     let Some(manifest) = push_service
-        .get_storage_manifest(&credentials, None)
+        .get_storage_manifest(&credentials, Some(local_version))
         .await
         .map_err(Error::ServiceError)?
     else {
-        debug!("storage sync: manifest is empty, nothing to sync");
+        debug!(
+            local_version,
+            "storage sync: server version unchanged (204), skipping"
+        );
         return Ok(());
     };
-    debug!(version = manifest.version, "storage sync: got manifest");
+    debug!(
+        version = manifest.version,
+        local_version, "storage sync: got manifest"
+    );
 
     let manifest_record = decrypt_manifest(&manifest, storage_key).map_err(Error::ServiceError)?;
     debug!(
@@ -2223,6 +2230,13 @@ async fn sync_storage_service<S: Store>(
         }
     }
 
-    info!(count = total_processed, "storage service sync complete");
+    store
+        .store_storage_manifest_version(manifest.version)
+        .await?;
+    info!(
+        count = total_processed,
+        version = manifest.version,
+        "storage service sync complete"
+    );
     Ok(())
 }
