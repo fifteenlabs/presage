@@ -2033,6 +2033,10 @@ async fn register_pre_keys<S: Store>(
     Ok(())
 }
 
+/// Maximum number of storage-service keys to request in a single `ReadOperation`.
+/// Signal Desktop uses 2500; the server's hard limit is ~5120.
+const STORAGE_SERVICE_BATCH_SIZE: usize = 2500;
+
 async fn sync_storage_service<S: Store>(
     store: &mut S,
     push_service: &mut PushService,
@@ -2100,110 +2104,125 @@ async fn sync_storage_service<S: Store>(
         return Ok(());
     }
 
-    // TODO: batch requests in chunks (~1000 keys) to avoid hitting request size limits
-    // for accounts with large contact/group lists, matching Signal clients' behaviour.
     let all_keys: Vec<Vec<u8>> = contact_keys.into_iter().chain(group_keys).collect();
-    debug!("storage sync: fetching storage records");
-    let items = push_service
-        .get_storage_records(&credentials, ReadOperation { read_key: all_keys })
-        .await
-        .map_err(Error::ServiceError)?;
-    debug!(count = items.len(), "storage sync: got storage items");
+    let total = all_keys.len();
+    debug!(total, "storage sync: fetching storage records in batches");
 
-    for item in &items {
-        let record = match decrypt_storage_record(item, storage_key, record_ikm.as_deref()) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(%e, "storage sync: failed to decrypt storage item, skipping");
-                continue;
-            }
-        };
+    let mut total_processed = 0usize;
+    for (i, batch) in all_keys.chunks(STORAGE_SERVICE_BATCH_SIZE).enumerate() {
+        debug!(
+            batch = i,
+            size = batch.len(),
+            "storage sync: fetching batch"
+        );
+        let items = push_service
+            .get_storage_records(
+                &credentials,
+                ReadOperation {
+                    read_key: batch.to_vec(),
+                },
+            )
+            .await
+            .map_err(Error::ServiceError)?;
+        debug!(count = items.len(), "storage sync: got storage items");
+        total_processed += items.len();
 
-        match record.record {
-            Some(libsignal_service::proto::storage_record::Record::Contact(cr)) => {
-                debug!(aci = %cr.aci, name = %cr.given_name, "storage sync: saving contact");
-                let mut contact: Contact = match Contact::try_from(cr) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!("storage sync: skipping contact record: {e}");
-                        continue;
-                    }
-                };
-
-                // Preserve locally-derived fields not present in ContactRecord
-                let service_id = ServiceId::Aci(Aci::from(contact.uuid));
-                if let Ok(Some(existing)) = store.contact_by_id(&service_id).await {
-                    contact.expire_timer = existing.expire_timer;
-                    contact.expire_timer_version = existing.expire_timer_version;
-                    contact.inbox_position = existing.inbox_position;
-                    contact.avatar = existing.avatar;
-                    contact.verified = existing.verified;
+        for item in &items {
+            let record = match decrypt_storage_record(item, storage_key, record_ikm.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(%e, "storage sync: failed to decrypt storage item, skipping");
+                    continue;
                 }
-                if let Err(e) = store.save_contact(&contact).await {
-                    warn!(%e, "storage sync: failed to save contact");
-                }
-            }
-            Some(libsignal_service::proto::storage_record::Record::GroupV2(gr)) => {
-                let master_key: libsignal_service::zkgroup::GroupMasterKeyBytes =
-                    match gr.master_key.as_slice().try_into() {
-                        Ok(mk) => mk,
-                        Err(_) => {
-                            warn!("storage sync: invalid group master key length, skipping");
+            };
+
+            match record.record {
+                Some(libsignal_service::proto::storage_record::Record::Contact(cr)) => {
+                    debug!(aci = %cr.aci, name = %cr.given_name, "storage sync: saving contact");
+                    let mut contact: Contact = match Contact::try_from(cr) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("storage sync: skipping contact record: {e}");
                             continue;
                         }
                     };
-                let group = match store.group(master_key).await {
-                    Ok(Some(mut existing)) => {
-                        // Preserve locally-derived fields; update storage-service-owned fields
-                        existing.blocked = gr.blocked;
-                        existing.whitelisted = gr.whitelisted;
-                        existing.archived = gr.archived;
-                        existing.marked_unread = gr.marked_unread;
-                        existing.muted_until_timestamp = gr.muted_until_timestamp;
-                        existing.dont_notify_for_mentions_if_muted =
-                            gr.dont_notify_for_mentions_if_muted;
-                        existing.hide_story = gr.hide_story;
-                        existing.story_send_mode = gr.story_send_mode.into();
-                        existing
+
+                    // Preserve locally-derived fields not present in ContactRecord
+                    let service_id = ServiceId::Aci(Aci::from(contact.uuid));
+                    if let Ok(Some(existing)) = store.contact_by_id(&service_id).await {
+                        contact.expire_timer = existing.expire_timer;
+                        contact.expire_timer_version = existing.expire_timer_version;
+                        contact.inbox_position = existing.inbox_position;
+                        contact.avatar = existing.avatar;
+                        contact.verified = existing.verified;
                     }
-                    _ => {
-                        debug!("storage sync: saving group stub");
-                        Group {
-                            title: None,
-                            avatar: None,
-                            disappearing_messages_timer: None,
-                            access_control: None,
-                            revision: 0,
-                            members: Vec::new(),
-                            pending_members: Vec::new(),
-                            requesting_members: Vec::new(),
-                            invite_link_password: Vec::new(),
-                            description: None,
-                            needs_hydration: true,
-                            blocked: gr.blocked,
-                            whitelisted: gr.whitelisted,
-                            archived: gr.archived,
-                            marked_unread: gr.marked_unread,
-                            muted_until_timestamp: gr.muted_until_timestamp,
-                            dont_notify_for_mentions_if_muted: gr.dont_notify_for_mentions_if_muted,
-                            hide_story: gr.hide_story,
-                            story_send_mode: gr.story_send_mode.into(),
-                        }
+                    if let Err(e) = store.save_contact(&contact).await {
+                        warn!(%e, "storage sync: failed to save contact");
                     }
-                };
-                if let Err(e) = store.save_group(master_key, group).await {
-                    warn!(%e, "storage sync: failed to save group");
                 }
-            }
-            Some(other) => {
-                debug!(?other, "storage sync: skipping non-contact/group record");
-            }
-            None => {
-                debug!("storage sync: empty record, skipping");
+                Some(libsignal_service::proto::storage_record::Record::GroupV2(gr)) => {
+                    let master_key: libsignal_service::zkgroup::GroupMasterKeyBytes =
+                        match gr.master_key.as_slice().try_into() {
+                            Ok(mk) => mk,
+                            Err(_) => {
+                                warn!("storage sync: invalid group master key length, skipping");
+                                continue;
+                            }
+                        };
+                    let group = match store.group(master_key).await {
+                        Ok(Some(mut existing)) => {
+                            // Preserve locally-derived fields; update storage-service-owned fields
+                            existing.blocked = gr.blocked;
+                            existing.whitelisted = gr.whitelisted;
+                            existing.archived = gr.archived;
+                            existing.marked_unread = gr.marked_unread;
+                            existing.muted_until_timestamp = gr.muted_until_timestamp;
+                            existing.dont_notify_for_mentions_if_muted =
+                                gr.dont_notify_for_mentions_if_muted;
+                            existing.hide_story = gr.hide_story;
+                            existing.story_send_mode = gr.story_send_mode.into();
+                            existing
+                        }
+                        _ => {
+                            debug!("storage sync: saving group stub");
+                            Group {
+                                title: None,
+                                avatar: None,
+                                disappearing_messages_timer: None,
+                                access_control: None,
+                                revision: 0,
+                                members: Vec::new(),
+                                pending_members: Vec::new(),
+                                requesting_members: Vec::new(),
+                                invite_link_password: Vec::new(),
+                                description: None,
+                                needs_hydration: true,
+                                blocked: gr.blocked,
+                                whitelisted: gr.whitelisted,
+                                archived: gr.archived,
+                                marked_unread: gr.marked_unread,
+                                muted_until_timestamp: gr.muted_until_timestamp,
+                                dont_notify_for_mentions_if_muted: gr
+                                    .dont_notify_for_mentions_if_muted,
+                                hide_story: gr.hide_story,
+                                story_send_mode: gr.story_send_mode.into(),
+                            }
+                        }
+                    };
+                    if let Err(e) = store.save_group(master_key, group).await {
+                        warn!(%e, "storage sync: failed to save group");
+                    }
+                }
+                Some(other) => {
+                    debug!(?other, "storage sync: skipping non-contact/group record");
+                }
+                None => {
+                    debug!("storage sync: empty record, skipping");
+                }
             }
         }
     }
 
-    info!(count = items.len(), "storage service sync complete");
+    info!(count = total_processed, "storage service sync complete");
     Ok(())
 }
