@@ -1850,8 +1850,10 @@ async fn save_message<S: Store>(
         }) => {
             if let Some(mut existing_msg) = store.message(&thread, ts).await? {
                 existing_msg.metadata = message.metadata;
-                existing_msg.body = ContentBody::DataMessage(data_message);
-                // TODO: find a way to mark the message as edited (so that it's visible in a client)
+                existing_msg.body = ContentBody::EditMessage(EditMessage {
+                    target_sent_timestamp: Some(ts),
+                    data_message: Some(data_message),
+                });
                 trace!(%thread, ts, "message in thread edited");
                 Some(existing_msg)
             } else {
