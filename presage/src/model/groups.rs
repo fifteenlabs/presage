@@ -10,8 +10,8 @@ use libsignal_service::utils::serde_aci;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Group {
-    pub title: String,
-    pub avatar: String,
+    pub title: Option<String>,
+    pub avatar: Option<String>,
     pub disappearing_messages_timer: Option<Timer>,
     pub access_control: Option<AccessControl>,
     pub revision: u32,
@@ -20,6 +20,25 @@ pub struct Group {
     pub requesting_members: Vec<RequestingMember>,
     pub invite_link_password: Vec<u8>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub needs_hydration: bool,
+    // storage service fields
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default)]
+    pub whitelisted: bool,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub marked_unread: bool,
+    #[serde(default)]
+    pub muted_until_timestamp: u64,
+    #[serde(default)]
+    pub dont_notify_for_mentions_if_muted: bool,
+    #[serde(default)]
+    pub hide_story: bool,
+    #[serde(default)]
+    pub story_send_mode: i64, // 0=Default, 1=Disabled, 2=Enabled
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -55,8 +74,12 @@ pub struct RequestingMember {
 impl From<libsignal_service::groups_v2::Group> for Group {
     fn from(val: libsignal_service::groups_v2::Group) -> Self {
         Group {
-            title: val.title,
-            avatar: val.avatar,
+            title: Some(val.title),
+            avatar: if val.avatar.is_empty() {
+                None
+            } else {
+                Some(val.avatar)
+            },
             disappearing_messages_timer: val.disappearing_messages_timer,
             access_control: val.access_control,
             revision: val.revision,
@@ -65,6 +88,15 @@ impl From<libsignal_service::groups_v2::Group> for Group {
             requesting_members: val.requesting_members.into_iter().map(Into::into).collect(),
             invite_link_password: val.invite_link_password,
             description: val.description,
+            needs_hydration: false,
+            blocked: false,
+            whitelisted: false,
+            archived: false,
+            marked_unread: false,
+            muted_until_timestamp: 0,
+            dont_notify_for_mentions_if_muted: false,
+            hide_story: false,
+            story_send_mode: 0,
         }
     }
 }

@@ -33,10 +33,28 @@ pub struct SqlContact {
     pub expire_timer_version: i64,
     pub inbox_position: i64,
     pub avatar: Option<Vec<u8>>,
-
+    // from contacts_verification_state join
     pub destination_aci: Option<String>,
     pub identity_key: Option<Vec<u8>>,
     pub is_verified: Option<bool>,
+    // storage service fields
+    pub pni: Option<String>,
+    pub username: Option<String>,
+    pub blocked: bool,
+    pub whitelisted: bool,
+    pub archived: bool,
+    pub marked_unread: bool,
+    pub muted_until_timestamp: i64,
+    pub hide_story: bool,
+    pub hidden: bool,
+    pub unregistered_at_timestamp: i64,
+    pub pni_signature_verified: bool,
+    pub system_given_name: Option<String>,
+    pub system_family_name: Option<String>,
+    pub system_nickname: Option<String>,
+    pub nickname_given_name: Option<String>,
+    pub nickname_family_name: Option<String>,
+    pub note: Option<String>,
 }
 
 impl TryInto<Contact> for SqlContact {
@@ -76,6 +94,27 @@ impl TryInto<Contact> for SqlContact {
                 content_type: "application/octet-stream".to_owned(),
                 reader: Bytes::from(b),
             }),
+            pni: self.pni.and_then(|p| {
+                p.parse()
+                    .map_err(|e| tracing::warn!("failed to parse stored PNI {p:?}: {e}"))
+                    .ok()
+            }),
+            username: self.username,
+            blocked: self.blocked,
+            whitelisted: self.whitelisted,
+            archived: self.archived,
+            marked_unread: self.marked_unread,
+            muted_until_timestamp: self.muted_until_timestamp as u64,
+            hide_story: self.hide_story,
+            hidden: self.hidden,
+            unregistered_at_timestamp: self.unregistered_at_timestamp as u64,
+            pni_signature_verified: self.pni_signature_verified,
+            system_given_name: self.system_given_name.unwrap_or_default(),
+            system_family_name: self.system_family_name.unwrap_or_default(),
+            system_nickname: self.system_nickname.unwrap_or_default(),
+            nickname_given_name: self.nickname_given_name.unwrap_or_default(),
+            nickname_family_name: self.nickname_family_name.unwrap_or_default(),
+            note: self.note.unwrap_or_default(),
         })
     }
 }
@@ -117,15 +156,24 @@ impl From<SqlProfile> for Profile {
 #[derive(Debug)]
 pub(crate) struct SqlGroup<'a> {
     pub(crate) master_key: Cow<'a, [u8]>,
-    pub(crate) title: String,
+    pub(crate) title: Option<String>,
     pub(crate) revision: u32,
     pub(crate) invite_link_password: Option<Vec<u8>>,
     pub(crate) access_control: Option<Json<AccessControl>>,
-    pub(crate) avatar: String,
+    pub(crate) avatar: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) members: Json<Vec<Member>>,
     pub(crate) pending_members: Json<Vec<PendingMember>>,
     pub(crate) requesting_members: Json<Vec<RequestingMember>>,
+    pub(crate) needs_hydration: bool,
+    pub(crate) blocked: bool,
+    pub(crate) whitelisted: bool,
+    pub(crate) archived: bool,
+    pub(crate) marked_unread: bool,
+    pub(crate) muted_until_timestamp: i64,
+    pub(crate) dont_notify_for_mentions_if_muted: bool,
+    pub(crate) hide_story: bool,
+    pub(crate) story_send_mode: i64,
 }
 
 impl SqlGroup<'_> {
@@ -142,6 +190,15 @@ impl SqlGroup<'_> {
             members: Json(group.members),
             pending_members: Json(group.pending_members),
             requesting_members: Json(group.requesting_members),
+            needs_hydration: group.needs_hydration,
+            blocked: group.blocked,
+            whitelisted: group.whitelisted,
+            archived: group.archived,
+            marked_unread: group.marked_unread,
+            muted_until_timestamp: group.muted_until_timestamp as i64,
+            dont_notify_for_mentions_if_muted: group.dont_notify_for_mentions_if_muted,
+            hide_story: group.hide_story,
+            story_send_mode: group.story_send_mode,
         }
     }
 
@@ -158,6 +215,15 @@ impl SqlGroup<'_> {
             members: Json(members),
             pending_members: Json(pending_members),
             requesting_members: Json(requesting_members),
+            needs_hydration,
+            blocked,
+            whitelisted,
+            archived,
+            marked_unread,
+            muted_until_timestamp,
+            dont_notify_for_mentions_if_muted,
+            hide_story,
+            story_send_mode,
         } = self;
         let master_key = master_key
             .as_ref()
@@ -175,6 +241,15 @@ impl SqlGroup<'_> {
             requesting_members,
             invite_link_password: invite_link_password.unwrap_or_default(),
             description,
+            needs_hydration,
+            blocked,
+            whitelisted,
+            archived,
+            marked_unread,
+            muted_until_timestamp: muted_until_timestamp as u64,
+            dont_notify_for_mentions_if_muted,
+            hide_story,
+            story_send_mode,
         };
         Ok((master_key, group))
     }

@@ -1,0 +1,128 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                master_key,\n                title,\n                revision AS \"revision: _\",\n                invite_link_password,\n                access_control AS \"access_control: _\",\n                avatar,\n                description,\n                members AS \"members: _\",\n                pending_members AS \"pending_members: _\",\n                requesting_members AS \"requesting_members: _\",\n                needs_hydration,\n                blocked, whitelisted, archived, marked_unread,\n                muted_until_timestamp,\n                dont_notify_for_mentions_if_muted,\n                hide_story,\n                story_send_mode\n            FROM groups\n            WHERE master_key = ?\n            LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "master_key",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "title",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "revision: _",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "invite_link_password",
+        "ordinal": 3,
+        "type_info": "Blob"
+      },
+      {
+        "name": "access_control: _",
+        "ordinal": 4,
+        "type_info": "Blob"
+      },
+      {
+        "name": "avatar",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "description",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "members: _",
+        "ordinal": 7,
+        "type_info": "Blob"
+      },
+      {
+        "name": "pending_members: _",
+        "ordinal": 8,
+        "type_info": "Blob"
+      },
+      {
+        "name": "requesting_members: _",
+        "ordinal": 9,
+        "type_info": "Blob"
+      },
+      {
+        "name": "needs_hydration",
+        "ordinal": 10,
+        "type_info": "Bool"
+      },
+      {
+        "name": "blocked",
+        "ordinal": 11,
+        "type_info": "Bool"
+      },
+      {
+        "name": "whitelisted",
+        "ordinal": 12,
+        "type_info": "Bool"
+      },
+      {
+        "name": "archived",
+        "ordinal": 13,
+        "type_info": "Bool"
+      },
+      {
+        "name": "marked_unread",
+        "ordinal": 14,
+        "type_info": "Bool"
+      },
+      {
+        "name": "muted_until_timestamp",
+        "ordinal": 15,
+        "type_info": "Integer"
+      },
+      {
+        "name": "dont_notify_for_mentions_if_muted",
+        "ordinal": 16,
+        "type_info": "Bool"
+      },
+      {
+        "name": "hide_story",
+        "ordinal": 17,
+        "type_info": "Bool"
+      },
+      {
+        "name": "story_send_mode",
+        "ordinal": 18,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b1a3f2277c04c7fd599600e62db4b1e29443d954cef508642f3839a90dd53e31"
+}
