@@ -126,7 +126,7 @@ impl<S: Store> Manager<S, Linking> {
                 pni_private_key,
                 pni_public_key,
                 profile_key,
-                master_key: _,
+                master_key,
                 account_entropy_pool: _,
             }) => {
                 let registration_data = RegistrationData {
@@ -140,6 +140,10 @@ impl<S: Store> Manager<S, Linking> {
                     pni_registration_id: Some(pni_registration_id),
                     profile_key,
                 };
+
+                if let Some(ref master_key) = master_key {
+                    store.store_master_key(Some(master_key)).await?;
+                }
 
                 store
                     .set_aci_identity_key_pair(IdentityKeyPair::new(

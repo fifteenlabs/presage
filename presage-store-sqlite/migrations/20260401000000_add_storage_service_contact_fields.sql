@@ -1,0 +1,17 @@
+ALTER TABLE contacts ADD COLUMN pni TEXT;
+ALTER TABLE contacts ADD COLUMN username TEXT;
+ALTER TABLE contacts ADD COLUMN blocked BOOLEAN NOT NULL DEFAULT 0;
+ALTER TABLE contacts ADD COLUMN whitelisted BOOLEAN NOT NULL DEFAULT 0;
+ALTER TABLE contacts ADD COLUMN archived BOOLEAN NOT NULL DEFAULT 0;
+ALTER TABLE contacts ADD COLUMN marked_unread BOOLEAN NOT NULL DEFAULT 0;
+ALTER TABLE contacts ADD COLUMN muted_until_timestamp INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE contacts ADD COLUMN hide_story BOOLEAN NOT NULL DEFAULT 0;
+ALTER TABLE contacts ADD COLUMN hidden BOOLEAN NOT NULL DEFAULT 0;
+ALTER TABLE contacts ADD COLUMN unregistered_at_timestamp INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE contacts ADD COLUMN pni_signature_verified BOOLEAN NOT NULL DEFAULT 0;
+ALTER TABLE contacts ADD COLUMN system_given_name TEXT;
+ALTER TABLE contacts ADD COLUMN system_family_name TEXT;
+ALTER TABLE contacts ADD COLUMN system_nickname TEXT;
+ALTER TABLE contacts ADD COLUMN nickname_given_name TEXT;
+ALTER TABLE contacts ADD COLUMN nickname_family_name TEXT;
+ALTER TABLE contacts ADD COLUMN note TEXT;

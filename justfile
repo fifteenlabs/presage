@@ -1,7 +1,8 @@
 database_url := ("sqlite://" + justfile_directory() + "/test.db")
 
+[working-directory: "presage-store-sqlite"]
 prepare-sqlx: setup-sqlx-db
-    cargo sqlx prepare --workspace --database-url "{{database_url}}"
+    cargo sqlx prepare --database-url "{{database_url}}"
 
 [working-directory: "presage-store-sqlite"]
 setup-sqlx-db:
