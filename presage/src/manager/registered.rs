@@ -17,8 +17,7 @@ use libsignal_service::{
     proto::{
         data_message::Delete,
         sync_message::{self, sticker_pack_operation, StickerPackOperation},
-        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, NullMessage, SyncMessage,
-        Verified,
+        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, SyncMessage, Verified,
     },
     protocol::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
@@ -1821,12 +1820,9 @@ async fn save_message<S: Store>(
                         }),
                     ..
                 } => {
-                    // replace an existing message by an empty NullMessage
-                    if let Some(mut existing_msg) = store.message(&thread, *ts).await? {
-                        existing_msg.metadata.sender = Aci::from(Uuid::nil()).into();
-                        existing_msg.body = NullMessage::default().into();
-                        store.save_message(&thread, existing_msg).await?;
-                        debug!(%thread, ts, "message in thread deleted");
+                    // Soft-delete is handled by the app layer; preserve the original content.
+                    if let Some(_existing_msg) = store.message(&thread, *ts).await? {
+                        debug!(%thread, ts, "message in thread deleted (soft-delete handled by app)");
                         None
                     } else {
                         warn!(%thread, ts, "could not find message to delete in thread");
@@ -1854,8 +1850,10 @@ async fn save_message<S: Store>(
         }) => {
             if let Some(mut existing_msg) = store.message(&thread, ts).await? {
                 existing_msg.metadata = message.metadata;
-                existing_msg.body = ContentBody::DataMessage(data_message);
-                // TODO: find a way to mark the message as edited (so that it's visible in a client)
+                existing_msg.body = ContentBody::EditMessage(EditMessage {
+                    target_sent_timestamp: Some(ts),
+                    data_message: Some(data_message),
+                });
                 trace!(%thread, ts, "message in thread edited");
                 Some(existing_msg)
             } else {
