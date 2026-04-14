@@ -90,6 +90,15 @@ pub trait StateStore {
         &self,
         aep: Option<&AccountEntropyPool>,
     ) -> impl Future<Output = Result<(), Self::StateStoreError>>;
+
+    fn fetch_storage_manifest_version(
+        &self,
+    ) -> impl Future<Output = Result<u64, Self::StateStoreError>>;
+
+    fn store_storage_manifest_version(
+        &self,
+        version: u64,
+    ) -> impl Future<Output = Result<(), Self::StateStoreError>>;
 }
 
 /// Stores messages, contacts, groups and profiles

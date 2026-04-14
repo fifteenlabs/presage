@@ -277,4 +277,34 @@ impl StateStore for SqliteStore {
         }
         Ok(())
     }
+
+    async fn fetch_storage_manifest_version(&self) -> Result<u64, Self::StateStoreError> {
+        let value: Option<Vec<u8>> =
+            query_scalar!("SELECT value FROM kv WHERE key = 'storage_manifest_version' LIMIT 1")
+                .fetch_optional(&self.db)
+                .await?;
+        Ok(match value {
+            None => 0,
+            Some(bytes) => u64::from_le_bytes(
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| SqliteStoreError::InvalidFormat)?,
+            ),
+        })
+    }
+
+    async fn store_storage_manifest_version(
+        &self,
+        version: u64,
+    ) -> Result<(), Self::StateStoreError> {
+        let value = version.to_le_bytes().to_vec();
+        query!(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES ('storage_manifest_version', ?)",
+            value
+        )
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
 }

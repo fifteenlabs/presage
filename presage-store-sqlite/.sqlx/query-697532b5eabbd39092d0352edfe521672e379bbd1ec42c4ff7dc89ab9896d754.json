@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO contacts(\n                uuid, phone_number, name, profile_key,\n                expire_timer, expire_timer_version, inbox_position, avatar,\n                pni, username, blocked, whitelisted, archived, marked_unread,\n                muted_until_timestamp, hide_story, hidden, unregistered_at_timestamp,\n                pni_signature_verified, system_given_name, system_family_name,\n                system_nickname, nickname_given_name, nickname_family_name, note\n            ) VALUES(\n                ?, ?, ?, ?,\n                ?, ?, ?, ?,\n                ?, ?, ?, ?, ?, ?,\n                ?, ?, ?, ?,\n                ?, ?, ?,\n                ?, ?, ?, ?\n            )",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 25
+    },
+    "nullable": []
+  },
+  "hash": "697532b5eabbd39092d0352edfe521672e379bbd1ec42c4ff7dc89ab9896d754"
+}

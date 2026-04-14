@@ -15,14 +15,14 @@ use libsignal_service::{
     content::{Content, ContentBody, Metadata},
     encrypt_device_name,
     groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
+    master_key::StorageServiceKey,
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
     prelude::{phonenumber::PhoneNumber, MasterKey, MessageSenderError, ProtobufMessage, Uuid},
     profile_cipher::ProfileCipher,
     proto::{
         data_message::Delete,
         sync_message::{self, sticker_pack_operation, StickerPackOperation},
-        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, NullMessage, SyncMessage,
-        Verified,
+        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, SyncMessage, Verified,
     },
     protocol::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
@@ -499,13 +499,13 @@ impl<S: Store> Manager<S, Registered> {
         };
 
         // Empty path means no avatar was set.
-        if group.avatar.is_empty() {
+        let Some(avatar_path) = group.avatar.as_deref().filter(|s| !s.is_empty()) else {
             return Ok(None);
-        }
+        };
 
         let avatar = gm
             .retrieve_avatar(
-                &group.avatar,
+                avatar_path,
                 GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key_bytes)),
             )
             .await?;
@@ -604,6 +604,7 @@ impl<S: Store> Manager<S, Registered> {
             master_key: Option<MasterKey>,
             account_entropy_pool: Option<AccountEntropyPool>,
             registration_type: RegistrationType,
+            push_service: PushService,
         }
 
         let identified_push_service = self.identified_push_service();
@@ -647,7 +648,7 @@ impl<S: Store> Manager<S, Registered> {
             identified_websocket,
             unidentified_websocket: self.unidentified_websocket().await?,
             encrypted_messages: Box::pin(encrypted_messages.stream()),
-            message_receiver: MessageReceiver::new(identified_push_service),
+            message_receiver: MessageReceiver::new(identified_push_service.clone()),
             service_cipher_aci: self.new_service_cipher_aci(),
             service_cipher_pni: self.new_service_cipher_pni(),
             groups_manager: Box::pin(self.groups_manager()).await?,
@@ -657,6 +658,7 @@ impl<S: Store> Manager<S, Registered> {
             master_key: self.master_key().await?,
             account_entropy_pool: self.account_entropy_pool().await?,
             registration_type: self.registration_type(),
+            push_service: identified_push_service,
         };
 
         debug!("starting to consume incoming message stream");
@@ -983,6 +985,39 @@ impl<S: Store> Manager<S, Registered> {
                                             }
                                         }
                                     }
+
+                                    // storage manifest fetch request — trigger a full storage sync
+                                    if let ContentBody::SynchronizeMessage(SyncMessage {
+                                        fetch_latest: Some(fetch_latest),
+                                        ..
+                                    }) = &content.body
+                                    {
+                                        use libsignal_service::content::sync_message::fetch_latest::Type as FetchType;
+                                        if fetch_latest.r#type() == FetchType::StorageManifest {
+                                            if let Some(master_key) = &state.master_key {
+                                                let mut store = state.store.clone();
+                                                let mut push_service = state.push_service.clone();
+                                                let storage_key =
+                                                    StorageServiceKey::from_master_key(master_key);
+                                                tokio::task::spawn_local(async move {
+                                                    if let Err(e) = sync_storage_service(
+                                                        &mut store,
+                                                        &mut push_service,
+                                                        &storage_key,
+                                                    )
+                                                    .await
+                                                    {
+                                                        warn!(%e, "storage service sync failed");
+                                                    }
+                                                });
+                                            } else {
+                                                warn!(
+                                                    "storage manifest fetch requested but no master key is available yet"
+                                                );
+                                            }
+                                        }
+                                    }
+
 
                                     // group update
                                     if let ContentBody::DataMessage(DataMessage {
@@ -1626,7 +1661,7 @@ impl<S: Store> Manager<S, Registered> {
                 })
             }
             Thread::Group(id) => match self.store.group(*id).await? {
-                Some(group) => Ok(group.title),
+                Some(group) => Ok(group.title.unwrap_or_default()),
                 None => Ok("".to_string()),
             },
         }
@@ -1703,6 +1738,36 @@ impl<S: Store> Manager<S, Registered> {
 
         Ok(account_manager.linked_devices(&aci_protocol_store).await?)
     }
+
+    pub async fn sync_storage_service(&mut self) -> Result<(), Error<S::Error>> {
+        let storage_key = StorageServiceKey::from_master_key(&self.master_key().await?);
+        let mut push_service = self.identified_push_service();
+        sync_storage_service(&mut self.store, &mut push_service, &storage_key).await
+    }
+
+    pub async fn hydrate_groups(&mut self) -> Result<(), Error<S::Error>> {
+        let stubs: Vec<libsignal_service::zkgroup::GroupMasterKeyBytes> = self
+            .store
+            .groups()
+            .await?
+            .filter_map(|r| {
+                r.map_err(|e| warn!(%e, "failed to load group, skipping"))
+                    .ok()
+            })
+            .filter(|(_, g)| g.needs_hydration)
+            .map(|(mk, _)| mk)
+            .collect();
+
+        info!(count = stubs.len(), "hydrating groups");
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+
+        for master_key in stubs {
+            if let Err(e) = hydrate_group(&mut self.store, &mut groups_manager, master_key).await {
+                warn!(%e, "failed to hydrate group, continuing");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Set the timestamp in any DataMessage so it matches its envelope's
@@ -1739,7 +1804,7 @@ async fn upsert_group<S: Store>(
 ) -> Result<Option<Group>, Error<S::Error>> {
     let upsert_group = match store.group(master_key_bytes.try_into()?).await {
         Ok(Some(group)) => {
-            debug!(group_name =% group.title, "loaded group from local db");
+            debug!(group_name =? group.title, "loaded group from local db");
             group.revision < *revision
         }
         Ok(None) => true,
@@ -1768,6 +1833,29 @@ async fn upsert_group<S: Store>(
     }
 
     Ok(store.group(master_key_bytes.try_into()?).await?)
+}
+
+async fn hydrate_group<S: Store>(
+    store: &mut S,
+    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    master_key: libsignal_service::zkgroup::GroupMasterKeyBytes,
+) -> Result<(), Error<S::Error>> {
+    match groups_manager
+        .fetch_encrypted_group(&mut rand::rng(), master_key.as_ref())
+        .await
+    {
+        Ok(encrypted_group) => {
+            let mut group: Group = decrypt_group(master_key.as_ref(), encrypted_group)?.into();
+            group.needs_hydration = false;
+            if let Err(e) = store.save_group(master_key, group).await {
+                error!(%e, "hydrate_group: failed to save group");
+            }
+        }
+        Err(e) => {
+            warn!(%e, "hydrate_group: failed to fetch from group server, skipping");
+        }
+    }
+    Ok(())
 }
 
 /// Download and decrypt a sticker manifest
@@ -1932,12 +2020,9 @@ async fn save_message<S: Store>(
                         }),
                     ..
                 } => {
-                    // replace an existing message by an empty NullMessage
-                    if let Some(mut existing_msg) = store.message(&thread, *ts).await? {
-                        existing_msg.metadata.sender = Aci::from(Uuid::nil()).into();
-                        existing_msg.body = NullMessage::default().into();
-                        store.save_message(&thread, existing_msg).await?;
-                        debug!(%thread, ts, "message in thread deleted");
+                    // Soft-delete is handled by the app layer; preserve the original content.
+                    if let Some(_existing_msg) = store.message(&thread, *ts).await? {
+                        debug!(%thread, ts, "message in thread deleted (soft-delete handled by app)");
                         None
                     } else {
                         warn!(%thread, ts, "could not find message to delete in thread");
@@ -1992,21 +2077,34 @@ async fn save_message<S: Store>(
             None
         }
         ContentBody::EditMessage(EditMessage {
-            target_sent_timestamp: Some(_),
-            data_message: Some(_),
+            target_sent_timestamp: Some(ts),
+            data_message: Some(data_message),
         })
         | ContentBody::SynchronizeMessage(SyncMessage {
             sent:
                 Some(sync_message::Sent {
                     edit_message:
                         Some(EditMessage {
-                            target_sent_timestamp: Some(_),
-                            data_message: Some(_),
+                            target_sent_timestamp: Some(ts),
+                            data_message: Some(data_message),
                         }),
                     ..
                 }),
             ..
-        }) => Some(message),
+        }) => {
+            if let Some(mut existing_msg) = store.message(&thread, ts).await? {
+                existing_msg.metadata = message.metadata;
+                existing_msg.body = ContentBody::EditMessage(EditMessage {
+                    target_sent_timestamp: Some(ts),
+                    data_message: Some(data_message),
+                });
+                trace!(%thread, ts, "message in thread edited");
+                Some(existing_msg)
+            } else {
+                warn!(%thread, ts, "could not find edited message");
+                None
+            }
+        }
         ContentBody::CallMessage(_)
         | ContentBody::SynchronizeMessage(SyncMessage {
             call_event: Some(_),
@@ -2067,29 +2165,45 @@ async fn upsert_contact_from_profile<S: Store>(
             let profile_cipher = ProfileCipher::new(profile_key);
             let decrypted_profile = profile_cipher.decrypt(encrypted_profile).unwrap();
 
-            let contact = Contact {
+            let mut contact = existing_contact.unwrap_or(Contact {
                 uuid: sender_uuid,
-                phone_number: existing_contact.and_then(|c| c.phone_number),
-                name: decrypted_profile
-                    .name
-                    // FIXME: this assumes [firstname] [lastname]
-                    .map(|pn| {
-                        if let Some(family_name) = pn.family_name {
-                            format!("{} {}", pn.given_name, family_name)
-                        } else {
-                            pn.given_name
-                        }
-                    })
-                    .unwrap_or_default(),
-                profile_key: profile_key.bytes.to_vec(),
-                expire_timer: data_message.expire_timer.unwrap_or_default(),
-                expire_timer_version: data_message.expire_timer_version.unwrap_or(1),
+                phone_number: None,
+                name: String::new(),
+                verified: Verified::default(),
+                profile_key: Vec::new(),
+                expire_timer: 0,
+                expire_timer_version: 2,
                 inbox_position: 0,
                 avatar: None,
-                verified: Verified::default(),
-            };
+                pni: None,
+                username: None,
+                blocked: false,
+                whitelisted: false,
+                archived: false,
+                marked_unread: false,
+                muted_until_timestamp: 0,
+                hide_story: false,
+                hidden: false,
+                unregistered_at_timestamp: 0,
+                pni_signature_verified: false,
+                system_given_name: String::new(),
+                system_family_name: String::new(),
+                system_nickname: String::new(),
+                nickname_given_name: String::new(),
+                nickname_family_name: String::new(),
+                note: String::new(),
+            });
+
+            contact.name = decrypted_profile
+                .name
+                .map(|pn| pn.to_string())
+                .unwrap_or_default();
+            contact.profile_key = profile_key.bytes.to_vec();
+            contact.expire_timer = data_message.expire_timer.unwrap_or_default();
+            contact.expire_timer_version = data_message.expire_timer_version.unwrap_or(1);
 
             info!(%sender_uuid, "saved contact on first sight");
+
             store.save_contact(&contact).await?;
             store.upsert_profile_key(&sender_uuid, profile_key).await?;
         } else {
@@ -2163,5 +2277,213 @@ async fn register_pre_keys<S: Store>(
         .await?;
 
     trace!("registered pre keys");
+    Ok(())
+}
+
+/// Maximum number of storage-service keys to request in a single `ReadOperation`.
+/// Signal Desktop uses 2500; the server's hard limit is ~5120.
+const STORAGE_SERVICE_BATCH_SIZE: usize = 2500;
+
+async fn sync_storage_service<S: Store>(
+    store: &mut S,
+    push_service: &mut PushService,
+    storage_key: &StorageServiceKey,
+) -> Result<(), Error<S::Error>> {
+    use libsignal_service::{
+        proto::{manifest_record::identifier::Type as StorageType, ReadOperation},
+        push_service::{decrypt_manifest, decrypt_storage_record},
+    };
+
+    debug!("storage sync: fetching credentials");
+    let credentials = push_service
+        .get_storage_credentials()
+        .await
+        .map_err(Error::ServiceError)?;
+    debug!(
+        "storage sync: got credentials username={}",
+        credentials.username
+    );
+
+    let local_version = store.fetch_storage_manifest_version().await?;
+    debug!(local_version, "storage sync: fetching manifest");
+    let Some(manifest) = push_service
+        .get_storage_manifest(&credentials, Some(local_version))
+        .await
+        .map_err(Error::ServiceError)?
+    else {
+        debug!(
+            local_version,
+            "storage sync: server version unchanged (204), skipping"
+        );
+        return Ok(());
+    };
+    debug!(
+        version = manifest.version,
+        local_version, "storage sync: got manifest"
+    );
+
+    let manifest_record = decrypt_manifest(&manifest, storage_key).map_err(Error::ServiceError)?;
+    debug!(
+        identifiers = manifest_record.identifiers.len(),
+        has_record_ikm = !manifest_record.record_ikm.is_empty(),
+        "storage sync: decrypted manifest"
+    );
+
+    let record_ikm: Option<Vec<u8>> = if manifest_record.record_ikm.is_empty() {
+        None
+    } else {
+        Some(manifest_record.record_ikm.clone())
+    };
+
+    let mut contact_keys: Vec<Vec<u8>> = Vec::new();
+    let mut group_keys: Vec<Vec<u8>> = Vec::new();
+    for id in &manifest_record.identifiers {
+        match id.r#type() {
+            StorageType::Contact => contact_keys.push(id.raw.clone()),
+            StorageType::Groupv2 => group_keys.push(id.raw.clone()),
+            _ => {}
+        }
+    }
+    debug!(
+        count = contact_keys.len(),
+        "storage sync: contact keys in manifest"
+    );
+    debug!(
+        count = group_keys.len(),
+        "storage sync: group keys in manifest"
+    );
+
+    if contact_keys.is_empty() && group_keys.is_empty() {
+        debug!("storage sync: nothing to sync");
+        return Ok(());
+    }
+
+    let all_keys: Vec<Vec<u8>> = contact_keys.into_iter().chain(group_keys).collect();
+    let total = all_keys.len();
+    debug!(total, "storage sync: fetching storage records in batches");
+
+    let mut total_processed = 0usize;
+    for (i, batch) in all_keys.chunks(STORAGE_SERVICE_BATCH_SIZE).enumerate() {
+        debug!(
+            batch = i,
+            size = batch.len(),
+            "storage sync: fetching batch"
+        );
+        let items = push_service
+            .get_storage_records(
+                &credentials,
+                ReadOperation {
+                    read_key: batch.to_vec(),
+                },
+            )
+            .await
+            .map_err(Error::ServiceError)?;
+        debug!(count = items.len(), "storage sync: got storage items");
+        total_processed += items.len();
+
+        for item in &items {
+            let record = match decrypt_storage_record(item, storage_key, record_ikm.as_deref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(%e, "storage sync: failed to decrypt storage item, skipping");
+                    continue;
+                }
+            };
+
+            match record.record {
+                Some(libsignal_service::proto::storage_record::Record::Contact(cr)) => {
+                    debug!(aci = %cr.aci, name = %cr.given_name, "storage sync: saving contact");
+                    let mut contact: Contact = match Contact::try_from(cr) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("storage sync: skipping contact record: {e}");
+                            continue;
+                        }
+                    };
+
+                    // Preserve locally-derived fields not present in ContactRecord
+                    let service_id = ServiceId::Aci(Aci::from(contact.uuid));
+                    if let Ok(Some(existing)) = store.contact_by_id(&service_id).await {
+                        contact.expire_timer = existing.expire_timer;
+                        contact.expire_timer_version = existing.expire_timer_version;
+                        contact.inbox_position = existing.inbox_position;
+                        contact.avatar = existing.avatar;
+                        contact.verified = existing.verified;
+                    }
+                    if let Err(e) = store.save_contact(&contact).await {
+                        warn!(%e, "storage sync: failed to save contact");
+                    }
+                }
+                Some(libsignal_service::proto::storage_record::Record::GroupV2(gr)) => {
+                    let master_key: libsignal_service::zkgroup::GroupMasterKeyBytes =
+                        match gr.master_key.as_slice().try_into() {
+                            Ok(mk) => mk,
+                            Err(_) => {
+                                warn!("storage sync: invalid group master key length, skipping");
+                                continue;
+                            }
+                        };
+                    let group = match store.group(master_key).await {
+                        Ok(Some(mut existing)) => {
+                            // Preserve locally-derived fields; update storage-service-owned fields
+                            existing.blocked = gr.blocked;
+                            existing.whitelisted = gr.whitelisted;
+                            existing.archived = gr.archived;
+                            existing.marked_unread = gr.marked_unread;
+                            existing.muted_until_timestamp = gr.muted_until_timestamp;
+                            existing.dont_notify_for_mentions_if_muted =
+                                gr.dont_notify_for_mentions_if_muted;
+                            existing.hide_story = gr.hide_story;
+                            existing.story_send_mode = gr.story_send_mode.into();
+                            existing
+                        }
+                        _ => {
+                            debug!("storage sync: saving group stub");
+                            Group {
+                                title: None,
+                                avatar: None,
+                                disappearing_messages_timer: None,
+                                access_control: None,
+                                revision: 0,
+                                members: Vec::new(),
+                                pending_members: Vec::new(),
+                                requesting_members: Vec::new(),
+                                invite_link_password: Vec::new(),
+                                description: None,
+                                needs_hydration: true,
+                                blocked: gr.blocked,
+                                whitelisted: gr.whitelisted,
+                                archived: gr.archived,
+                                marked_unread: gr.marked_unread,
+                                muted_until_timestamp: gr.muted_until_timestamp,
+                                dont_notify_for_mentions_if_muted: gr
+                                    .dont_notify_for_mentions_if_muted,
+                                hide_story: gr.hide_story,
+                                story_send_mode: gr.story_send_mode.into(),
+                            }
+                        }
+                    };
+                    if let Err(e) = store.save_group(master_key, group).await {
+                        warn!(%e, "storage sync: failed to save group");
+                    }
+                }
+                Some(other) => {
+                    debug!(?other, "storage sync: skipping non-contact/group record");
+                }
+                None => {
+                    debug!("storage sync: empty record, skipping");
+                }
+            }
+        }
+    }
+
+    store
+        .store_storage_manifest_version(manifest.version)
+        .await?;
+    info!(
+        count = total_processed,
+        version = manifest.version,
+        "storage service sync complete"
+    );
     Ok(())
 }

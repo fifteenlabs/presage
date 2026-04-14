@@ -140,6 +140,10 @@ impl<S: Store> Manager<S, Linking> {
                     profile_key,
                 };
 
+                if let Some(ref master_key) = master_key {
+                    store.store_master_key(Some(master_key)).await?;
+                }
+
                 store
                     .set_aci_identity_key_pair(IdentityKeyPair::new(
                         aci_public_key,

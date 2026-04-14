@@ -1,0 +1,182 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                uuid AS \"uuid: _\",\n                phone_number,\n                name,\n                profile_key,\n                expire_timer,\n                expire_timer_version,\n                inbox_position,\n                avatar,\n                destination_aci AS \"destination_aci: _\",\n                identity_key,\n                is_verified,\n                pni,\n                username,\n                blocked,\n                whitelisted,\n                archived,\n                marked_unread,\n                muted_until_timestamp,\n                hide_story,\n                hidden,\n                unregistered_at_timestamp,\n                pni_signature_verified,\n                system_given_name,\n                system_family_name,\n                system_nickname,\n                nickname_given_name,\n                nickname_family_name,\n                note\n            FROM contacts c\n            LEFT JOIN contacts_verification_state cv ON c.uuid = cv.destination_aci\n            ORDER BY c.inbox_position",
+  "describe": {
+    "columns": [
+      {
+        "name": "uuid: _",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "phone_number",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "name",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "profile_key",
+        "ordinal": 3,
+        "type_info": "Blob"
+      },
+      {
+        "name": "expire_timer",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "expire_timer_version",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "inbox_position",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "avatar",
+        "ordinal": 7,
+        "type_info": "Blob"
+      },
+      {
+        "name": "destination_aci: _",
+        "ordinal": 8,
+        "type_info": "Blob"
+      },
+      {
+        "name": "identity_key",
+        "ordinal": 9,
+        "type_info": "Blob"
+      },
+      {
+        "name": "is_verified",
+        "ordinal": 10,
+        "type_info": "Bool"
+      },
+      {
+        "name": "pni",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "username",
+        "ordinal": 12,
+        "type_info": "Text"
+      },
+      {
+        "name": "blocked",
+        "ordinal": 13,
+        "type_info": "Bool"
+      },
+      {
+        "name": "whitelisted",
+        "ordinal": 14,
+        "type_info": "Bool"
+      },
+      {
+        "name": "archived",
+        "ordinal": 15,
+        "type_info": "Bool"
+      },
+      {
+        "name": "marked_unread",
+        "ordinal": 16,
+        "type_info": "Bool"
+      },
+      {
+        "name": "muted_until_timestamp",
+        "ordinal": 17,
+        "type_info": "Integer"
+      },
+      {
+        "name": "hide_story",
+        "ordinal": 18,
+        "type_info": "Bool"
+      },
+      {
+        "name": "hidden",
+        "ordinal": 19,
+        "type_info": "Bool"
+      },
+      {
+        "name": "unregistered_at_timestamp",
+        "ordinal": 20,
+        "type_info": "Integer"
+      },
+      {
+        "name": "pni_signature_verified",
+        "ordinal": 21,
+        "type_info": "Bool"
+      },
+      {
+        "name": "system_given_name",
+        "ordinal": 22,
+        "type_info": "Text"
+      },
+      {
+        "name": "system_family_name",
+        "ordinal": 23,
+        "type_info": "Text"
+      },
+      {
+        "name": "system_nickname",
+        "ordinal": 24,
+        "type_info": "Text"
+      },
+      {
+        "name": "nickname_given_name",
+        "ordinal": 25,
+        "type_info": "Text"
+      },
+      {
+        "name": "nickname_family_name",
+        "ordinal": 26,
+        "type_info": "Text"
+      },
+      {
+        "name": "note",
+        "ordinal": 27,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "1aad5ad500af70aa7d526d92d64a98e1abca1e01acbd954e8fd0ee7089081ede"
+}
