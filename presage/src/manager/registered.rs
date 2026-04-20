@@ -24,7 +24,6 @@ use libsignal_service::{
     },
     provisioning::ProvisioningError,
     push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
-    receiver::MessageReceiver,
     sender::{AttachmentSpec, AttachmentUploadError},
     sticker_cipher::derive_key,
     unidentified_access::UnidentifiedAccess,
@@ -377,19 +376,6 @@ impl<S: Store> Manager<S, Registered> {
     ) -> Result<Profile, Error<S::Error>> {
         let aci = aci.into();
 
-        // Check if profile is cached.
-        // TODO: Create a migration in the store removing all profiles.
-        // TODO: Is there some way to know if this is outdated?
-        if let Some(profile) = self
-            .store
-            .profile(aci.into(), profile_key)
-            .await
-            .ok()
-            .flatten()
-        {
-            return Ok(profile);
-        }
-
         let mut account_manager = AccountManager::new(
             self.identified_push_service(),
             self.identified_websocket(false).await?,
@@ -460,43 +446,37 @@ impl<S: Store> Manager<S, Registered> {
         uuid: Uuid,
         profile_key: ProfileKey,
     ) -> Result<Option<AvatarBytes>, Error<S::Error>> {
-        // Check if profile avatar is cached.
-        // TODO: Is there some way to know if this is outdated?
-        if let Some(avatar) = self
-            .store
-            .profile_avatar(uuid, profile_key)
-            .await
-            .ok()
-            .flatten()
-        {
-            return Ok(Some(avatar));
-        }
+        // Always fetch a fresh profile from the network to get the current avatar URL.
+        // The server-side URL acts as the version identifier — if it changed, the
+        // avatar changed. Mirrors Signal Desktop's existingProfileAvatar.url === avatarUrl check.
+        let profile = self.retrieve_profile_by_uuid(uuid, profile_key).await?;
 
-        let profile =
-            if let Some(profile) = self.store.profile(uuid, profile_key).await.ok().flatten() {
-                profile
-            } else {
-                self.retrieve_profile_by_uuid(uuid, profile_key).await?
-            };
-
-        let Some(avatar) = profile.avatar.as_ref() else {
+        let Some(avatar_url) = profile.avatar.as_deref() else {
             return Ok(None);
         };
 
-        let mut websocket = self.unidentified_websocket().await?;
+        // Return cached bytes if the URL matches — no re-download needed.
+        if let Ok(Some((cached_url, cached_bytes))) =
+            self.store.profile_avatar(uuid, profile_key).await
+        {
+            if cached_url.as_deref() == Some(avatar_url) {
+                return Ok(Some(cached_bytes));
+            }
+        }
 
-        let mut avatar_stream = websocket.retrieve_profile_avatar(avatar).await?;
+        // URL changed or no cache — download, decrypt, save, and return.
+        let mut websocket = self.unidentified_websocket().await?;
+        let mut avatar_stream = websocket.retrieve_profile_avatar(avatar_url).await?;
         // 10MB is what Signal Android allocates
         let mut contents = Vec::with_capacity(10 * 1024 * 1024);
         let len = avatar_stream.read_to_end(&mut contents).await?;
         contents.truncate(len);
 
         let cipher = ProfileCipher::new(profile_key);
-
         let avatar = cipher.decrypt_avatar(&contents)?;
         let _ = self
             .store
-            .save_profile_avatar(uuid, profile_key, &avatar)
+            .save_profile_avatar(uuid, profile_key, &avatar, Some(avatar_url))
             .await;
         Ok(Some(avatar))
     }
@@ -534,7 +514,6 @@ impl<S: Store> Manager<S, Registered> {
             identified_websocket: SignalWebSocket<websocket::Identified>,
             unidentified_websocket: SignalWebSocket<websocket::Unidentified>,
             encrypted_messages: Receiver,
-            message_receiver: MessageReceiver,
             service_cipher_aci: ServiceCipher<AciStore>,
             service_cipher_pni: ServiceCipher<PniStore>,
             groups_manager: GroupsManager<InMemoryCredentialsCache>,
@@ -586,7 +565,6 @@ impl<S: Store> Manager<S, Registered> {
             identified_websocket,
             unidentified_websocket: self.unidentified_websocket().await?,
             encrypted_messages: Box::pin(encrypted_messages.stream()),
-            message_receiver: MessageReceiver::new(identified_push_service.clone()),
             service_cipher_aci: self.new_service_cipher_aci(),
             service_cipher_pni: self.new_service_cipher_pni(),
             groups_manager: Box::pin(self.groups_manager()).await?,
@@ -746,42 +724,6 @@ impl<S: Store> Manager<S, Registered> {
                                             contacts.blob.is_some(),
                                             contacts.complete
                                         );
-                                        match state
-                                            .message_receiver
-                                            .retrieve_contacts(contacts)
-                                            .await
-                                        {
-                                            Ok(contacts) => {
-                                                let contacts: Vec<_> = contacts
-                                                    .filter_map(|r| {
-                                                        r.map_err(|e| {
-                                                            warn!("failed to parse contact: {e}")
-                                                        })
-                                                        .ok()
-                                                    })
-                                                    .collect();
-                                                debug!(
-                                                    "contacts retrieved: {} contacts",
-                                                    contacts.len()
-                                                );
-                                                let _ = state.store.clear_contacts().await;
-                                                info!("saving contacts");
-                                                for contact in contacts {
-                                                    if let Err(error) = state
-                                                        .store
-                                                        .save_contact(&contact.into())
-                                                        .await
-                                                    {
-                                                        warn!(%error, "failed to save contacts");
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            Err(error) => {
-                                                warn!(%error, "failed to retrieve contacts");
-                                            }
-                                        }
-
                                         return Some((Received::Contacts, state));
                                     }
 

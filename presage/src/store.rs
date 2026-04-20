@@ -297,20 +297,22 @@ pub trait ContentsStore: Send + Sync {
         key: ProfileKey,
     ) -> impl Future<Output = Result<Option<Profile>, Self::ContentsStoreError>>;
 
-    /// Save a profile avatar by [Uuid] and [ProfileKey].
+    /// Save a profile avatar by [Uuid] and [ProfileKey], storing the server URL alongside the bytes.
     fn save_profile_avatar(
         &mut self,
         uuid: Uuid,
         key: ProfileKey,
         profile: &AvatarBytes,
+        url: Option<&str>,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
     /// Retrieve a profile avatar by [Uuid] and [ProfileKey].
+    /// Returns `(url, bytes)` where `url` is the server-side avatar path stored at last download.
     fn profile_avatar(
         &self,
         uuid: Uuid,
         key: ProfileKey,
-    ) -> impl Future<Output = Result<Option<AvatarBytes>, Self::ContentsStoreError>>;
+    ) -> impl Future<Output = Result<Option<(Option<String>, AvatarBytes)>, Self::ContentsStoreError>>;
 
     // Stickers
 
