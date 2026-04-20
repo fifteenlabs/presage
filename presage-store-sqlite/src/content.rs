@@ -706,11 +706,13 @@ impl ContentsStore for SqliteStore {
         uuid: Uuid,
         _key: ProfileKey,
         profile: &AvatarBytes,
+        url: Option<&str>,
     ) -> Result<(), Self::ContentsStoreError> {
         query!(
-            "INSERT OR REPLACE INTO profile_avatars(uuid, bytes) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO profile_avatars(uuid, bytes, url) VALUES (?, ?, ?)",
             uuid,
             profile,
+            url,
         )
         .execute(&self.db)
         .await?;
@@ -721,11 +723,12 @@ impl ContentsStore for SqliteStore {
         &self,
         uuid: Uuid,
         _key: ProfileKey,
-    ) -> Result<Option<AvatarBytes>, Self::ContentsStoreError> {
-        query_scalar!("SELECT bytes FROM profile_avatars WHERE uuid = ?", uuid)
+    ) -> Result<Option<(Option<String>, AvatarBytes)>, Self::ContentsStoreError> {
+        query!("SELECT bytes, url FROM profile_avatars WHERE uuid = ?", uuid)
             .fetch_optional(&self.db)
             .await
             .map_err(From::from)
+            .map(|opt| opt.map(|r| (r.url, r.bytes)))
     }
 
     async fn add_sticker_pack(
