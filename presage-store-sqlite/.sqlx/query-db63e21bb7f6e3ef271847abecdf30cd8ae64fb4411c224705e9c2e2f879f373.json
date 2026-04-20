@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT bytes, url FROM profile_avatars WHERE uuid = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "bytes",
+        "ordinal": 0,
+        "type_info": "Blob"
+      },
+      {
+        "name": "url",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "db63e21bb7f6e3ef271847abecdf30cd8ae64fb4411c224705e9c2e2f879f373"
+}
