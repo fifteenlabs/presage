@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM kv WHERE key = 'backup_key'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "52f03b65205273bd5a67f7344ca3b0998409bcc3c77e660723b4665ebe97c0c8"
+}

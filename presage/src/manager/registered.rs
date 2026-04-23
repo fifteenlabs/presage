@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,6 +25,7 @@ use libsignal_service::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
     },
     provisioning::ProvisioningError,
+    push_service::linking::{TransferArchiveError, TransferArchiveResult},
     push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
     sender::{AttachmentSpec, AttachmentUploadError},
     sticker_cipher::derive_key,
@@ -37,15 +40,21 @@ use libsignal_service::{
         groups::{GroupMasterKey, GroupSecretParams},
         profiles::ProfileKey,
     },
-    AccountManager, Profile, ServiceIdExt,
+    AccountManager, FileReaderFactory, FramesReader, MessageBackupKey, Profile, ServiceIdExt,
+    VarintDelimitedReader,
 };
 use rand::rng;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
+use crate::backup::{
+    convert::{self, RecipientInfo},
+    BackupImportProgress, Frame, FrameItem,
+};
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
 use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
@@ -1516,6 +1525,160 @@ impl<S: Store> Manager<S, Registered> {
         for master_key in stubs {
             if let Err(e) = hydrate_group(&mut self.store, &mut groups_manager, master_key).await {
                 warn!(%e, "failed to hydrate group, continuing");
+            }
+        }
+        Ok(())
+    }
+
+    /// Download and import a Signal backup after device linking (Link & Sync).
+    /// Returns immediately if no backup key is present (primary didn't upload).
+    pub async fn download_and_import_backup<F: Fn(BackupImportProgress)>(
+        &mut self,
+        path: &Path,
+        on_progress: F,
+    ) -> Result<(), Error<S::Error>> {
+        let backup_key = match self.store.fetch_backup_key().await? {
+            Some(k) => k,
+            None => return Ok(()),
+        };
+        let aci = Aci::from_uuid_bytes(self.state.data.service_ids.aci.into_bytes());
+        let backup_id = backup_key.derive_backup_id(&aci);
+        let message_backup_key = MessageBackupKey::derive(&backup_key, &backup_id, None);
+
+        let (cdn, archive_key) = match self.store.fetch_transfer_archive().await? {
+            Some(cached) => cached,
+            None => {
+                on_progress(BackupImportProgress::WaitingForUpload);
+                let mut svc = self.state.identified_push_service();
+                match svc
+                    .get_transfer_archive(std::time::Duration::from_secs(3600))
+                    .await?
+                {
+                    TransferArchiveResult::Available { cdn, key } => {
+                        self.store.store_transfer_archive(Some((cdn, &key))).await?;
+                        (cdn, key)
+                    }
+                    TransferArchiveResult::Error {
+                        error: TransferArchiveError::RelinkRequested,
+                    } => return Err(Error::BackupRelinkRequested),
+                    TransferArchiveResult::Error {
+                        error: TransferArchiveError::ContinueWithoutUpload,
+                    } => {
+                        self.store.store_backup_key(None).await?;
+                        return Ok(());
+                    }
+                }
+            }
+        };
+
+        self.download_archive(path, cdn, &archive_key, &on_progress)
+            .await?;
+
+        on_progress(BackupImportProgress::Processing);
+
+        let import_result = self.import_from_file(path, &message_backup_key, aci).await;
+
+        let _ = tokio::fs::remove_file(path).await;
+
+        import_result?;
+        self.store.store_backup_key(None).await?;
+        self.store.store_transfer_archive(None).await?;
+        on_progress(BackupImportProgress::Done);
+        Ok(())
+    }
+
+    async fn download_archive<F: Fn(BackupImportProgress)>(
+        &mut self,
+        path: &Path,
+        cdn: u32,
+        key: &str,
+        on_progress: &F,
+    ) -> Result<(), Error<S::Error>> {
+        let range_start = tokio::fs::metadata(path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        on_progress(BackupImportProgress::Downloading {
+            bytes_received: range_start,
+            total: None,
+        });
+
+        let mut svc = self.state.identified_push_service();
+        let (mut stream, total_bytes) =
+            svc.download_transfer_archive(cdn, key, range_start).await?;
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+
+        let mut bytes_received = range_start;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).await?;
+            bytes_received += n as u64;
+            on_progress(BackupImportProgress::Downloading {
+                bytes_received,
+                total: total_bytes,
+            });
+        }
+        file.flush().await?;
+        Ok(())
+    }
+
+    async fn import_from_file(
+        &mut self,
+        path: &Path,
+        message_backup_key: &MessageBackupKey,
+        aci: libsignal_service::protocol::Aci,
+    ) -> Result<(), Error<S::Error>> {
+        let factory = FileReaderFactory {
+            path: path.to_owned(),
+        };
+        let frames_reader = FramesReader::new(message_backup_key, factory)
+            .await
+            .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
+        let mut reader = VarintDelimitedReader::new(frames_reader);
+
+        reader
+            .read_next()
+            .await
+            .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
+
+        let mut recipients: HashMap<u64, RecipientInfo> = HashMap::new();
+        let mut chats: HashMap<u64, Thread> = HashMap::new();
+
+        while let Some(bytes) = reader
+            .read_next()
+            .await
+            .map_err(|e| Error::BackupImportFailed(e.to_string()))?
+        {
+            let frame = Frame::decode_bytes(bytes.as_ref())
+                .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
+            match frame.item {
+                Some(FrameItem::Recipient(r)) => {
+                    if let Some((id, info)) = convert::recipient_info(&r) {
+                        recipients.insert(id, info);
+                    }
+                }
+                Some(FrameItem::Chat(c)) => {
+                    if let Some((id, thread)) = convert::chat_to_thread(&c, &recipients) {
+                        chats.insert(id, thread);
+                    }
+                }
+                Some(FrameItem::ChatItem(ci)) => {
+                    if let Some((content, thread)) =
+                        convert::chat_item_to_content(&ci, &recipients, &chats, aci)
+                    {
+                        self.store.save_message(&thread, content).await?;
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
