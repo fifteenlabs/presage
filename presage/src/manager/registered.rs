@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures::{future, AsyncReadExt, Stream, StreamExt};
 use libsignal_service::{
     attachment_cipher::decrypt_in_place,
+    backup::{FileReaderFactory, FramesReader, MessageBackupKey, VarintDelimitedReader},
     cipher,
     configuration::{ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, DataMessageFlags, Metadata},
@@ -40,8 +41,7 @@ use libsignal_service::{
         groups::{GroupMasterKey, GroupSecretParams},
         profiles::ProfileKey,
     },
-    AccountManager, FileReaderFactory, FramesReader, MessageBackupKey, Profile, ServiceIdExt,
-    VarintDelimitedReader,
+    AccountManager, Profile, ServiceIdExt,
 };
 use rand::rng;
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,7 @@ use url::Url;
 
 use crate::backup::{
     convert::{self, RecipientInfo},
-    BackupImportProgress, Frame, FrameItem,
+    BackupImportProgress, Frame, FrameItem, TransferArchive,
 };
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
@@ -1530,82 +1530,117 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
-    /// Download and import a Signal backup after device linking (Link & Sync).
-    /// Returns immediately if no backup key is present (primary didn't upload).
-    pub async fn download_and_import_backup<F: Fn(BackupImportProgress)>(
-        &mut self,
-        path: &Path,
-        on_progress: F,
-    ) -> Result<(), Error<S::Error>> {
+    /// Fetches the stored `BackupKey` and derives the `MessageBackupKey` for this account.
+    pub async fn backup_message_key(&self) -> Result<Option<MessageBackupKey>, Error<S::Error>> {
         let backup_key = match self.store.fetch_backup_key().await? {
             Some(k) => k,
-            None => return Ok(()),
+            None => return Ok(None),
         };
         let aci = Aci::from_uuid_bytes(self.state.data.service_ids.aci.into_bytes());
         let backup_id = backup_key.derive_backup_id(&aci);
-        let message_backup_key = MessageBackupKey::derive(&backup_key, &backup_id, None);
+        Ok(Some(MessageBackupKey::derive(
+            &backup_key,
+            &backup_id,
+            None,
+        )))
+    }
 
-        let (cdn, archive_key) = match self.store.fetch_transfer_archive().await? {
-            Some(cached) => cached,
-            None => {
-                on_progress(BackupImportProgress::WaitingForUpload);
+    /// Download and import a Signal backup after device linking (Link & Sync).
+    pub async fn download_and_import_backup<F: Fn(BackupImportProgress)>(
+        &mut self,
+        ephemeral_key: Option<MessageBackupKey>,
+        on_progress: F,
+    ) -> Result<bool, Error<S::Error>> {
+        let aci = Aci::from_uuid_bytes(self.state.data.service_ids.aci.into_bytes());
+
+        let (stream, total_bytes, path, download_offset, message_backup_key) =
+            if let Some(message_backup_key) = ephemeral_key {
+                let archive = match self.store.fetch_transfer_archive().await? {
+                    Some(cached) => cached,
+                    None => {
+                        on_progress(BackupImportProgress::WaitingForUpload);
+                        let mut svc = self.state.identified_push_service();
+                        match svc
+                            .get_transfer_archive(std::time::Duration::from_secs(3600))
+                            .await?
+                        {
+                            TransferArchiveResult::Available { cdn, key } => {
+                                let archive = TransferArchive {
+                                    cdn,
+                                    key,
+                                    path: crate::backup::random_backup_path(),
+                                };
+                                self.store.store_transfer_archive(Some(&archive)).await?;
+                                archive
+                            }
+                            TransferArchiveResult::Error {
+                                error: TransferArchiveError::RelinkRequested,
+                            } => return Err(Error::BackupRelinkRequested),
+                            TransferArchiveResult::Error {
+                                error: TransferArchiveError::ContinueWithoutUpload,
+                            } => return Ok(false),
+                        }
+                    }
+                };
+                let download_offset = match tokio::fs::metadata(&archive.path).await {
+                    Ok(m) => m.len(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(e) => return Err(e.into()),
+                };
                 let mut svc = self.state.identified_push_service();
-                match svc
-                    .get_transfer_archive(std::time::Duration::from_secs(3600))
-                    .await?
-                {
-                    TransferArchiveResult::Available { cdn, key } => {
-                        self.store.store_transfer_archive(Some((cdn, &key))).await?;
-                        (cdn, key)
-                    }
-                    TransferArchiveResult::Error {
-                        error: TransferArchiveError::RelinkRequested,
-                    } => return Err(Error::BackupRelinkRequested),
-                    TransferArchiveResult::Error {
-                        error: TransferArchiveError::ContinueWithoutUpload,
-                    } => {
-                        self.store.store_backup_key(None).await?;
-                        return Ok(());
-                    }
-                }
-            }
-        };
+                let (stream, total_bytes) = svc
+                    .download_transfer_archive(archive.cdn, &archive.key, download_offset)
+                    .await?;
+                (
+                    stream,
+                    total_bytes,
+                    archive.path,
+                    download_offset,
+                    message_backup_key,
+                )
+            } else {
+                // Regular backup restore needs a different download path — equivalent
+                // to Signal Desktop's api.download() with ZKP credentials, not
+                // api.downloadEphemeral() which is used for Link & Sync.
+                warn!("regular (non-ephemeral) backup restore is not yet implemented");
+                return Ok(false);
+            };
 
-        self.download_archive(path, cdn, &archive_key, &on_progress)
+        self.write_archive_to_file(&path, stream, total_bytes, download_offset, &on_progress)
             .await?;
 
         on_progress(BackupImportProgress::Processing);
 
-        let import_result = self.import_from_file(path, &message_backup_key, aci).await;
-
-        let _ = tokio::fs::remove_file(path).await;
-
+        let import_result = self.import_from_file(&path, &message_backup_key, aci).await;
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            warn!(%e, path = %path.display(), "failed to remove backup temp file");
+        }
         import_result?;
-        self.store.store_backup_key(None).await?;
+
         self.store.store_transfer_archive(None).await?;
         on_progress(BackupImportProgress::Done);
-        Ok(())
+        Ok(true)
     }
 
-    async fn download_archive<F: Fn(BackupImportProgress)>(
-        &mut self,
+    async fn write_archive_to_file<R, F>(
+        &self,
         path: &Path,
-        cdn: u32,
-        key: &str,
+        mut stream: R,
+        total_bytes: u64,
+        download_offset: u64,
         on_progress: &F,
-    ) -> Result<(), Error<S::Error>> {
-        let range_start = tokio::fs::metadata(path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        on_progress(BackupImportProgress::Downloading {
-            bytes_received: range_start,
-            total: None,
-        });
+    ) -> Result<(), Error<S::Error>>
+    where
+        R: futures::io::AsyncRead + Unpin,
+        F: Fn(BackupImportProgress),
+    {
+        // Matches Signal Desktop's GET_ATTACHMENT_CHUNK_TIMEOUT.
+        const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-        let mut svc = self.state.identified_push_service();
-        let (mut stream, total_bytes) =
-            svc.download_transfer_archive(cdn, key, range_start).await?;
+        on_progress(BackupImportProgress::Downloading {
+            bytes_received: download_offset,
+            total: total_bytes,
+        });
 
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -1613,10 +1648,17 @@ impl<S: Store> Manager<S, Registered> {
             .open(path)
             .await?;
 
-        let mut bytes_received = range_start;
+        let mut bytes_received = download_offset;
         let mut buf = vec![0u8; 65536];
         loop {
-            let n = stream.read(&mut buf).await?;
+            let n = tokio::time::timeout(CHUNK_TIMEOUT, stream.read(&mut buf))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "transfer archive download stalled",
+                    )
+                })??;
             if n == 0 {
                 break;
             }
@@ -1645,6 +1687,16 @@ impl<S: Store> Manager<S, Registered> {
             .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
         let mut reader = VarintDelimitedReader::new(frames_reader);
 
+        // The first frame is always AccountData (profile name/about/avatar, account
+        // settings like read receipts, typing indicators, link previews, phone number
+        // sharing mode, preferred reaction emoji, etc.). We intentionally skip it for
+        // now: profile data arrives via network fetches on message receipt and storage
+        // service sync, and presage has no settings storage layer yet. This mirrors
+        // Signal Desktop's "no backup" path behaviour.
+        //
+        // TODO: implement AccountData restore — in particular the preferences are
+        // interesting to carry over from the backup rather than waiting for a sync
+        // message from the primary device.
         reader
             .read_next()
             .await

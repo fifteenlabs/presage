@@ -679,10 +679,10 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                     let whoami = manager.whoami().await?;
                     println!("{whoami:?}");
 
-                    let tmp = std::env::temp_dir().join("signal-backup.bin");
-                    println!("Starting backup import (temp file: {})...", tmp.display());
-                    manager
-                        .download_and_import_backup(&tmp, |progress| match progress {
+                    println!("Starting backup import…");
+                    let ephemeral_key = manager.backup_message_key().await?;
+                    let imported = manager
+                        .download_and_import_backup(ephemeral_key, |progress| match progress {
                             BackupImportProgress::WaitingForUpload => {
                                 println!("[backup] Waiting for primary device to upload…");
                             }
@@ -690,16 +690,12 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                                 bytes_received,
                                 total,
                             } => {
-                                if let Some(total) = total {
-                                    println!(
-                                        "[backup] Downloading… {}/{} bytes ({:.1}%)",
-                                        bytes_received,
-                                        total,
-                                        bytes_received as f64 / total as f64 * 100.0
-                                    );
-                                } else {
-                                    println!("[backup] Downloading… {} bytes", bytes_received);
-                                }
+                                println!(
+                                    "[backup] Downloading… {}/{} bytes ({:.1}%)",
+                                    bytes_received,
+                                    total,
+                                    bytes_received as f64 / total as f64 * 100.0
+                                );
                             }
                             BackupImportProgress::Processing => {
                                 println!("[backup] Decrypting and importing messages…");
@@ -709,6 +705,9 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                             }
                         })
                         .await?;
+                    if !imported {
+                        println!("[backup] Primary device skipped upload; continuing without message history.");
+                    }
                 }
                 (Err(err), _) => {
                     println!("{err:?}");

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use presage::{
+    backup::TransferArchive,
     libsignal_service::{BackupKey, prelude::MasterKey, protocol::SenderCertificate},
     store::{StateStore, Store},
 };
@@ -364,18 +365,12 @@ impl StateStore for SqliteStore {
     }
 
     async fn fetch_backup_key(&self) -> Result<Option<BackupKey>, Self::StateStoreError> {
-        let result: Option<Vec<u8>> =
-            query_scalar!("SELECT value FROM kv WHERE key = 'backup_key' LIMIT 1")
-                .fetch_optional(&self.db)
-                .await?;
-        match result {
-            None => Ok(None),
-            Some(bytes) => Ok(Some(BackupKey(
-                bytes
-                    .try_into()
-                    .map_err(|_| SqliteStoreError::InvalidFormat)?,
-            ))),
-        }
+        query_scalar!("SELECT value FROM kv WHERE key = 'backup_key' LIMIT 1")
+            .fetch_optional(&self.db)
+            .await?
+            .map(|value: Vec<u8>| value.try_into().map(BackupKey))
+            .transpose()
+            .map_err(|_| SqliteStoreError::InvalidFormat)
     }
 
     async fn store_backup_key(&self, key: Option<&BackupKey>) -> Result<(), Self::StateStoreError> {
@@ -398,31 +393,25 @@ impl StateStore for SqliteStore {
         Ok(())
     }
 
-    async fn fetch_transfer_archive(&self) -> Result<Option<(u32, String)>, Self::StateStoreError> {
-        let result: Option<Vec<u8>> =
-            query_scalar!("SELECT value FROM kv WHERE key = 'transfer_archive' LIMIT 1")
-                .fetch_optional(&self.db)
-                .await?;
-        match result {
-            None => Ok(None),
-            Some(bytes) => {
-                let s = String::from_utf8(bytes).map_err(|_| SqliteStoreError::InvalidFormat)?;
-                let (cdn_str, key) = s.split_once(':').ok_or(SqliteStoreError::InvalidFormat)?;
-                let cdn = cdn_str
-                    .parse::<u32>()
-                    .map_err(|_| SqliteStoreError::InvalidFormat)?;
-                Ok(Some((cdn, key.to_owned())))
-            }
-        }
+    async fn fetch_transfer_archive(
+        &self,
+    ) -> Result<Option<TransferArchive>, Self::StateStoreError> {
+        query_scalar!("SELECT value FROM kv WHERE key = 'transfer_archive' LIMIT 1")
+            .fetch_optional(&self.db)
+            .await?
+            .map(|bytes: Vec<u8>| {
+                serde_json::from_slice(&bytes).map_err(|_| SqliteStoreError::InvalidFormat)
+            })
+            .transpose()
     }
 
     async fn store_transfer_archive(
         &self,
-        archive: Option<(u32, &str)>,
+        archive: Option<&TransferArchive>,
     ) -> Result<(), Self::StateStoreError> {
         match archive {
-            Some((cdn, key)) => {
-                let value = format!("{cdn}:{key}");
+            Some(a) => {
+                let value = serde_json::to_vec(a).map_err(|_| SqliteStoreError::InvalidFormat)?;
                 query!(
                     "INSERT OR REPLACE INTO kv (key, value) VALUES ('transfer_archive', ?)",
                     value

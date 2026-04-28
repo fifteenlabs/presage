@@ -88,6 +88,10 @@ pub fn chat_item_to_content(
                 Thread::Contact(sid) => Some(sid.service_id_string()),
                 Thread::Group(_) => None,
             };
+            // For outgoing group messages the envelope destination is self (our
+            // ACI) — this is the SyncMessage convention: the thread is carried by
+            // Sent.destination_service_id being None and the store is routed via
+            // the explicit Thread argument, not derived from metadata.destination.
             let destination = match &thread {
                 Thread::Contact(sid) => *sid,
                 Thread::Group(_) => ServiceId::Aci(our_aci),

@@ -101,13 +101,14 @@ pub trait StateStore {
 
     fn fetch_transfer_archive(
         &self,
-    ) -> impl Future<Output = Result<Option<(u32, String)>, Self::StateStoreError>> {
+    ) -> impl Future<Output = Result<Option<crate::backup::TransferArchive>, Self::StateStoreError>>
+    {
         async { Ok(None) }
     }
 
     fn store_transfer_archive(
         &self,
-        _archive: Option<(u32, &str)>,
+        _archive: Option<&crate::backup::TransferArchive>,
     ) -> impl Future<Output = Result<(), Self::StateStoreError>> {
         async { Ok(()) }
     }
