@@ -14,6 +14,7 @@ cdsi = ["libsignal-service/cdsi"]
 [dependencies]
 libsignal-service = { git = "https://github.com/whisperfish/libsignal-service-rs", rev = "bb43e8125e0c9e7a1ce20d57fb330f6fbd9257eb", default-features = false, features = [
     "phonenumber",
+    "backups",
 ] }
 
 base64 = "0.22"
@@ -29,6 +30,8 @@ tokio = { version = "1.48", default-features = false, features = [
     "rt",
     "sync",
     "time",
+    "fs",
+    "io-util",
 ] }
 tracing = "0.1"
 url = "2.5"

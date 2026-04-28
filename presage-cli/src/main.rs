@@ -33,6 +33,7 @@ use presage::proto::ReceiptMessage;
 use presage::proto::SyncMessage;
 use presage::store::ContentExt;
 use presage::{
+    backup::BackupImportProgress,
     libsignal_service::content::{Content, ContentBody, DataMessage, GroupContextV2},
     manager::{Registered, RegistrationOptions},
     store::{Store, Thread},
@@ -692,9 +693,39 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             .await;
 
             match manager {
-                (Ok(manager), _) => {
+                (Ok(mut manager), _) => {
                     let whoami = manager.whoami().await?;
                     println!("{whoami:?}");
+
+                    println!("Starting backup import…");
+                    let ephemeral_key = manager.backup_message_key().await?;
+                    let imported = manager
+                        .download_and_import_backup(ephemeral_key, |progress| match progress {
+                            BackupImportProgress::WaitingForUpload => {
+                                println!("[backup] Waiting for primary device to upload…");
+                            }
+                            BackupImportProgress::Downloading {
+                                bytes_received,
+                                total,
+                            } => {
+                                println!(
+                                    "[backup] Downloading… {}/{} bytes ({:.1}%)",
+                                    bytes_received,
+                                    total,
+                                    bytes_received as f64 / total as f64 * 100.0
+                                );
+                            }
+                            BackupImportProgress::Processing => {
+                                println!("[backup] Decrypting and importing messages…");
+                            }
+                            BackupImportProgress::Done => {
+                                println!("[backup] Import complete.");
+                            }
+                        })
+                        .await?;
+                    if !imported {
+                        println!("[backup] Primary device skipped upload; continuing without message history.");
+                    }
                 }
                 (Err(err), _) => {
                     println!("{err:?}");

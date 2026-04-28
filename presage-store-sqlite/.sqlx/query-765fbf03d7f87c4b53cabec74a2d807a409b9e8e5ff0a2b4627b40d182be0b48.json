@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO kv (key, value) VALUES ('backup_key', ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "765fbf03d7f87c4b53cabec74a2d807a409b9e8e5ff0a2b4627b40d182be0b48"
+}

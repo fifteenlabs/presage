@@ -19,7 +19,7 @@ use libsignal_service::{
     push_service::DEFAULT_DEVICE_ID,
     session_store::SessionStoreExt,
     zkgroup::GroupMasterKeyBytes,
-    Profile,
+    BackupKey, Profile,
 };
 use serde::{Deserialize, Serialize};
 use tracing::trace;
@@ -99,6 +99,29 @@ pub trait StateStore {
         &self,
         version: u64,
     ) -> impl Future<Output = Result<(), Self::StateStoreError>>;
+
+    fn fetch_backup_key(
+        &self,
+    ) -> impl Future<Output = Result<Option<BackupKey>, Self::StateStoreError>>;
+
+    fn store_backup_key(
+        &self,
+        key: Option<&BackupKey>,
+    ) -> impl Future<Output = Result<(), Self::StateStoreError>>;
+
+    fn fetch_transfer_archive(
+        &self,
+    ) -> impl Future<Output = Result<Option<crate::backup::TransferArchive>, Self::StateStoreError>>
+    {
+        async { Ok(None) }
+    }
+
+    fn store_transfer_archive(
+        &self,
+        _archive: Option<&crate::backup::TransferArchive>,
+    ) -> impl Future<Output = Result<(), Self::StateStoreError>> {
+        async { Ok(()) }
+    }
 }
 
 /// Stores messages, contacts, groups and profiles
