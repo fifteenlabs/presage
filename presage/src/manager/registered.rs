@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::{future, AsyncReadExt, Stream, StreamExt};
 use libsignal_service::{
     attachment_cipher::decrypt_in_place,
+    backup::{FileReaderFactory, FramesReader, MessageBackupKey, VarintDelimitedReader},
     cipher,
     configuration::{ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, DataMessageFlags, Metadata},
@@ -23,6 +26,7 @@ use libsignal_service::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
     },
     provisioning::ProvisioningError,
+    push_service::linking::{TransferArchiveError, TransferArchiveResult},
     push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
     sender::{AttachmentSpec, AttachmentUploadError},
     sticker_cipher::derive_key,
@@ -42,10 +46,15 @@ use libsignal_service::{
 use rand::rng;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
+use crate::backup::{
+    convert::{self, RecipientInfo},
+    BackupImportProgress, Frame, FrameItem, TransferArchive,
+};
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
 use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
@@ -1209,10 +1218,7 @@ impl<S: Store> Manager<S, Registered> {
         &self,
         attachment_pointer: &AttachmentPointer,
     ) -> Result<Vec<u8>, Error<S::Error>> {
-        let expected_digest = attachment_pointer
-            .digest
-            .as_ref()
-            .ok_or_else(|| Error::UnexpectedAttachmentChecksum)?;
+        let expected_digest = attachment_pointer.digest.as_ref();
 
         let mut service = self.identified_push_service();
         let mut attachment_stream = service.get_attachment(attachment_pointer).await?;
@@ -1224,9 +1230,14 @@ impl<S: Store> Manager<S, Registered> {
         let size_bytes = attachment_stream.read_to_end(&mut ciphertext).await?;
         trace!(size_bytes, "downloaded encrypted attachment");
 
-        let digest = sha2::Sha256::digest(&ciphertext);
-        if &digest[..] != expected_digest {
-            return Err(Error::UnexpectedAttachmentChecksum);
+        // Verify ciphertext digest when present. Backup-imported attachments may carry only
+        // a plaintextHash (no encryptedDigest), so digest can be absent — the HMAC inside
+        // decrypt_in_place still provides integrity verification.
+        if let Some(expected) = expected_digest {
+            let digest = sha2::Sha256::digest(&ciphertext);
+            if &digest[..] != expected {
+                return Err(Error::UnexpectedAttachmentChecksum);
+            }
         }
 
         let key: [u8; 64] = attachment_pointer.key().try_into()?;
@@ -1516,6 +1527,216 @@ impl<S: Store> Manager<S, Registered> {
         for master_key in stubs {
             if let Err(e) = hydrate_group(&mut self.store, &mut groups_manager, master_key).await {
                 warn!(%e, "failed to hydrate group, continuing");
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetches the stored `BackupKey` and derives the `MessageBackupKey` for this account.
+    pub async fn backup_message_key(&self) -> Result<Option<MessageBackupKey>, Error<S::Error>> {
+        let backup_key = match self.store.fetch_backup_key().await? {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let aci = Aci::from_uuid_bytes(self.state.data.service_ids.aci.into_bytes());
+        let backup_id = backup_key.derive_backup_id(&aci);
+        Ok(Some(MessageBackupKey::derive(
+            &backup_key,
+            &backup_id,
+            None,
+        )))
+    }
+
+    /// Download and import a Signal backup after device linking (Link & Sync).
+    pub async fn download_and_import_backup<F: Fn(BackupImportProgress)>(
+        &mut self,
+        ephemeral_key: Option<MessageBackupKey>,
+        on_progress: F,
+    ) -> Result<bool, Error<S::Error>> {
+        let aci = Aci::from_uuid_bytes(self.state.data.service_ids.aci.into_bytes());
+
+        let (stream, total_bytes, path, download_offset, message_backup_key) =
+            if let Some(message_backup_key) = ephemeral_key {
+                let archive = match self.store.fetch_transfer_archive().await? {
+                    Some(cached) => cached,
+                    None => {
+                        on_progress(BackupImportProgress::WaitingForUpload);
+                        let mut svc = self.state.identified_push_service();
+                        match svc
+                            .get_transfer_archive(std::time::Duration::from_secs(3600))
+                            .await?
+                        {
+                            TransferArchiveResult::Available { cdn, key } => {
+                                let archive = TransferArchive {
+                                    cdn,
+                                    key,
+                                    path: crate::backup::random_backup_path(),
+                                };
+                                self.store.store_transfer_archive(Some(&archive)).await?;
+                                archive
+                            }
+                            TransferArchiveResult::Error {
+                                error: TransferArchiveError::RelinkRequested,
+                            } => return Err(Error::BackupRelinkRequested),
+                            TransferArchiveResult::Error {
+                                error: TransferArchiveError::ContinueWithoutUpload,
+                            } => return Ok(false),
+                        }
+                    }
+                };
+                let download_offset = match tokio::fs::metadata(&archive.path).await {
+                    Ok(m) => m.len(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(e) => return Err(e.into()),
+                };
+                let mut svc = self.state.identified_push_service();
+                let (stream, total_bytes) = svc
+                    .download_transfer_archive(archive.cdn, &archive.key, download_offset)
+                    .await?;
+                (
+                    stream,
+                    total_bytes,
+                    archive.path,
+                    download_offset,
+                    message_backup_key,
+                )
+            } else {
+                // Regular backup restore needs a different download path — equivalent
+                // to Signal Desktop's api.download() with ZKP credentials, not
+                // api.downloadEphemeral() which is used for Link & Sync.
+                warn!("regular (non-ephemeral) backup restore is not yet implemented");
+                return Ok(false);
+            };
+
+        self.write_archive_to_file(&path, stream, total_bytes, download_offset, &on_progress)
+            .await?;
+
+        on_progress(BackupImportProgress::Processing);
+
+        let import_result = self.import_from_file(&path, &message_backup_key, aci).await;
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            warn!(%e, path = %path.display(), "failed to remove backup temp file");
+        }
+        import_result?;
+
+        self.store.store_transfer_archive(None).await?;
+        on_progress(BackupImportProgress::Done);
+        Ok(true)
+    }
+
+    /// Streams `stream` into `path` in 64 KB chunks, appending to resume interrupted downloads.
+    /// Reports progress via `on_progress` after each chunk. Times out if a chunk stalls for 10s.
+    async fn write_archive_to_file<R, F>(
+        &self,
+        path: &Path,
+        mut stream: R,
+        total_bytes: u64,
+        download_offset: u64,
+        on_progress: &F,
+    ) -> Result<(), Error<S::Error>>
+    where
+        R: futures::io::AsyncRead + Unpin,
+        F: Fn(BackupImportProgress),
+    {
+        // Matches Signal Desktop's GET_ATTACHMENT_CHUNK_TIMEOUT.
+        const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+        on_progress(BackupImportProgress::Downloading {
+            bytes_received: download_offset,
+            total: total_bytes,
+        });
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+
+        let mut bytes_received = download_offset;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = tokio::time::timeout(CHUNK_TIMEOUT, stream.read(&mut buf))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "transfer archive download stalled",
+                    )
+                })??;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n]).await?;
+            bytes_received += n as u64;
+            on_progress(BackupImportProgress::Downloading {
+                bytes_received,
+                total: total_bytes,
+            });
+        }
+        file.flush().await?;
+        Ok(())
+    }
+
+    /// Decrypts and parses a Backups v2 file, saving each `ChatItem` frame as a `Content` message.
+    /// The first frame (AccountData) is intentionally skipped — settings are synced via other means.
+    async fn import_from_file(
+        &mut self,
+        path: &Path,
+        message_backup_key: &MessageBackupKey,
+        aci: libsignal_service::protocol::Aci,
+    ) -> Result<(), Error<S::Error>> {
+        let factory = FileReaderFactory {
+            path: path.to_owned(),
+        };
+        let frames_reader = FramesReader::new(message_backup_key, factory)
+            .await
+            .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
+        let mut reader = VarintDelimitedReader::new(frames_reader);
+
+        // The first frame is always AccountData (profile name/about/avatar, account
+        // settings like read receipts, typing indicators, link previews, phone number
+        // sharing mode, preferred reaction emoji, etc.). We intentionally skip it for
+        // now: profile data arrives via network fetches on message receipt and storage
+        // service sync, and presage has no settings storage layer yet. This mirrors
+        // Signal Desktop's "no backup" path behaviour.
+        //
+        // TODO: implement AccountData restore — in particular the preferences are
+        // interesting to carry over from the backup rather than waiting for a sync
+        // message from the primary device.
+        reader
+            .read_next()
+            .await
+            .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
+
+        let mut recipients: HashMap<u64, RecipientInfo> = HashMap::new();
+        let mut chats: HashMap<u64, Thread> = HashMap::new();
+
+        while let Some(bytes) = reader
+            .read_next()
+            .await
+            .map_err(|e| Error::BackupImportFailed(e.to_string()))?
+        {
+            let frame = Frame::decode_bytes(bytes.as_ref())
+                .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
+            match frame.item {
+                Some(FrameItem::Recipient(r)) => {
+                    if let Some((id, info)) = convert::recipient_info(&r, aci) {
+                        recipients.insert(id, info);
+                    }
+                }
+                Some(FrameItem::Chat(c)) => {
+                    if let Some((id, thread)) = convert::chat_to_thread(&c, &recipients) {
+                        chats.insert(id, thread);
+                    }
+                }
+                Some(FrameItem::ChatItem(ci)) => {
+                    for (content, thread) in
+                        convert::chat_item_to_contents(&ci, &recipients, &chats, aci)
+                    {
+                        self.store.save_message(&thread, content).await?;
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())

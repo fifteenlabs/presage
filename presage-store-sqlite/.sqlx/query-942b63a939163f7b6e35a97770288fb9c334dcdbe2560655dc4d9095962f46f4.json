@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO kv (key, value) VALUES ('transfer_archive', ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "942b63a939163f7b6e35a97770288fb9c334dcdbe2560655dc4d9095962f46f4"
+}

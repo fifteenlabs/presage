@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 
 use presage::{
-    libsignal_service::{prelude::MasterKey, protocol::SenderCertificate},
+    backup::TransferArchive,
+    libsignal_service::{BackupKey, prelude::MasterKey, protocol::SenderCertificate},
     store::{StateStore, Store},
 };
 use protocol::{IdentityType, SqliteProtocolStore};
@@ -360,6 +361,70 @@ impl StateStore for SqliteStore {
         )
         .execute(&self.db)
         .await?;
+        Ok(())
+    }
+
+    async fn fetch_backup_key(&self) -> Result<Option<BackupKey>, Self::StateStoreError> {
+        query_scalar!("SELECT value FROM kv WHERE key = 'backup_key' LIMIT 1")
+            .fetch_optional(&self.db)
+            .await?
+            .map(|value: Vec<u8>| value.try_into().map(BackupKey))
+            .transpose()
+            .map_err(|_| SqliteStoreError::InvalidFormat)
+    }
+
+    async fn store_backup_key(&self, key: Option<&BackupKey>) -> Result<(), Self::StateStoreError> {
+        match key {
+            Some(k) => {
+                let value = &k.0[..];
+                query!(
+                    "INSERT OR REPLACE INTO kv (key, value) VALUES ('backup_key', ?)",
+                    value
+                )
+                .execute(&self.db)
+                .await?;
+            }
+            None => {
+                query!("DELETE FROM kv WHERE key = 'backup_key'")
+                    .execute(&self.db)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn fetch_transfer_archive(
+        &self,
+    ) -> Result<Option<TransferArchive>, Self::StateStoreError> {
+        query_scalar!("SELECT value FROM kv WHERE key = 'transfer_archive' LIMIT 1")
+            .fetch_optional(&self.db)
+            .await?
+            .map(|bytes: Vec<u8>| {
+                serde_json::from_slice(&bytes).map_err(|_| SqliteStoreError::InvalidFormat)
+            })
+            .transpose()
+    }
+
+    async fn store_transfer_archive(
+        &self,
+        archive: Option<&TransferArchive>,
+    ) -> Result<(), Self::StateStoreError> {
+        match archive {
+            Some(a) => {
+                let value = serde_json::to_vec(a).map_err(|_| SqliteStoreError::InvalidFormat)?;
+                query!(
+                    "INSERT OR REPLACE INTO kv (key, value) VALUES ('transfer_archive', ?)",
+                    value
+                )
+                .execute(&self.db)
+                .await?;
+            }
+            None => {
+                query!("DELETE FROM kv WHERE key = 'transfer_archive'")
+                    .execute(&self.db)
+                    .await?;
+            }
+        }
         Ok(())
     }
 }

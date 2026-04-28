@@ -720,11 +720,14 @@ impl ContentsStore for SqliteStore {
         uuid: Uuid,
         _key: ProfileKey,
     ) -> Result<Option<(Option<String>, AvatarBytes)>, Self::ContentsStoreError> {
-        query!("SELECT bytes, url FROM profile_avatars WHERE uuid = ?", uuid)
-            .fetch_optional(&self.db)
-            .await
-            .map_err(From::from)
-            .map(|opt| opt.map(|r| (r.url, r.bytes)))
+        query!(
+            "SELECT bytes, url FROM profile_avatars WHERE uuid = ?",
+            uuid
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(From::from)
+        .map(|opt| opt.map(|r| (r.url, r.bytes)))
     }
 
     async fn add_sticker_pack(

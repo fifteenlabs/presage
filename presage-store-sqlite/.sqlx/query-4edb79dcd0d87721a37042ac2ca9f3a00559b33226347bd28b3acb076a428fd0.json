@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM kv WHERE key = 'transfer_archive'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "4edb79dcd0d87721a37042ac2ca9f3a00559b33226347bd28b3acb076a428fd0"
+}

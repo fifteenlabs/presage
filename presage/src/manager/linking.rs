@@ -127,6 +127,7 @@ impl<S: Store> Manager<S, Linking> {
                 pni_public_key,
                 profile_key,
                 master_key,
+                backup_key,
             }) => {
                 let registration_data = RegistrationData {
                     signal_servers,
@@ -142,6 +143,9 @@ impl<S: Store> Manager<S, Linking> {
 
                 if let Some(ref master_key) = master_key {
                     store.store_master_key(Some(master_key)).await?;
+                }
+                if let Some(ref backup_key) = backup_key {
+                    store.store_backup_key(Some(backup_key)).await?;
                 }
 
                 store

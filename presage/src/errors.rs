@@ -83,6 +83,10 @@ pub enum Error<S: std::error::Error> {
     InvalidDeviceId,
     #[error("invalid Signal username: {0}")]
     InvalidUsername(#[from] UsernameError),
+    #[error("primary device requested re-link during backup transfer")]
+    BackupRelinkRequested,
+    #[error("backup import failed: {0}")]
+    BackupImportFailed(String),
 }
 
 impl<S: std::error::Error> From<MessageSenderError> for Error<S> {
