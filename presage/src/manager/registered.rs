@@ -1624,6 +1624,8 @@ impl<S: Store> Manager<S, Registered> {
         Ok(true)
     }
 
+    /// Streams `stream` into `path` in 64 KB chunks, appending to resume interrupted downloads.
+    /// Reports progress via `on_progress` after each chunk. Times out if a chunk stalls for 10s.
     async fn write_archive_to_file<R, F>(
         &self,
         path: &Path,
@@ -1675,6 +1677,8 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// Decrypts and parses a Backups v2 file, saving each `ChatItem` frame as a `Content` message.
+    /// The first frame (AccountData) is intentionally skipped — settings are synced via other means.
     async fn import_from_file(
         &mut self,
         path: &Path,

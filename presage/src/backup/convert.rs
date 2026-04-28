@@ -21,11 +21,14 @@ use libsignal_service::{
 use super::ChatItem;
 use crate::store::Thread;
 
+/// Resolved identity of a backup recipient — either a contact's ACI or a group's master key.
 pub struct RecipientInfo {
     pub service_id: Option<ServiceId>,
     pub group_master_key: Option<[u8; 32]>,
 }
 
+/// Extracts the identity of a backup `Recipient`, returning `(recipient_id, info)` or `None`
+/// for unsupported destination types (e.g. distribution lists, release notes channel).
 pub fn recipient_info(r: &backup::Recipient, our_aci: Aci) -> Option<(u64, RecipientInfo)> {
     use libsignal_service::proto::backup::recipient::Destination;
     let info = match r.destination.as_ref()? {
@@ -50,6 +53,8 @@ pub fn recipient_info(r: &backup::Recipient, our_aci: Aci) -> Option<(u64, Recip
     Some((r.id, info))
 }
 
+/// Maps a backup `Chat` to a presage `Thread`, returning `(chat_id, thread)` or `None`
+/// if the chat's recipient hasn't been resolved yet (e.g. unsupported destination type).
 pub fn chat_to_thread(
     chat: &backup::Chat,
     recipients: &HashMap<u64, RecipientInfo>,
@@ -103,6 +108,8 @@ fn file_pointer_to_attachment_pointer(
     })
 }
 
+/// Converts a `MessageAttachment` to a wire-format `AttachmentPointer`, mapping backup flag
+/// values to their wire equivalents (they differ — e.g. backup Gif = 3, wire Gif = 8).
 fn message_attachment_to_pointer(ma: &backup::MessageAttachment) -> Option<AttachmentPointer> {
     let fp = ma.pointer.as_ref()?;
     // Backup Gif = 3, wire Gif = 8 — values differ, so we map explicitly.
@@ -115,6 +122,8 @@ fn message_attachment_to_pointer(ma: &backup::MessageAttachment) -> Option<Attac
     file_pointer_to_attachment_pointer(fp, flags)
 }
 
+/// Converts a backup `Quote` to a wire-format `DataMessage::Quote`. Returns `None` if the
+/// quoted author can't be resolved to an ACI (required by the wire format).
 fn backup_quote_to_dm_quote(
     q: &backup::Quote,
     recipients: &HashMap<u64, RecipientInfo>,
@@ -138,6 +147,8 @@ fn backup_quote_to_dm_quote(
     })
 }
 
+/// Converts a backup `LinkPreview` to a wire-format `Preview`, resolving the thumbnail image
+/// via `file_pointer_to_attachment_pointer` (returns `None` image if not CDN-hosted).
 fn backup_link_preview_to_preview(lp: &backup::LinkPreview) -> Preview {
     Preview {
         url: Some(lp.url.clone()),
@@ -151,6 +162,7 @@ fn backup_link_preview_to_preview(lp: &backup::LinkPreview) -> Preview {
     }
 }
 
+/// Converts a backup `Sticker` to a wire-format `DataMessage::Sticker`.
 fn backup_sticker_to_dm_sticker(s: &backup::Sticker) -> data_message::Sticker {
     data_message::Sticker {
         pack_id: Some(s.pack_id.clone()),
