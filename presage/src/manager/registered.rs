@@ -1218,10 +1218,7 @@ impl<S: Store> Manager<S, Registered> {
         &self,
         attachment_pointer: &AttachmentPointer,
     ) -> Result<Vec<u8>, Error<S::Error>> {
-        let expected_digest = attachment_pointer
-            .digest
-            .as_ref()
-            .ok_or_else(|| Error::UnexpectedAttachmentChecksum)?;
+        let expected_digest = attachment_pointer.digest.as_ref();
 
         let mut service = self.identified_push_service();
         let mut attachment_stream = service.get_attachment(attachment_pointer).await?;
@@ -1233,9 +1230,14 @@ impl<S: Store> Manager<S, Registered> {
         let size_bytes = attachment_stream.read_to_end(&mut ciphertext).await?;
         trace!(size_bytes, "downloaded encrypted attachment");
 
-        let digest = sha2::Sha256::digest(&ciphertext);
-        if &digest[..] != expected_digest {
-            return Err(Error::UnexpectedAttachmentChecksum);
+        // Verify ciphertext digest when present. Backup-imported attachments may carry only
+        // a plaintextHash (no encryptedDigest), so digest can be absent — the HMAC inside
+        // decrypt_in_place still provides integrity verification.
+        if let Some(expected) = expected_digest {
+            let digest = sha2::Sha256::digest(&ciphertext);
+            if &digest[..] != expected {
+                return Err(Error::UnexpectedAttachmentChecksum);
+            }
         }
 
         let key: [u8; 64] = attachment_pointer.key().try_into()?;
@@ -1714,7 +1716,7 @@ impl<S: Store> Manager<S, Registered> {
                 .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
             match frame.item {
                 Some(FrameItem::Recipient(r)) => {
-                    if let Some((id, info)) = convert::recipient_info(&r) {
+                    if let Some((id, info)) = convert::recipient_info(&r, aci) {
                         recipients.insert(id, info);
                     }
                 }
@@ -1724,8 +1726,8 @@ impl<S: Store> Manager<S, Registered> {
                     }
                 }
                 Some(FrameItem::ChatItem(ci)) => {
-                    if let Some((content, thread)) =
-                        convert::chat_item_to_content(&ci, &recipients, &chats, aci)
+                    for (content, thread) in
+                        convert::chat_item_to_contents(&ci, &recipients, &chats, aci)
                     {
                         self.store.save_message(&thread, content).await?;
                     }

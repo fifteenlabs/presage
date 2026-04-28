@@ -1,7 +1,7 @@
 pub mod convert;
 
 pub use libsignal_service::proto::backup::{
-    frame::Item as FrameItem, Chat, ChatItem, Frame, Recipient, StandardMessage,
+    frame::Item as FrameItem, Chat, ChatItem, Frame, Recipient,
 };
 
 pub(crate) fn random_backup_path() -> std::path::PathBuf {
