@@ -32,6 +32,22 @@ use crate::{
 /// An error trait implemented by store error types
 pub trait StoreError: std::error::Error + Sync + Send {}
 
+/// A resumable checkpoint inside `sync_storage_service`.
+///
+/// After each batch of records is successfully fetched and persisted, the sync
+/// writes one of these to the state store. On the next sync attempt, if the
+/// server's current manifest version equals `target_version`, the loop skips
+/// the first `next_batch_index` batches.
+///
+/// If `target_version` doesn't match the server's current version (because the
+/// server moved on while we were offline), the cursor is discarded and sync
+/// restarts at batch 0.
+#[derive(Debug, Clone, Copy)]
+pub struct StorageSyncCursor {
+    pub target_version: u64,
+    pub next_batch_index: u32,
+}
+
 /// Stores the registered state of the manager
 pub trait StateStore {
     type StateStoreError: StoreError;
@@ -89,6 +105,32 @@ pub trait StateStore {
         &self,
         version: u64,
     ) -> impl Future<Output = Result<(), Self::StateStoreError>>;
+
+    /// Fetch the in-progress storage-service sync cursor, if any.
+    ///
+    /// Stores that don't implement resume can leave the default no-op
+    /// returning `Ok(None)` — the sync will always start from batch 0.
+    fn fetch_storage_sync_cursor(
+        &self,
+    ) -> impl Future<Output = Result<Option<StorageSyncCursor>, Self::StateStoreError>> {
+        async { Ok(None) }
+    }
+
+    /// Persist the in-progress storage-service sync cursor. Called once
+    /// after each batch of records is successfully fetched + applied.
+    fn store_storage_sync_cursor(
+        &self,
+        _cursor: &StorageSyncCursor,
+    ) -> impl Future<Output = Result<(), Self::StateStoreError>> {
+        async { Ok(()) }
+    }
+
+    /// Clear the in-progress cursor. Called when sync completes
+    /// successfully, when the saved cursor's target_version is stale,
+    /// or when the server reports no change (204).
+    fn clear_storage_sync_cursor(&self) -> impl Future<Output = Result<(), Self::StateStoreError>> {
+        async { Ok(()) }
+    }
 
     fn fetch_backup_key(
         &self,
