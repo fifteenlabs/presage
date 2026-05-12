@@ -65,7 +65,9 @@ use crate::backup::{
 };
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
-use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
+use crate::store::{
+    ContentsStore, Sticker, StickerPack, StickerPackManifest, StorageSyncCursor, Store, Thread,
+};
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
 
 pub use crate::model::messages::Received;
@@ -2479,6 +2481,8 @@ async fn sync_storage_service<S: Store>(
             local_version,
             "storage sync: server version unchanged (204), skipping"
         );
+        // Server reports no change — a leftover cursor would be stale.
+        store.clear_storage_sync_cursor().await.ok();
         return Ok(());
     };
     debug!(
@@ -2526,8 +2530,36 @@ async fn sync_storage_service<S: Store>(
     let total = all_keys.len();
     debug!(total, "storage sync: fetching storage records in batches");
 
+    // If we have a saved cursor that targets this same manifest version,
+    // skip the batches already completed in the prior attempt. A cursor
+    // for any other version is stale — discard and start fresh.
+    let resume_from = match store.fetch_storage_sync_cursor().await? {
+        Some(cursor) if cursor.target_version == manifest.version => {
+            debug!(
+                target_version = cursor.target_version,
+                next_batch_index = cursor.next_batch_index,
+                "storage sync: resuming from saved cursor"
+            );
+            cursor.next_batch_index as usize
+        }
+        Some(stale) => {
+            debug!(
+                stale_version = stale.target_version,
+                current_version = manifest.version,
+                "storage sync: stale cursor for old manifest version, discarding"
+            );
+            store.clear_storage_sync_cursor().await.ok();
+            0
+        }
+        None => 0,
+    };
+
     let mut total_processed = 0usize;
-    for (i, batch) in all_keys.chunks(STORAGE_SERVICE_BATCH_SIZE).enumerate() {
+    for (i, batch) in all_keys
+        .chunks(STORAGE_SERVICE_BATCH_SIZE)
+        .enumerate()
+        .skip(resume_from)
+    {
         debug!(
             batch = i,
             size = batch.len(),
@@ -2639,11 +2671,27 @@ async fn sync_storage_service<S: Store>(
                 }
             }
         }
+
+        // Per-batch checkpoint: every record in batches 0..=i has been
+        // attempted (successes are persisted via INSERT OR REPLACE in the
+        // store impls; failures were warn-logged and skipped). If the app
+        // dies after this point, the next sync targeting this same manifest
+        // version will resume at batch i+1.
+        let cursor = StorageSyncCursor {
+            target_version: manifest.version,
+            next_batch_index: (i + 1) as u32,
+        };
+        if let Err(e) = store.store_storage_sync_cursor(&cursor).await {
+            warn!(%e, "storage sync: failed to persist sync cursor, continuing");
+        }
     }
 
     store
         .store_storage_manifest_version(manifest.version)
         .await?;
+    // Sync completed end-to-end — clear the cursor so it doesn't survive
+    // as a stale entry on the next call.
+    store.clear_storage_sync_cursor().await.ok();
     info!(
         count = total_processed,
         version = manifest.version,
