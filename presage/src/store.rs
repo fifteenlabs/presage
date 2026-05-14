@@ -12,7 +12,7 @@ use libsignal_service::{
         verified, DataMessage, EditMessage, GroupContextV2, SyncMessage, Verified,
     },
     protocol::{
-        IdentityKey, IdentityKeyPair, ProtocolAddress, ProtocolStore, SenderCertificate,
+        Aci, IdentityKey, IdentityKeyPair, ProtocolAddress, ProtocolStore, SenderCertificate,
         SenderKeyStore, ServiceId,
     },
     push_service::DEFAULT_DEVICE_ID,
@@ -559,6 +559,31 @@ impl TryFrom<&Content> for Thread {
                     .try_into()
                     .expect("Group master key to have 32 bytes"),
             )),
+            // [Call] Sync'd 1:1 call event (from another linked device).
+            // The peer lives in `call_event.conversation_id` (16 raw UUID
+            // bytes); the envelope's `metadata.sender` is our own ACI, so
+            // without this arm the call would land in sync-self. Adhoc and
+            // group call types fall through — they need group_id/room_id
+            // resolution out of scope here.
+            ContentBody::SynchronizeMessage(SyncMessage {
+                call_event: Some(call_event),
+                ..
+            }) if matches!(
+                sync_message::call_event::Type::try_from(call_event.r#type.unwrap_or(0)),
+                Ok(sync_message::call_event::Type::AudioCall
+                    | sync_message::call_event::Type::VideoCall)
+            ) =>
+            {
+                let bytes = call_event
+                    .conversation_id
+                    .as_deref()
+                    .ok_or(ThreadError::InvalidServiceId)?;
+                let uuid_bytes: [u8; 16] = bytes
+                    .try_into()
+                    .map_err(|_| ThreadError::InvalidServiceId)?;
+                let aci = Aci::from_uuid_bytes(uuid_bytes);
+                Ok(Self::Contact(ServiceId::from(aci)))
+            }
             // [1-1] Any other message directly to us
             _ => Ok(Thread::Contact(content.metadata.sender)),
         }
