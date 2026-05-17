@@ -1931,8 +1931,18 @@ async fn save_message<S: Store>(
     message: Content,
     override_thread: Option<Thread>,
 ) -> Result<(), Error<S::Error>> {
-    // derive the thread from the message type
-    let thread = override_thread.unwrap_or(Thread::try_from(&message)?);
+    // derive the thread from the message type. For sync group call_events,
+    // the wire-format `conversation_id` is the 32-byte derived group_id; we
+    // ask the store to translate it back to a Thread::Group via the master_key
+    // index. Falls back to Thread::try_from for non-call content and for
+    // unresolved/adhoc cases (which still land in sync-self for now).
+    let thread = match override_thread {
+        Some(t) => t,
+        None => match crate::model::calls::resolve_call_thread(&message, store).await? {
+            Some(t) => t,
+            None => Thread::try_from(&message)?,
+        },
+    };
 
     // only save DataMessage and SynchronizeMessage (sent)
     let message = match message.body {

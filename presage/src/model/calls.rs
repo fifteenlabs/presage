@@ -8,12 +8,16 @@
 //! Live `CallMessage` signaling is intentionally not modelled here — only the
 //! sync record that another linked device emits.
 
-use libsignal_service::content::ContentBody;
+use libsignal_service::content::{Content, ContentBody};
 use libsignal_service::prelude::Uuid;
 use libsignal_service::proto::sync_message::call_event::{Direction, Event, Type};
 use libsignal_service::protocol::{Aci, ServiceId};
+use libsignal_service::zkgroup::{
+    groups::{GroupMasterKey, GroupSecretParams},
+    GroupMasterKeyBytes,
+};
 
-use crate::store::Thread;
+use crate::store::{ContentsStore, Thread};
 
 /// Direct (1:1), Group, or Adhoc (call link).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,6 +248,111 @@ pub fn call_conversation_id_to_thread(bytes: &[u8]) -> Option<Thread> {
     } else {
         None
     }
+}
+
+/// Typed peer for a call event.
+///
+/// `Direct` carries the peer's ACI (1:1); `Group` carries the group's
+/// master_key (resolved via the store from the wire-format 32-byte group_id).
+/// Adhoc/call-link rooms are not yet modelled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallPeer {
+    Direct(Uuid),
+    Group(GroupMasterKeyBytes),
+}
+
+impl CallPeer {
+    /// Stable string form used as `peer_id` in [`CallHistoryEntry`].
+    /// 1:1 uses the UUID display form; groups use lowercase hex of the
+    /// 32-byte master_key (matches the thread_id convention elsewhere).
+    pub fn peer_id(&self) -> String {
+        match self {
+            Self::Direct(uuid) => uuid.to_string(),
+            Self::Group(mk) => hex::encode(mk),
+        }
+    }
+
+    /// The [`Thread`] this peer routes to.
+    pub fn to_thread(&self) -> Thread {
+        match self {
+            Self::Direct(uuid) => {
+                let aci = Aci::from_uuid_bytes(uuid.into_bytes());
+                Thread::Contact(ServiceId::from(aci))
+            }
+            Self::Group(mk) => Thread::Group(*mk),
+        }
+    }
+}
+
+/// Find the `master_key` whose derived `group_id` matches `target_group_id`.
+///
+/// Sync `call_event.conversation_id` for group calls carries the 32-byte
+/// derived `group_id`, but the rest of presage indexes groups by `master_key`.
+/// The derivation is one-way (SHO hash), so we resolve by iterating all
+/// stored groups and computing each one's `group_id`. O(N) per lookup; fine
+/// for typical group counts.
+pub async fn resolve_group_master_key_from_group_id<S: ContentsStore>(
+    store: &S,
+    target_group_id: &[u8; 32],
+) -> Result<Option<GroupMasterKeyBytes>, S::ContentsStoreError> {
+    let iter = store.groups().await?;
+    for result in iter {
+        let (master_key, _group) = result?;
+        let secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+        if &secret_params.get_group_identifier() == target_group_id {
+            return Ok(Some(master_key));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve a [`CallEventInfo`] to its typed peer.
+///
+/// Returns `Ok(None)` for adhoc (not yet supported) and for group calls whose
+/// derived `group_id` doesn't match any stored group (e.g. a call event that
+/// arrived before the group was synced).
+pub async fn resolve_call_peer<S: ContentsStore>(
+    info: &CallEventInfo,
+    store: &S,
+) -> Result<Option<CallPeer>, S::ContentsStoreError> {
+    match info.mode {
+        CallMode::Direct => {
+            let uuid_bytes: [u8; 16] = match info.conversation_id.as_slice().try_into() {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            };
+            Ok(Some(CallPeer::Direct(Uuid::from_bytes(uuid_bytes))))
+        }
+        CallMode::Group => {
+            let group_id: [u8; 32] = match info.conversation_id.as_slice().try_into() {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            };
+            Ok(resolve_group_master_key_from_group_id(store, &group_id)
+                .await?
+                .map(CallPeer::Group))
+        }
+        CallMode::Adhoc | CallMode::Unknown => Ok(None),
+    }
+}
+
+/// Resolve the [`Thread`] for a `Content` carrying a sync `call_event`, using
+/// the store to translate group call `group_id` into a `Thread::Group`.
+///
+/// Returns `Ok(None)` when the content is not a sync call_event, or when it
+/// is but can't be resolved (adhoc, malformed, unknown group). Callers fall
+/// back to [`Thread::try_from`] in that case.
+pub async fn resolve_call_thread<S: ContentsStore>(
+    content: &Content,
+    store: &S,
+) -> Result<Option<Thread>, S::ContentsStoreError> {
+    let Some(info) = extract_call_event(&content.body) else {
+        return Ok(None);
+    };
+    Ok(resolve_call_peer(&info, store)
+        .await?
+        .map(|peer| peer.to_thread()))
 }
 
 /// Merge a freshly-arrived sync call event into the prior canonical entry,
