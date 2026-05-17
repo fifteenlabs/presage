@@ -25,7 +25,7 @@ use tracing::trace;
 
 use crate::{
     manager::RegistrationData,
-    model::{contacts::Contact, groups::Group},
+    model::{calls::CallHistoryEntry, contacts::Contact, groups::Group},
     AvatarBytes,
 };
 
@@ -219,6 +219,20 @@ pub trait ContentsStore: Send + Sync {
         thread: &Thread,
         range: impl RangeBounds<u64>,
     ) -> impl Future<Output = Result<Self::MessagesIter, Self::ContentsStoreError>>;
+
+    /// Persist a canonical call history entry produced by
+    /// [`crate::model::calls::transition_call_history`].
+    ///
+    /// Stores keep the post-merge state separate from the per-event sync rows
+    /// written by [`Self::save_message`]. The default impl is a no-op so stores
+    /// that don't yet model call history (e.g. presage's in-memory store) can
+    /// still compile; persistent stores override it.
+    fn save_call_history(
+        &self,
+        _entry: &CallHistoryEntry,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
 
     /// Get the expire timer from a [Thread], which corresponds to either [Contact::expire_timer]
     /// or [Group::disappearing_messages_timer].

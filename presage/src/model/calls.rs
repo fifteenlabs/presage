@@ -10,8 +10,8 @@
 
 use libsignal_service::content::ContentBody;
 use libsignal_service::prelude::Uuid;
-use libsignal_service::protocol::{Aci, ServiceId};
 use libsignal_service::proto::sync_message::call_event::{Direction, Event, Type};
+use libsignal_service::protocol::{Aci, ServiceId};
 
 use crate::store::Thread;
 
@@ -292,9 +292,13 @@ pub fn transition_call_history(
     }
 
     let status = match (info.event, info.direction) {
-        (CallEventKind::NotAccepted, CallDirection::Incoming) => CallStatus::Missed,
-        (CallEventKind::NotAccepted, CallDirection::Outgoing) => CallStatus::Declined,
-        (CallEventKind::NotAccepted, CallDirection::Unknown) => CallStatus::Missed,
+        // Signal Desktop's `transitionDirectCallStatus` maps a wire-arriving
+        // `NOT_ACCEPTED` to `Missed` for all directions (unless the receiving
+        // device had already locally resolved the call as Declined, which doesn't
+        // apply to us — app v2 has no call UI and no local participation).
+        // The asymmetric "Declined" vs "Missed" labelling happens at UI time
+        // based on direction, not in the status itself.
+        (CallEventKind::NotAccepted, _) => CallStatus::Missed,
         (CallEventKind::Observed, _) => CallStatus::Pending,
         _ => prev_status.unwrap_or(CallStatus::Pending),
     };
@@ -332,44 +336,98 @@ mod tests {
 
     #[test]
     fn observed_fresh_becomes_pending() {
-        let out = transition_call_history(None, &info(CallEventKind::Observed, CallDirection::Incoming, 100), peer()).unwrap();
+        let out = transition_call_history(
+            None,
+            &info(CallEventKind::Observed, CallDirection::Incoming, 100),
+            peer(),
+        )
+        .unwrap();
         assert_eq!(out.status, CallStatus::Pending);
         assert_eq!(out.timestamp_ms, 100);
     }
 
     #[test]
     fn not_accepted_incoming_is_missed() {
-        let prev = transition_call_history(None, &info(CallEventKind::Observed, CallDirection::Incoming, 100), peer());
-        let out = transition_call_history(prev.as_ref(), &info(CallEventKind::NotAccepted, CallDirection::Incoming, 200), peer()).unwrap();
+        // Matches Signal Desktop's `transitionDirectCallStatus`: a wire-arriving
+        // `NOT_ACCEPTED` always resolves to Missed for a device with no prior
+        // local Declined state. UI labelling (Declined vs Missed) is applied
+        // later based on direction.
+        let prev = transition_call_history(
+            None,
+            &info(CallEventKind::Observed, CallDirection::Incoming, 100),
+            peer(),
+        );
+        let out = transition_call_history(
+            prev.as_ref(),
+            &info(CallEventKind::NotAccepted, CallDirection::Incoming, 200),
+            peer(),
+        )
+        .unwrap();
         assert_eq!(out.status, CallStatus::Missed);
     }
 
     #[test]
-    fn not_accepted_outgoing_is_declined() {
-        let prev = transition_call_history(None, &info(CallEventKind::Observed, CallDirection::Outgoing, 100), peer());
-        let out = transition_call_history(prev.as_ref(), &info(CallEventKind::NotAccepted, CallDirection::Outgoing, 200), peer()).unwrap();
-        assert_eq!(out.status, CallStatus::Declined);
+    fn not_accepted_outgoing_is_missed() {
+        let prev = transition_call_history(
+            None,
+            &info(CallEventKind::Observed, CallDirection::Outgoing, 100),
+            peer(),
+        );
+        let out = transition_call_history(
+            prev.as_ref(),
+            &info(CallEventKind::NotAccepted, CallDirection::Outgoing, 200),
+            peer(),
+        )
+        .unwrap();
+        assert_eq!(out.status, CallStatus::Missed);
     }
 
     #[test]
     fn accepted_is_sticky_against_later_not_accepted() {
-        let prev = transition_call_history(None, &info(CallEventKind::Accepted, CallDirection::Incoming, 100), peer());
+        let prev = transition_call_history(
+            None,
+            &info(CallEventKind::Accepted, CallDirection::Incoming, 100),
+            peer(),
+        );
         assert_eq!(prev.as_ref().unwrap().status, CallStatus::Accepted);
-        let out = transition_call_history(prev.as_ref(), &info(CallEventKind::NotAccepted, CallDirection::Incoming, 200), peer()).unwrap();
+        let out = transition_call_history(
+            prev.as_ref(),
+            &info(CallEventKind::NotAccepted, CallDirection::Incoming, 200),
+            peer(),
+        )
+        .unwrap();
         assert_eq!(out.status, CallStatus::Accepted);
     }
 
     #[test]
     fn delete_is_terminal_over_accepted() {
-        let prev = transition_call_history(None, &info(CallEventKind::Accepted, CallDirection::Incoming, 100), peer());
-        let out = transition_call_history(prev.as_ref(), &info(CallEventKind::Delete, CallDirection::Incoming, 200), peer()).unwrap();
+        let prev = transition_call_history(
+            None,
+            &info(CallEventKind::Accepted, CallDirection::Incoming, 100),
+            peer(),
+        );
+        let out = transition_call_history(
+            prev.as_ref(),
+            &info(CallEventKind::Delete, CallDirection::Incoming, 200),
+            peer(),
+        )
+        .unwrap();
         assert_eq!(out.status, CallStatus::Deleted);
     }
 
     #[test]
     fn delete_is_terminal_even_against_later_events() {
-        let prev = transition_call_history(None, &info(CallEventKind::Delete, CallDirection::Incoming, 100), peer());
-        let out = transition_call_history(prev.as_ref(), &info(CallEventKind::Accepted, CallDirection::Incoming, 200), peer()).unwrap();
+        let prev = transition_call_history(
+            None,
+            &info(CallEventKind::Delete, CallDirection::Incoming, 100),
+            peer(),
+        );
+        let out = transition_call_history(
+            prev.as_ref(),
+            &info(CallEventKind::Accepted, CallDirection::Incoming, 200),
+            peer(),
+        )
+        .unwrap();
         assert_eq!(out.status, CallStatus::Deleted);
     }
 
@@ -384,8 +442,17 @@ mod tests {
 
     #[test]
     fn timestamp_anchored_at_first_event() {
-        let prev = transition_call_history(None, &info(CallEventKind::Observed, CallDirection::Incoming, 100), peer());
-        let out = transition_call_history(prev.as_ref(), &info(CallEventKind::Accepted, CallDirection::Incoming, 500), peer()).unwrap();
+        let prev = transition_call_history(
+            None,
+            &info(CallEventKind::Observed, CallDirection::Incoming, 100),
+            peer(),
+        );
+        let out = transition_call_history(
+            prev.as_ref(),
+            &info(CallEventKind::Accepted, CallDirection::Incoming, 500),
+            peer(),
+        )
+        .unwrap();
         assert_eq!(out.timestamp_ms, 100);
     }
 

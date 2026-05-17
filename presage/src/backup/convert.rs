@@ -276,6 +276,15 @@ pub fn chat_item_to_contents(
     };
     let timestamp = item.date_sent;
 
+    // Calls are modeled as `UpdateMessage` ChatItems, not `StandardMessage`,
+    // and produce a `SyncMessage { call_event }` rather than a DataMessage —
+    // so handle them before the StandardMessage/StickerMessage path. Other
+    // update kinds (GroupCall, group changes, profile changes, etc.) fall
+    // through to the catch-all and are dropped.
+    if let Some(Item::UpdateMessage(cu)) = item.item.as_ref() {
+        return individual_call_to_contents(cu, &thread, our_aci, timestamp);
+    }
+
     let is_outgoing = match item.directional_details.as_ref() {
         Some(DirectionalDetails::Outgoing(_)) => true,
         Some(DirectionalDetails::Incoming(_)) => false,
@@ -375,4 +384,90 @@ pub fn chat_item_to_contents(
         reactions, item, recipients, &thread, our_aci,
     ));
     results
+}
+
+/// Convert a backup `ChatUpdateMessage` carrying an `IndividualCall` into a
+/// synthetic sync `call_event` Content, so it flows through the normal
+/// `save_message` path. Group/adhoc updates and non-call ChatUpdates return
+/// empty — they require resolution that v1 doesn't provide.
+fn individual_call_to_contents(
+    cu: &backup::ChatUpdateMessage,
+    thread: &Thread,
+    our_aci: Aci,
+    fallback_ts: u64,
+) -> Vec<(Content, Thread)> {
+    use backup::chat_update_message::Update;
+    use backup::individual_call;
+    use sync_message::call_event::{Direction as WireDir, Event as WireEvent, Type as WireType};
+
+    let Some(Update::IndividualCall(call)) = cu.update.as_ref() else {
+        return vec![];
+    };
+
+    // Only 1:1 calls are modelled. A non-Contact thread here would mean the
+    // backup put an IndividualCall on a group chat — out of spec; drop.
+    let Thread::Contact(peer) = thread else {
+        return vec![];
+    };
+    let conv_id: Vec<u8> = peer.raw_uuid().as_bytes().to_vec();
+
+    // Proto defaults follow the comments in Backup.proto:
+    //   UNKNOWN_TYPE      → Audio
+    //   UNKNOWN_DIRECTION → Incoming
+    //   UNKNOWN_STATE     → Accepted
+    let wire_type = match individual_call::Type::try_from(call.r#type) {
+        Ok(individual_call::Type::VideoCall) => WireType::VideoCall,
+        _ => WireType::AudioCall,
+    };
+    let wire_dir = match individual_call::Direction::try_from(call.direction) {
+        Ok(individual_call::Direction::Outgoing) => WireDir::Outgoing,
+        _ => WireDir::Incoming,
+    };
+    // The backup carries the final state, so we synthesise a single event that
+    // collapses through `transition_call_history` to the right canonical
+    // status: Accepted → Accepted; Missed / MissedNotificationProfile /
+    // NotAccepted → NotAccepted (state machine resolves to `Missed`; the UI
+    // layer applies the Missed/Declined label based on direction).
+    let wire_event = match individual_call::State::try_from(call.state) {
+        Ok(individual_call::State::Missed)
+        | Ok(individual_call::State::MissedNotificationProfile)
+        | Ok(individual_call::State::NotAccepted) => WireEvent::NotAccepted,
+        _ => WireEvent::Accepted,
+    };
+
+    let call_ts = if call.started_call_timestamp != 0 {
+        call.started_call_timestamp
+    } else {
+        fallback_ts
+    };
+
+    let call_event = sync_message::CallEvent {
+        conversation_id: Some(conv_id),
+        call_id: call.call_id,
+        timestamp: Some(call_ts),
+        r#type: Some(wire_type as i32),
+        direction: Some(wire_dir as i32),
+        event: Some(wire_event as i32),
+    };
+
+    let body = ContentBody::SynchronizeMessage(SyncMessage {
+        call_event: Some(call_event),
+        ..Default::default()
+    });
+
+    let main_content = Content {
+        metadata: Metadata {
+            sender: ServiceId::Aci(our_aci),
+            destination: ServiceId::Aci(our_aci),
+            sender_device: *DEFAULT_DEVICE_ID,
+            server_guid: None,
+            timestamp: call_ts,
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+        },
+        body,
+    };
+
+    vec![(main_content, thread.clone())]
 }

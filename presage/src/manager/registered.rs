@@ -55,6 +55,9 @@ use crate::backup::{
     convert::{self, RecipientInfo},
     BackupImportProgress, Frame, FrameItem, TransferArchive,
 };
+use crate::model::calls::{
+    call_conversation_id_to_peer_uuid, extract_call_event, transition_call_history,
+};
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
 use crate::store::{
@@ -1735,7 +1738,18 @@ impl<S: Store> Manager<S, Registered> {
                     for (content, thread) in
                         convert::chat_item_to_contents(&ci, &recipients, &chats, aci)
                     {
+                        // Detect a synthesised sync `call_event` before moving
+                        // `content` into `save_message`. Backup rows carry one
+                        // event per call (final state); the state machine
+                        // collapses it into the canonical entry.
+                        let call_entry = extract_call_event(&content.body).and_then(|info| {
+                            let peer = call_conversation_id_to_peer_uuid(&info.conversation_id)?;
+                            transition_call_history(None, &info, peer)
+                        });
                         self.store.save_message(&thread, content).await?;
+                        if let Some(entry) = call_entry {
+                            self.store.save_call_history(&entry).await?;
+                        }
                     }
                 }
                 _ => {}
