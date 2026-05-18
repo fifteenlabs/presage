@@ -265,6 +265,9 @@ fn reactions_to_contents(
 ///
 /// Returns the main message first, followed by one entry per reaction (each reconstructed
 /// as its own `DataMessage::reaction` envelope, matching Signal's wire format).
+///
+/// Pure dispatcher: each item kind has its own helper. Unknown item kinds and
+/// unsupported `UpdateMessage` sub-variants drop silently (empty vec).
 pub fn chat_item_to_contents(
     item: &ChatItem,
     recipients: &HashMap<u64, RecipientInfo>,
@@ -276,78 +279,118 @@ pub fn chat_item_to_contents(
     };
     let timestamp = item.date_sent;
 
-    // Calls are modeled as `UpdateMessage` ChatItems, not `StandardMessage`,
-    // and produce a `SyncMessage { call_event }` rather than a DataMessage —
-    // so handle them before the StandardMessage/StickerMessage path. Other
-    // update kinds (group changes, profile changes, etc.) fall through to
-    // the catch-all and are dropped.
-    if let Some(Item::UpdateMessage(cu)) = item.item.as_ref() {
-        match cu.update.as_ref() {
+    match item.item.as_ref() {
+        Some(Item::StandardMessage(sm)) => {
+            standard_message_to_contents(sm, item, &thread, recipients, our_aci, timestamp)
+        }
+        Some(Item::StickerMessage(sm)) => {
+            sticker_message_to_contents(sm, item, &thread, recipients, our_aci, timestamp)
+        }
+        Some(Item::UpdateMessage(cu)) => match cu.update.as_ref() {
             Some(backup::chat_update_message::Update::IndividualCall(_)) => {
-                return individual_call_to_contents(cu, &thread, our_aci, timestamp);
+                individual_call_to_contents(cu, &thread, our_aci, timestamp)
             }
             Some(backup::chat_update_message::Update::GroupCall(_)) => {
-                return group_call_to_contents(cu, &thread, recipients, our_aci, timestamp);
+                group_call_to_contents(cu, &thread, recipients, our_aci, timestamp)
             }
-            _ => return vec![],
-        }
+            _ => vec![],
+        },
+        _ => vec![],
     }
+}
 
+/// Build a `DataMessage` for a backup `StandardMessage` (text + attachments +
+/// quote + link previews), then hand off to the shared envelope/reactions
+/// wrapper.
+fn standard_message_to_contents(
+    sm: &backup::StandardMessage,
+    item: &ChatItem,
+    thread: &Thread,
+    recipients: &HashMap<u64, RecipientInfo>,
+    our_aci: Aci,
+    timestamp: u64,
+) -> Vec<(Content, Thread)> {
+    let dm = DataMessage {
+        body: sm.text.as_ref().map(|t| t.body.clone()),
+        attachments: sm
+            .attachments
+            .iter()
+            .filter_map(message_attachment_to_pointer)
+            .collect(),
+        quote: sm
+            .quote
+            .as_ref()
+            .and_then(|q| backup_quote_to_dm_quote(q, recipients)),
+        preview: sm
+            .link_preview
+            .iter()
+            .map(backup_link_preview_to_preview)
+            .collect(),
+        timestamp: Some(timestamp),
+        ..Default::default()
+    };
+    wrap_dm_with_reactions(
+        dm,
+        &sm.reactions,
+        item,
+        thread,
+        recipients,
+        our_aci,
+        timestamp,
+    )
+}
+
+/// Build a `DataMessage` for a backup `StickerMessage`, then hand off to the
+/// shared envelope/reactions wrapper.
+fn sticker_message_to_contents(
+    sm: &backup::StickerMessage,
+    item: &ChatItem,
+    thread: &Thread,
+    recipients: &HashMap<u64, RecipientInfo>,
+    our_aci: Aci,
+    timestamp: u64,
+) -> Vec<(Content, Thread)> {
+    let dm = DataMessage {
+        sticker: sm.sticker.as_ref().map(backup_sticker_to_dm_sticker),
+        timestamp: Some(timestamp),
+        ..Default::default()
+    };
+    wrap_dm_with_reactions(
+        dm,
+        &sm.reactions,
+        item,
+        thread,
+        recipients,
+        our_aci,
+        timestamp,
+    )
+}
+
+/// Wrap a `DataMessage` into a sync (outgoing) or direct (incoming) envelope,
+/// then append per-reaction Contents. Returns `vec![]` for missing
+/// directional details, or for incoming items whose author can't be resolved
+/// to a ServiceId — same drop-cases as the original inline implementation.
+fn wrap_dm_with_reactions(
+    dm: DataMessage,
+    reactions: &[backup::Reaction],
+    item: &ChatItem,
+    thread: &Thread,
+    recipients: &HashMap<u64, RecipientInfo>,
+    our_aci: Aci,
+    timestamp: u64,
+) -> Vec<(Content, Thread)> {
     let is_outgoing = match item.directional_details.as_ref() {
         Some(DirectionalDetails::Outgoing(_)) => true,
         Some(DirectionalDetails::Incoming(_)) => false,
         _ => return vec![],
     };
 
-    let incoming_sender = if !is_outgoing {
-        match recipients.get(&item.author_id).and_then(|r| r.service_id) {
-            Some(s) => Some(s),
-            None => return vec![],
-        }
-    } else {
-        None
-    };
-
-    let (dm, reactions): (DataMessage, &[backup::Reaction]) = match item.item.as_ref() {
-        Some(Item::StandardMessage(sm)) => {
-            let dm = DataMessage {
-                body: sm.text.as_ref().map(|t| t.body.clone()),
-                attachments: sm
-                    .attachments
-                    .iter()
-                    .filter_map(message_attachment_to_pointer)
-                    .collect(),
-                quote: sm
-                    .quote
-                    .as_ref()
-                    .and_then(|q| backup_quote_to_dm_quote(q, recipients)),
-                preview: sm
-                    .link_preview
-                    .iter()
-                    .map(backup_link_preview_to_preview)
-                    .collect(),
-                timestamp: Some(timestamp),
-                ..Default::default()
-            };
-            (dm, &sm.reactions)
-        }
-        Some(Item::StickerMessage(sm)) => {
-            let dm = DataMessage {
-                sticker: sm.sticker.as_ref().map(backup_sticker_to_dm_sticker),
-                timestamp: Some(timestamp),
-                ..Default::default()
-            };
-            (dm, &sm.reactions)
-        }
-        _ => return vec![],
-    };
-
     let (body, sender, destination) = if is_outgoing {
-        let dest_str = match &thread {
+        let dest_str = match thread {
             Thread::Contact(sid) => Some(sid.service_id_string()),
             Thread::Group(_) => None,
         };
-        let destination = match &thread {
+        let destination = match thread {
             Thread::Contact(sid) => *sid,
             Thread::Group(_) => ServiceId::Aci(our_aci),
         };
@@ -366,9 +409,12 @@ pub fn chat_item_to_contents(
             destination,
         )
     } else {
+        let Some(sender) = recipients.get(&item.author_id).and_then(|r| r.service_id) else {
+            return vec![];
+        };
         (
             ContentBody::DataMessage(dm),
-            incoming_sender.expect("checked above"),
+            sender,
             ServiceId::Aci(our_aci),
         )
     };
@@ -389,7 +435,7 @@ pub fn chat_item_to_contents(
 
     let mut results = vec![(main_content, thread.clone())];
     results.extend(reactions_to_contents(
-        reactions, item, recipients, &thread, our_aci,
+        reactions, item, recipients, thread, our_aci,
     ));
     results
 }
