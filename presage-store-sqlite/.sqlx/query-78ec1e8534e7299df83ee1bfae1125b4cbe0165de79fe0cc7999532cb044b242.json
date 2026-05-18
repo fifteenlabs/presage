@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT master_key FROM groups WHERE group_id = ? LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "master_key",
+        "ordinal": 0,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "78ec1e8534e7299df83ee1bfae1125b4cbe0165de79fe0cc7999532cb044b242"
+}

@@ -72,6 +72,59 @@ impl SqliteStore {
             trust_new_identities,
         })
     }
+
+    /// One-shot backfill of `groups.group_id` for rows that predate the
+    /// `add_group_id_to_groups` migration. Idempotent; returns the number
+    /// of rows touched (0 in steady state).
+    ///
+    /// Until the row is backfilled, `group_by_group_id` falls through to
+    /// the trait default's O(N) zkgroup-derivation iteration on every
+    /// sync `call_event` for the affected group. After backfill, the
+    /// lookup hits the partial UNIQUE INDEX in O(log N).
+    ///
+    /// Callers should invoke this once per process start (or per account
+    /// boot) after `open*()`. Safe to call repeatedly.
+    pub async fn backfill_group_ids(&self) -> Result<usize, SqliteStoreError> {
+        use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+
+        let rows: Vec<Vec<u8>> =
+            query_scalar!("SELECT master_key FROM groups WHERE group_id IS NULL")
+                .fetch_all(&self.db)
+                .await?;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let count = rows.len();
+
+        let mut tx = self.db.begin().await?;
+        for master_key_bytes in rows {
+            let master_key: [u8; 32] = match master_key_bytes.as_slice().try_into() {
+                Ok(k) => k,
+                Err(_) => {
+                    tracing::warn!(
+                        "presage: skipping group with invalid master_key length during backfill"
+                    );
+                    continue;
+                }
+            };
+            let group_id: [u8; 32] =
+                GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key))
+                    .get_group_identifier();
+            let group_id_slice: &[u8] = &group_id;
+            let master_key_slice: &[u8] = &master_key;
+            query!(
+                "UPDATE groups SET group_id = ?1 WHERE master_key = ?2",
+                group_id_slice,
+                master_key_slice,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+
+        Ok(count)
+    }
 }
 
 impl Store for SqliteStore {

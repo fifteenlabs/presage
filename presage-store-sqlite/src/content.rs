@@ -9,7 +9,11 @@ use presage::{
         protocol::ServiceId,
         zkgroup::GroupMasterKeyBytes,
     },
-    model::{contacts::Contact, groups::Group},
+    model::{
+        calls::{CallDirection, CallHistoryEntry, CallMode, CallStatus, CallType},
+        contacts::Contact,
+        groups::Group,
+    },
     proto::{Verified, verified},
     store::{ContentsStore, StickerPack, Thread},
 };
@@ -183,6 +187,80 @@ impl ContentsStore for SqliteStore {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn save_call_history(
+        &self,
+        entry: &CallHistoryEntry,
+    ) -> Result<(), Self::ContentsStoreError> {
+        // INTEGER columns are i64; u64 is bit-preserved (RingRTC reserves
+        // u64::MAX as a sentinel for "invalid call_id", which round-trips as
+        // -1i64 here — fine, it's still a unique key).
+        let call_id = entry.call_id as i64;
+        let timestamp_ms: i64 = entry
+            .timestamp_ms
+            .try_into()
+            .map_err(|_| SqliteStoreError::InvalidFormat)?;
+        let mode = entry.mode.as_str();
+        let call_type = entry.call_type.as_str();
+        let direction = entry.direction.as_str();
+        let status = entry.status.as_str();
+
+        // `ringer_id`, `started_by_id`, `ended_timestamp_ms` columns stay
+        // nullable in the schema for future live-call lifecycle code, but
+        // nothing on this branch populates them — omit them from the INSERT
+        // so they default to NULL.
+        query!(
+            "INSERT OR REPLACE INTO call_history (
+                call_id,
+                peer_id,
+                mode,
+                call_type,
+                direction,
+                status,
+                timestamp_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            call_id,
+            entry.peer_id,
+            mode,
+            call_type,
+            direction,
+            status,
+            timestamp_ms,
+        )
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_call_history(
+        &self,
+        call_id: u64,
+    ) -> Result<Option<CallHistoryEntry>, Self::ContentsStoreError> {
+        let call_id_signed = call_id as i64;
+        let Some(row) = query!(
+            r#"SELECT
+                call_id, peer_id, mode, call_type, direction, status, timestamp_ms
+               FROM call_history WHERE call_id = ? LIMIT 1"#,
+            call_id_signed,
+        )
+        .fetch_optional(&self.db)
+        .await?
+        else {
+            return Ok(None);
+        };
+        // CallStatus is mode-typed; parse `mode` first so the overlapping
+        // status strings ("Accepted", "Missed", …) land in the right variant.
+        let mode = CallMode::parse(&row.mode);
+        Ok(Some(CallHistoryEntry {
+            call_id: row.call_id as u64,
+            peer_id: row.peer_id,
+            mode,
+            call_type: CallType::parse(&row.call_type),
+            direction: CallDirection::parse(&row.direction),
+            status: CallStatus::parse(mode, &row.status),
+            timestamp_ms: row.timestamp_ms as u64,
+        }))
     }
 
     async fn delete_message(
@@ -485,18 +563,28 @@ impl ContentsStore for SqliteStore {
         master_key: GroupMasterKeyBytes,
         group: impl Into<Group>,
     ) -> Result<(), Self::ContentsStoreError> {
+        // Derive the 32-byte public `group_id` from the master_key once at
+        // write time so future call_event lookups hit the index instead of
+        // re-deriving across every row.
+        use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+        let group_id: [u8; 32] =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key))
+                .get_group_identifier();
+        let group_id_slice: &[u8] = &group_id;
+
         let g = SqlGroup::from_group(&master_key, group.into());
         let master_key = g.master_key.as_ref();
         query!(
             r#"INSERT OR REPLACE INTO groups (
-                master_key, title, revision, invite_link_password,
+                master_key, group_id, title, revision, invite_link_password,
                 access_control, avatar, description,
                 members, pending_members, requesting_members,
                 needs_hydration, blocked, whitelisted, archived, marked_unread,
                 muted_until_timestamp, dont_notify_for_mentions_if_muted,
                 hide_story, story_send_mode, disappearing_messages_timer
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             master_key,
+            group_id_slice,
             g.title,
             g.revision,
             g.invite_link_password,
@@ -584,6 +672,28 @@ impl ContentsStore for SqliteStore {
         .await?
         .map(|g| g.into_group().map(|(_master_key, group)| group))
         .transpose()
+    }
+
+    async fn group_by_group_id(
+        &self,
+        group_id: &[u8; 32],
+    ) -> Result<Option<GroupMasterKeyBytes>, Self::ContentsStoreError> {
+        let group_id_slice: &[u8] = group_id;
+        let Some(row) = query!(
+            "SELECT master_key FROM groups WHERE group_id = ? LIMIT 1",
+            group_id_slice,
+        )
+        .fetch_optional(&self.db)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let master_key: GroupMasterKeyBytes = row
+            .master_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| SqliteStoreError::InvalidFormat)?;
+        Ok(Some(master_key))
     }
 
     async fn save_group_avatar(

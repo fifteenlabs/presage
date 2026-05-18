@@ -1,0 +1,56 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT\n                call_id, peer_id, mode, call_type, direction, status, timestamp_ms\n               FROM call_history WHERE call_id = ? LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "call_id",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "peer_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "mode",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "call_type",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "direction",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "status",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "timestamp_ms",
+        "ordinal": 6,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "678bb91c018efc563512477c05c9161a0d477f798afff81af349459021516a00"
+}
