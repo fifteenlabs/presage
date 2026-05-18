@@ -115,9 +115,12 @@ pub enum CallEventKind {
     Unknown,
 }
 
-/// Resolved status after merging events through [`transition_call_history`].
+/// Status of a direct (1:1) call. Mirrors Signal Desktop's
+/// `DirectCallStatus`. `MissedNotificationProfile` is intentionally collapsed
+/// into `Missed` for v1 (Desktop has a `TODO: DESKTOP-3483 — not generated
+/// locally` note on the variant).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CallStatus {
+pub enum DirectCallStatus {
     Pending,
     Accepted,
     Missed,
@@ -126,7 +129,7 @@ pub enum CallStatus {
     Unknown,
 }
 
-impl CallStatus {
+impl DirectCallStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "Pending",
@@ -146,6 +149,91 @@ impl CallStatus {
             "Declined" => Self::Declined,
             "Deleted" => Self::Deleted,
             _ => Self::Unknown,
+        }
+    }
+}
+
+/// Status of a group call. Mirrors Signal Desktop's `GroupCallStatus`.
+///
+/// `Generic` is "observed but no specific local outcome" (Desktop calls it
+/// `GenericGroupCall`; we drop the prefix since our mode is on a separate
+/// field). `Joined` and `Accepted` are deliberately distinct — Desktop uses
+/// `Joined` for "we joined the call" and `Accepted` for "we accepted an
+/// incoming ring without necessarily joining".
+///
+/// Wire sync events (PR 3) can only produce: `Generic`, `Joined`, `Missed`,
+/// `Declined`, `Deleted`. Backup import (PR 5) will reach the full set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupCallStatus {
+    Generic,
+    OutgoingRing,
+    Ringing,
+    Joined,
+    Accepted,
+    Missed,
+    Declined,
+    Deleted,
+    Unknown,
+}
+
+impl GroupCallStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "GenericGroupCall",
+            Self::OutgoingRing => "OutgoingRing",
+            Self::Ringing => "Ringing",
+            Self::Joined => "Joined",
+            Self::Accepted => "Accepted",
+            Self::Missed => "Missed",
+            Self::Declined => "Declined",
+            Self::Deleted => "Deleted",
+            Self::Unknown => "Unknown",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "GenericGroupCall" => Self::Generic,
+            "OutgoingRing" => Self::OutgoingRing,
+            "Ringing" => Self::Ringing,
+            "Joined" => Self::Joined,
+            "Accepted" => Self::Accepted,
+            "Missed" => Self::Missed,
+            "Declined" => Self::Declined,
+            "Deleted" => Self::Deleted,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Mode-typed status carried by [`CallHistoryEntry`].
+///
+/// Composite over [`DirectCallStatus`] and [`GroupCallStatus`]. Adhoc is
+/// reserved for PR 6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallStatus {
+    Direct(DirectCallStatus),
+    Group(GroupCallStatus),
+}
+
+impl CallStatus {
+    /// String form for schema serialization. Direct and group string spaces
+    /// overlap (`Accepted`, `Missed`, …) — readers disambiguate via the
+    /// `mode` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct(s) => s.as_str(),
+            Self::Group(s) => s.as_str(),
+        }
+    }
+
+    /// Parse a stored status string in the context of a known `mode`.
+    pub fn parse(mode: CallMode, s: &str) -> Self {
+        match mode {
+            CallMode::Direct => Self::Direct(DirectCallStatus::parse(s)),
+            CallMode::Group => Self::Group(GroupCallStatus::parse(s)),
+            // Adhoc/Unknown fall through to Direct::Unknown for now.
+            _ => Self::Direct(DirectCallStatus::Unknown),
         }
     }
 }
@@ -356,71 +444,112 @@ pub async fn resolve_call_thread<S: ContentsStore>(
 }
 
 /// Merge a freshly-arrived sync call event into the prior canonical entry,
-/// returning the new entry. Mode-specific transitions; v1 only handles Direct.
-///
-/// Rules (Direct):
-/// - `Delete` is terminal — any prior status flips to `Deleted` and stays.
-/// - `Accepted` is sticky — once accepted, no other event downgrades it.
-/// - `NotAccepted` → `Missed` (incoming) or `Declined` (outgoing peer declined).
-/// - `Observed` → `Pending` (call observed but no outcome yet).
-/// - Timestamp stays anchored at the first observed event (chronological stability).
+/// returning the new entry. Dispatches by mode. Adhoc returns `None` (PR 6).
 pub fn transition_call_history(
     prev: Option<&CallHistoryEntry>,
     info: &CallEventInfo,
     peer_id: String,
 ) -> Option<CallHistoryEntry> {
-    if info.mode != CallMode::Direct {
-        return None;
+    match info.mode {
+        CallMode::Direct => transition_direct(prev, info, peer_id),
+        CallMode::Group => transition_group(prev, info, peer_id),
+        CallMode::Adhoc | CallMode::Unknown => None,
     }
+}
 
-    let prev_status = prev.map(|p| p.status);
+/// State machine for 1:1 (direct) calls.
+///
+/// Rules:
+/// - `Delete` is terminal — any prior status flips to `Deleted` and stays.
+/// - `Accepted` is sticky — once accepted, no other event downgrades it.
+/// - `NotAccepted` → `Missed` (UI applies the asymmetric Declined/Missed
+///   labelling at render time based on direction).
+/// - `Observed` → `Pending`.
+/// - Timestamp anchored at the first observed event.
+fn transition_direct(
+    prev: Option<&CallHistoryEntry>,
+    info: &CallEventInfo,
+    peer_id: String,
+) -> Option<CallHistoryEntry> {
+    let prev_direct = prev.and_then(|p| match p.status {
+        CallStatus::Direct(s) => Some(s),
+        _ => None,
+    });
     let anchored_ts = prev.map(|p| p.timestamp_ms).unwrap_or(info.timestamp_ms);
 
-    if info.event == CallEventKind::Delete || prev_status == Some(CallStatus::Deleted) {
-        return Some(CallHistoryEntry {
-            call_id: info.call_id,
-            peer_id,
-            mode: info.mode,
-            call_type: info.call_type,
-            direction: info.direction,
-            status: CallStatus::Deleted,
-            timestamp_ms: anchored_ts,
-        });
-    }
-
-    if prev_status == Some(CallStatus::Accepted) || info.event == CallEventKind::Accepted {
-        return Some(CallHistoryEntry {
-            call_id: info.call_id,
-            peer_id,
-            mode: info.mode,
-            call_type: info.call_type,
-            direction: info.direction,
-            status: CallStatus::Accepted,
-            timestamp_ms: anchored_ts,
-        });
-    }
-
-    let status = match (info.event, info.direction) {
-        // Signal Desktop's `transitionDirectCallStatus` maps a wire-arriving
-        // `NOT_ACCEPTED` to `Missed` for all directions (unless the receiving
-        // device had already locally resolved the call as Declined, which doesn't
-        // apply to us — app v2 has no call UI and no local participation).
-        // The asymmetric "Declined" vs "Missed" labelling happens at UI time
-        // based on direction, not in the status itself.
-        (CallEventKind::NotAccepted, _) => CallStatus::Missed,
-        (CallEventKind::Observed, _) => CallStatus::Pending,
-        _ => prev_status.unwrap_or(CallStatus::Pending),
-    };
-
-    Some(CallHistoryEntry {
+    let entry = |status: DirectCallStatus| CallHistoryEntry {
         call_id: info.call_id,
-        peer_id,
+        peer_id: peer_id.clone(),
         mode: info.mode,
         call_type: info.call_type,
         direction: info.direction,
-        status,
+        status: CallStatus::Direct(status),
         timestamp_ms: anchored_ts,
-    })
+    };
+
+    if info.event == CallEventKind::Delete || prev_direct == Some(DirectCallStatus::Deleted) {
+        return Some(entry(DirectCallStatus::Deleted));
+    }
+    if prev_direct == Some(DirectCallStatus::Accepted) || info.event == CallEventKind::Accepted {
+        return Some(entry(DirectCallStatus::Accepted));
+    }
+
+    let status = match (info.event, info.direction) {
+        (CallEventKind::NotAccepted, _) => DirectCallStatus::Missed,
+        (CallEventKind::Observed, _) => DirectCallStatus::Pending,
+        _ => prev_direct.unwrap_or(DirectCallStatus::Pending),
+    };
+    Some(entry(status))
+}
+
+/// State machine for group calls.
+///
+/// Rules (mirror Signal Desktop's group `transitionCallHistoryStatus`):
+/// - `Delete` is terminal.
+/// - `Joined` is sticky — wire `Accepted` lands as `Joined` (we joined the
+///   call) and stays joined against later non-Delete events.
+/// - `Observed` → `Generic` (call exists; no specific local outcome).
+/// - `NotAccepted + Incoming` → `Missed` (incoming ring not answered).
+/// - `NotAccepted + Outgoing` → `Generic` (outgoing ring with no join; group
+///   semantics have no symmetric "declined" outcome — Desktop drops it into
+///   the generic bucket too).
+/// - Other → keep prior or `Generic`.
+/// - Timestamp anchored at the first observed event.
+fn transition_group(
+    prev: Option<&CallHistoryEntry>,
+    info: &CallEventInfo,
+    peer_id: String,
+) -> Option<CallHistoryEntry> {
+    let prev_group = prev.and_then(|p| match p.status {
+        CallStatus::Group(s) => Some(s),
+        _ => None,
+    });
+    let anchored_ts = prev.map(|p| p.timestamp_ms).unwrap_or(info.timestamp_ms);
+
+    let entry = |status: GroupCallStatus| CallHistoryEntry {
+        call_id: info.call_id,
+        peer_id: peer_id.clone(),
+        mode: info.mode,
+        call_type: info.call_type,
+        direction: info.direction,
+        status: CallStatus::Group(status),
+        timestamp_ms: anchored_ts,
+    };
+
+    if info.event == CallEventKind::Delete || prev_group == Some(GroupCallStatus::Deleted) {
+        return Some(entry(GroupCallStatus::Deleted));
+    }
+    if prev_group == Some(GroupCallStatus::Joined) || info.event == CallEventKind::Accepted {
+        return Some(entry(GroupCallStatus::Joined));
+    }
+
+    let status = match (info.event, info.direction) {
+        (CallEventKind::Observed, _) => GroupCallStatus::Generic,
+        (CallEventKind::NotAccepted, CallDirection::Incoming) => GroupCallStatus::Missed,
+        (CallEventKind::NotAccepted, _) => GroupCallStatus::Generic,
+        _ => prev_group.unwrap_or(GroupCallStatus::Generic),
+    };
+    Some(entry(status))
 }
 
 #[cfg(test)]
@@ -439,28 +568,38 @@ mod tests {
         }
     }
 
+    fn group_info(event: CallEventKind, direction: CallDirection, ts: u64) -> CallEventInfo {
+        CallEventInfo {
+            call_id: 42,
+            conversation_id: vec![0; 32],
+            timestamp_ms: ts,
+            mode: CallMode::Group,
+            call_type: CallType::Group,
+            direction,
+            event,
+        }
+    }
+
     fn peer() -> String {
         "00000000-0000-0000-0000-000000000001".to_string()
     }
 
+    // ---- direct ----
+
     #[test]
-    fn observed_fresh_becomes_pending() {
+    fn direct_observed_fresh_becomes_pending() {
         let out = transition_call_history(
             None,
             &info(CallEventKind::Observed, CallDirection::Incoming, 100),
             peer(),
         )
         .unwrap();
-        assert_eq!(out.status, CallStatus::Pending);
+        assert_eq!(out.status, CallStatus::Direct(DirectCallStatus::Pending));
         assert_eq!(out.timestamp_ms, 100);
     }
 
     #[test]
-    fn not_accepted_incoming_is_missed() {
-        // Matches Signal Desktop's `transitionDirectCallStatus`: a wire-arriving
-        // `NOT_ACCEPTED` always resolves to Missed for a device with no prior
-        // local Declined state. UI labelling (Declined vs Missed) is applied
-        // later based on direction.
+    fn direct_not_accepted_incoming_is_missed() {
         let prev = transition_call_history(
             None,
             &info(CallEventKind::Observed, CallDirection::Incoming, 100),
@@ -472,11 +611,11 @@ mod tests {
             peer(),
         )
         .unwrap();
-        assert_eq!(out.status, CallStatus::Missed);
+        assert_eq!(out.status, CallStatus::Direct(DirectCallStatus::Missed));
     }
 
     #[test]
-    fn not_accepted_outgoing_is_missed() {
+    fn direct_not_accepted_outgoing_is_missed() {
         let prev = transition_call_history(
             None,
             &info(CallEventKind::Observed, CallDirection::Outgoing, 100),
@@ -488,28 +627,31 @@ mod tests {
             peer(),
         )
         .unwrap();
-        assert_eq!(out.status, CallStatus::Missed);
+        assert_eq!(out.status, CallStatus::Direct(DirectCallStatus::Missed));
     }
 
     #[test]
-    fn accepted_is_sticky_against_later_not_accepted() {
+    fn direct_accepted_is_sticky_against_later_not_accepted() {
         let prev = transition_call_history(
             None,
             &info(CallEventKind::Accepted, CallDirection::Incoming, 100),
             peer(),
         );
-        assert_eq!(prev.as_ref().unwrap().status, CallStatus::Accepted);
+        assert_eq!(
+            prev.as_ref().unwrap().status,
+            CallStatus::Direct(DirectCallStatus::Accepted)
+        );
         let out = transition_call_history(
             prev.as_ref(),
             &info(CallEventKind::NotAccepted, CallDirection::Incoming, 200),
             peer(),
         )
         .unwrap();
-        assert_eq!(out.status, CallStatus::Accepted);
+        assert_eq!(out.status, CallStatus::Direct(DirectCallStatus::Accepted));
     }
 
     #[test]
-    fn delete_is_terminal_over_accepted() {
+    fn direct_delete_is_terminal_over_accepted() {
         let prev = transition_call_history(
             None,
             &info(CallEventKind::Accepted, CallDirection::Incoming, 100),
@@ -521,11 +663,11 @@ mod tests {
             peer(),
         )
         .unwrap();
-        assert_eq!(out.status, CallStatus::Deleted);
+        assert_eq!(out.status, CallStatus::Direct(DirectCallStatus::Deleted));
     }
 
     #[test]
-    fn delete_is_terminal_even_against_later_events() {
+    fn direct_delete_is_terminal_even_against_later_events() {
         let prev = transition_call_history(
             None,
             &info(CallEventKind::Delete, CallDirection::Incoming, 100),
@@ -537,20 +679,11 @@ mod tests {
             peer(),
         )
         .unwrap();
-        assert_eq!(out.status, CallStatus::Deleted);
+        assert_eq!(out.status, CallStatus::Direct(DirectCallStatus::Deleted));
     }
 
     #[test]
-    fn non_direct_mode_drops() {
-        let mut i = info(CallEventKind::Observed, CallDirection::Incoming, 100);
-        i.mode = CallMode::Group;
-        assert!(transition_call_history(None, &i, peer()).is_none());
-        i.mode = CallMode::Adhoc;
-        assert!(transition_call_history(None, &i, peer()).is_none());
-    }
-
-    #[test]
-    fn timestamp_anchored_at_first_event() {
+    fn direct_timestamp_anchored_at_first_event() {
         let prev = transition_call_history(
             None,
             &info(CallEventKind::Observed, CallDirection::Incoming, 100),
@@ -564,6 +697,121 @@ mod tests {
         .unwrap();
         assert_eq!(out.timestamp_ms, 100);
     }
+
+    // ---- group ----
+
+    #[test]
+    fn group_observed_fresh_becomes_generic() {
+        let out = transition_call_history(
+            None,
+            &group_info(CallEventKind::Observed, CallDirection::Incoming, 100),
+            peer(),
+        )
+        .unwrap();
+        assert_eq!(out.status, CallStatus::Group(GroupCallStatus::Generic));
+        assert_eq!(out.timestamp_ms, 100);
+    }
+
+    #[test]
+    fn group_accepted_lands_as_joined() {
+        let out = transition_call_history(
+            None,
+            &group_info(CallEventKind::Accepted, CallDirection::Incoming, 100),
+            peer(),
+        )
+        .unwrap();
+        assert_eq!(out.status, CallStatus::Group(GroupCallStatus::Joined));
+    }
+
+    #[test]
+    fn group_joined_is_sticky_against_later_not_accepted() {
+        let prev = transition_call_history(
+            None,
+            &group_info(CallEventKind::Accepted, CallDirection::Incoming, 100),
+            peer(),
+        );
+        let out = transition_call_history(
+            prev.as_ref(),
+            &group_info(CallEventKind::NotAccepted, CallDirection::Incoming, 200),
+            peer(),
+        )
+        .unwrap();
+        assert_eq!(out.status, CallStatus::Group(GroupCallStatus::Joined));
+    }
+
+    #[test]
+    fn group_not_accepted_incoming_is_missed() {
+        let prev = transition_call_history(
+            None,
+            &group_info(CallEventKind::Observed, CallDirection::Incoming, 100),
+            peer(),
+        );
+        let out = transition_call_history(
+            prev.as_ref(),
+            &group_info(CallEventKind::NotAccepted, CallDirection::Incoming, 200),
+            peer(),
+        )
+        .unwrap();
+        assert_eq!(out.status, CallStatus::Group(GroupCallStatus::Missed));
+    }
+
+    #[test]
+    fn group_not_accepted_outgoing_is_generic() {
+        // Group calls have no symmetric "declined-outgoing" semantic; an
+        // outgoing ring without a join collapses into the generic bucket.
+        let out = transition_call_history(
+            None,
+            &group_info(CallEventKind::NotAccepted, CallDirection::Outgoing, 100),
+            peer(),
+        )
+        .unwrap();
+        assert_eq!(out.status, CallStatus::Group(GroupCallStatus::Generic));
+    }
+
+    #[test]
+    fn group_delete_is_terminal_over_joined() {
+        let prev = transition_call_history(
+            None,
+            &group_info(CallEventKind::Accepted, CallDirection::Incoming, 100),
+            peer(),
+        );
+        let out = transition_call_history(
+            prev.as_ref(),
+            &group_info(CallEventKind::Delete, CallDirection::Incoming, 200),
+            peer(),
+        )
+        .unwrap();
+        assert_eq!(out.status, CallStatus::Group(GroupCallStatus::Deleted));
+    }
+
+    #[test]
+    fn group_timestamp_anchored_at_first_event() {
+        let prev = transition_call_history(
+            None,
+            &group_info(CallEventKind::Observed, CallDirection::Incoming, 100),
+            peer(),
+        );
+        let out = transition_call_history(
+            prev.as_ref(),
+            &group_info(CallEventKind::Accepted, CallDirection::Incoming, 500),
+            peer(),
+        )
+        .unwrap();
+        assert_eq!(out.timestamp_ms, 100);
+    }
+
+    // ---- adhoc / unknown ----
+
+    #[test]
+    fn adhoc_mode_drops() {
+        let mut i = info(CallEventKind::Observed, CallDirection::Incoming, 100);
+        i.mode = CallMode::Adhoc;
+        assert!(transition_call_history(None, &i, peer()).is_none());
+        i.mode = CallMode::Unknown;
+        assert!(transition_call_history(None, &i, peer()).is_none());
+    }
+
+    // ---- helpers ----
 
     #[test]
     fn conversation_id_helpers_only_match_16_bytes() {
