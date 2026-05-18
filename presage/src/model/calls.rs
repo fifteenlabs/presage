@@ -364,6 +364,20 @@ pub fn call_conversation_id_to_thread(bytes: &[u8]) -> Option<Thread> {
     }
 }
 
+/// Canonical `peer_id` for a [`CallHistoryEntry`] given an already-resolved
+/// [`Thread`]. Sync helper for callers that have the thread in hand and want
+/// to skip the async [`resolve_call_peer`] round-trip — used by the backup
+/// import path, where the thread is resolved earlier via `chat_to_thread`.
+///
+/// Format matches [`CallPeer::peer_id`]: UUID string for `Direct`, lowercase
+/// hex of the 32-byte master_key for `Group`.
+pub fn peer_id_from_thread(thread: &Thread) -> String {
+    match thread {
+        Thread::Contact(sid) => sid.raw_uuid().to_string(),
+        Thread::Group(master_key) => hex::encode(master_key),
+    }
+}
+
 /// Typed peer for a call event.
 ///
 /// `Direct` carries the peer's ACI (1:1); `Group` carries the group's
