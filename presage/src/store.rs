@@ -25,7 +25,11 @@ use tracing::trace;
 
 use crate::{
     manager::RegistrationData,
-    model::{contacts::Contact, groups::Group},
+    model::{
+        calls::{transition_call_history, CallEventInfo, CallHistoryEntry, CallPeer},
+        contacts::Contact,
+        groups::Group,
+    },
     AvatarBytes,
 };
 
@@ -227,6 +231,57 @@ pub trait ContentsStore: Send + Sync {
         range: impl RangeBounds<u64>,
     ) -> impl Future<Output = Result<Self::MessagesIter, Self::ContentsStoreError>>;
 
+    /// Persist a canonical call history entry produced by
+    /// [`crate::model::calls::transition_call_history`].
+    ///
+    /// Stores keep the post-merge state separate from the per-event sync rows
+    /// written by [`Self::save_message`]. The default impl is a no-op so stores
+    /// that don't yet model call history (e.g. presage's in-memory store) can
+    /// still compile; persistent stores override it.
+    fn save_call_history(
+        &self,
+        _entry: &CallHistoryEntry,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Look up the canonical call history entry for a given `call_id`.
+    /// Returns `None` when no entry exists for this id.
+    ///
+    /// Default impl returns `None` so stores that don't model call history
+    /// still compile; persistent stores override it.
+    fn get_call_history(
+        &self,
+        _call_id: u64,
+    ) -> impl Future<Output = Result<Option<CallHistoryEntry>, Self::ContentsStoreError>> + Send
+    {
+        async { Ok(None) }
+    }
+
+    /// Merge a freshly-decoded sync `call_event` into the canonical call
+    /// history: load any prior entry, run the state machine, save the
+    /// result. Returns the merged entry, or `None` when the state machine
+    /// rejects the event (currently Adhoc / Unknown mode).
+    ///
+    /// Default impl chains `get_call_history` → `transition_call_history` →
+    /// `save_call_history`, so any store overriding the two underlying
+    /// methods gets ingestion for free.
+    fn ingest_call_event(
+        &self,
+        info: &CallEventInfo,
+        peer: &CallPeer,
+    ) -> impl Future<Output = Result<Option<CallHistoryEntry>, Self::ContentsStoreError>> + Send
+    {
+        async move {
+            let prev = self.get_call_history(info.call_id).await?;
+            let Some(entry) = transition_call_history(prev.as_ref(), info, peer.peer_id()) else {
+                return Ok(None);
+            };
+            self.save_call_history(&entry).await?;
+            Ok(Some(entry))
+        }
+    }
+
     /// Get the expire timer from a [Thread], which corresponds to either [Contact::expire_timer]
     /// or [Group::disappearing_messages_timer].
     fn expire_timer(
@@ -325,6 +380,33 @@ pub trait ContentsStore: Send + Sync {
         &self,
         master_key: GroupMasterKeyBytes,
     ) -> impl Future<Output = Result<Option<Group>, Self::ContentsStoreError>>;
+
+    /// Look up a stored group by its derived 32-byte `group_id` (the public
+    /// protocol identifier carried in sync `call_event` payloads). Returns
+    /// the matching `master_key` when the group is known.
+    ///
+    /// Default impl iterates `groups()` and derives each row's `group_id`
+    /// via `GroupSecretParams::get_group_identifier()` — O(N) per lookup
+    /// with one zkgroup derivation per row. Persistent stores should
+    /// override with an indexed lookup (O(log N), no crypto).
+    fn group_by_group_id(
+        &self,
+        group_id: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<GroupMasterKeyBytes>, Self::ContentsStoreError>> {
+        async move {
+            use libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+            let iter = self.groups().await?;
+            for result in iter {
+                let (master_key, _group) = result?;
+                let secret_params =
+                    GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+                if &secret_params.get_group_identifier() == group_id {
+                    return Ok(Some(master_key));
+                }
+            }
+            Ok(None)
+        }
+    }
 
     /// Save a group avatar in the cache
     fn save_group_avatar(
@@ -566,7 +648,11 @@ impl TryFrom<&Content> for Thread {
                     .try_into()
                     .expect("Group master key to have 32 bytes"),
             )),
-            // [1-1] Any other message directly to us
+            // [1-1] Any other message directly to us.
+            // Sync `call_event` content is routed via the async
+            // `resolve_call_thread` resolver (see `save_message`) — it
+            // handles both 1:1 (UUID conversation_id) and group
+            // (derived group_id → master_key lookup).
             _ => Ok(Thread::Contact(content.metadata.sender)),
         }
     }

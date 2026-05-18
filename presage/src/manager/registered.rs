@@ -58,6 +58,7 @@ use crate::backup::{
     convert::{self, RecipientInfo},
     BackupImportProgress, Frame, FrameItem, TransferArchive,
 };
+use crate::model::calls::{extract_call_event, CallPeer};
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
 use crate::store::{
@@ -1789,7 +1790,18 @@ impl<S: Store> Manager<S, Registered> {
                     for (content, thread) in
                         convert::chat_item_to_contents(&ci, &recipients, &chats, aci)
                     {
+                        // Synthesised sync `call_event` rows route through
+                        // `ingest_call_event` so the same load + state machine +
+                        // save pipeline runs for backup and live events alike.
+                        // The converter built this proto upstream from typed
+                        // backup data — `extract_call_event` reverses that to
+                        // hand the state machine its `CallEventInfo`.
+                        let call_info = extract_call_event(&content.body);
+                        let call_peer = CallPeer::from_thread(&thread);
                         self.store.save_message(&thread, content).await?;
+                        if let (Some(info), Some(peer)) = (call_info, call_peer) {
+                            self.store.ingest_call_event(&info, &peer).await?;
+                        }
                     }
                 }
                 _ => {}
@@ -1971,8 +1983,18 @@ async fn save_message<S: Store>(
     message: Content,
     override_thread: Option<Thread>,
 ) -> Result<(), Error<S::Error>> {
-    // derive the thread from the message type
-    let thread = override_thread.unwrap_or(Thread::try_from(&message)?);
+    // derive the thread from the message type. For sync group call_events,
+    // the wire-format `conversation_id` is the 32-byte derived group_id; we
+    // ask the store to translate it back to a Thread::Group via the master_key
+    // index. Falls back to Thread::try_from for non-call content and for
+    // unresolved/adhoc cases (which still land in sync-self for now).
+    let thread = match override_thread {
+        Some(t) => t,
+        None => match crate::model::calls::resolve_call_thread(&message, store).await? {
+            Some(t) => t,
+            None => Thread::try_from(&message)?,
+        },
+    };
 
     // only save DataMessage and SynchronizeMessage (sent)
     let message = match message.body {

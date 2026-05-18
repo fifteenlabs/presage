@@ -265,6 +265,9 @@ fn reactions_to_contents(
 ///
 /// Returns the main message first, followed by one entry per reaction (each reconstructed
 /// as its own `DataMessage::reaction` envelope, matching Signal's wire format).
+///
+/// Pure dispatcher: each item kind has its own helper. Unknown item kinds and
+/// unsupported `UpdateMessage` sub-variants drop silently (empty vec).
 pub fn chat_item_to_contents(
     item: &ChatItem,
     recipients: &HashMap<u64, RecipientInfo>,
@@ -276,61 +279,118 @@ pub fn chat_item_to_contents(
     };
     let timestamp = item.date_sent;
 
+    match item.item.as_ref() {
+        Some(Item::StandardMessage(sm)) => {
+            standard_message_to_contents(sm, item, &thread, recipients, our_aci, timestamp)
+        }
+        Some(Item::StickerMessage(sm)) => {
+            sticker_message_to_contents(sm, item, &thread, recipients, our_aci, timestamp)
+        }
+        Some(Item::UpdateMessage(cu)) => match cu.update.as_ref() {
+            Some(backup::chat_update_message::Update::IndividualCall(_)) => {
+                individual_call_to_contents(cu, &thread, our_aci, timestamp)
+            }
+            Some(backup::chat_update_message::Update::GroupCall(_)) => {
+                group_call_to_contents(cu, &thread, recipients, our_aci, timestamp)
+            }
+            _ => vec![],
+        },
+        _ => vec![],
+    }
+}
+
+/// Build a `DataMessage` for a backup `StandardMessage` (text + attachments +
+/// quote + link previews), then hand off to the shared envelope/reactions
+/// wrapper.
+fn standard_message_to_contents(
+    sm: &backup::StandardMessage,
+    item: &ChatItem,
+    thread: &Thread,
+    recipients: &HashMap<u64, RecipientInfo>,
+    our_aci: Aci,
+    timestamp: u64,
+) -> Vec<(Content, Thread)> {
+    let dm = DataMessage {
+        body: sm.text.as_ref().map(|t| t.body.clone()),
+        attachments: sm
+            .attachments
+            .iter()
+            .filter_map(message_attachment_to_pointer)
+            .collect(),
+        quote: sm
+            .quote
+            .as_ref()
+            .and_then(|q| backup_quote_to_dm_quote(q, recipients)),
+        preview: sm
+            .link_preview
+            .iter()
+            .map(backup_link_preview_to_preview)
+            .collect(),
+        timestamp: Some(timestamp),
+        ..Default::default()
+    };
+    wrap_dm_with_reactions(
+        dm,
+        &sm.reactions,
+        item,
+        thread,
+        recipients,
+        our_aci,
+        timestamp,
+    )
+}
+
+/// Build a `DataMessage` for a backup `StickerMessage`, then hand off to the
+/// shared envelope/reactions wrapper.
+fn sticker_message_to_contents(
+    sm: &backup::StickerMessage,
+    item: &ChatItem,
+    thread: &Thread,
+    recipients: &HashMap<u64, RecipientInfo>,
+    our_aci: Aci,
+    timestamp: u64,
+) -> Vec<(Content, Thread)> {
+    let dm = DataMessage {
+        sticker: sm.sticker.as_ref().map(backup_sticker_to_dm_sticker),
+        timestamp: Some(timestamp),
+        ..Default::default()
+    };
+    wrap_dm_with_reactions(
+        dm,
+        &sm.reactions,
+        item,
+        thread,
+        recipients,
+        our_aci,
+        timestamp,
+    )
+}
+
+/// Wrap a `DataMessage` into a sync (outgoing) or direct (incoming) envelope,
+/// then append per-reaction Contents. Returns `vec![]` for missing
+/// directional details, or for incoming items whose author can't be resolved
+/// to a ServiceId — same drop-cases as the original inline implementation.
+fn wrap_dm_with_reactions(
+    dm: DataMessage,
+    reactions: &[backup::Reaction],
+    item: &ChatItem,
+    thread: &Thread,
+    recipients: &HashMap<u64, RecipientInfo>,
+    our_aci: Aci,
+    timestamp: u64,
+) -> Vec<(Content, Thread)> {
     let is_outgoing = match item.directional_details.as_ref() {
         Some(DirectionalDetails::Outgoing(_)) => true,
         Some(DirectionalDetails::Incoming(_)) => false,
         _ => return vec![],
     };
 
-    let incoming_sender = if !is_outgoing {
-        match recipients.get(&item.author_id).and_then(|r| r.service_id) {
-            Some(s) => Some(s),
-            None => return vec![],
-        }
-    } else {
-        None
-    };
-
-    let (dm, reactions): (DataMessage, &[backup::Reaction]) = match item.item.as_ref() {
-        Some(Item::StandardMessage(sm)) => {
-            let dm = DataMessage {
-                body: sm.text.as_ref().map(|t| t.body.clone()),
-                attachments: sm
-                    .attachments
-                    .iter()
-                    .filter_map(message_attachment_to_pointer)
-                    .collect(),
-                quote: sm
-                    .quote
-                    .as_ref()
-                    .and_then(|q| backup_quote_to_dm_quote(q, recipients)),
-                preview: sm
-                    .link_preview
-                    .iter()
-                    .map(backup_link_preview_to_preview)
-                    .collect(),
-                timestamp: Some(timestamp),
-                ..Default::default()
-            };
-            (dm, &sm.reactions)
-        }
-        Some(Item::StickerMessage(sm)) => {
-            let dm = DataMessage {
-                sticker: sm.sticker.as_ref().map(backup_sticker_to_dm_sticker),
-                timestamp: Some(timestamp),
-                ..Default::default()
-            };
-            (dm, &sm.reactions)
-        }
-        _ => return vec![],
-    };
-
     let (body, sender, destination) = if is_outgoing {
-        let dest_str = match &thread {
+        let dest_str = match thread {
             Thread::Contact(sid) => Some(sid.service_id_string()),
             Thread::Group(_) => None,
         };
-        let destination = match &thread {
+        let destination = match thread {
             Thread::Contact(sid) => *sid,
             Thread::Group(_) => ServiceId::Aci(our_aci),
         };
@@ -349,9 +409,12 @@ pub fn chat_item_to_contents(
             destination,
         )
     } else {
+        let Some(sender) = recipients.get(&item.author_id).and_then(|r| r.service_id) else {
+            return vec![];
+        };
         (
             ContentBody::DataMessage(dm),
-            incoming_sender.expect("checked above"),
+            sender,
             ServiceId::Aci(our_aci),
         )
     };
@@ -372,7 +435,201 @@ pub fn chat_item_to_contents(
 
     let mut results = vec![(main_content, thread.clone())];
     results.extend(reactions_to_contents(
-        reactions, item, recipients, &thread, our_aci,
+        reactions, item, recipients, thread, our_aci,
     ));
     results
+}
+
+/// Convert a backup `ChatUpdateMessage` carrying an `IndividualCall` into a
+/// synthetic sync `call_event` Content, so it flows through the normal
+/// `save_message` path. Group/adhoc updates and non-call ChatUpdates return
+/// empty — they require resolution that v1 doesn't provide.
+fn individual_call_to_contents(
+    cu: &backup::ChatUpdateMessage,
+    thread: &Thread,
+    our_aci: Aci,
+    fallback_ts: u64,
+) -> Vec<(Content, Thread)> {
+    use backup::chat_update_message::Update;
+    use backup::individual_call;
+    use sync_message::call_event::{Direction as WireDir, Event as WireEvent, Type as WireType};
+
+    let Some(Update::IndividualCall(call)) = cu.update.as_ref() else {
+        return vec![];
+    };
+
+    // Only 1:1 calls are modelled. A non-Contact thread here would mean the
+    // backup put an IndividualCall on a group chat — out of spec; drop.
+    let Thread::Contact(peer) = thread else {
+        return vec![];
+    };
+    let conv_id: Vec<u8> = peer.raw_uuid().as_bytes().to_vec();
+
+    // Proto defaults follow the comments in Backup.proto:
+    //   UNKNOWN_TYPE      → Audio
+    //   UNKNOWN_DIRECTION → Incoming
+    //   UNKNOWN_STATE     → Accepted
+    let wire_type = match individual_call::Type::try_from(call.r#type) {
+        Ok(individual_call::Type::VideoCall) => WireType::VideoCall,
+        _ => WireType::AudioCall,
+    };
+    let wire_dir = match individual_call::Direction::try_from(call.direction) {
+        Ok(individual_call::Direction::Outgoing) => WireDir::Outgoing,
+        _ => WireDir::Incoming,
+    };
+    // The backup carries the final state, so we synthesise a single event that
+    // collapses through `transition_call_history` to the right canonical
+    // status: Accepted → Accepted; Missed / MissedNotificationProfile /
+    // NotAccepted → NotAccepted (state machine resolves to `Missed`; the UI
+    // layer applies the Missed/Declined label based on direction).
+    let wire_event = match individual_call::State::try_from(call.state) {
+        Ok(individual_call::State::Missed)
+        | Ok(individual_call::State::MissedNotificationProfile)
+        | Ok(individual_call::State::NotAccepted) => WireEvent::NotAccepted,
+        _ => WireEvent::Accepted,
+    };
+
+    let call_ts = if call.started_call_timestamp != 0 {
+        call.started_call_timestamp
+    } else {
+        fallback_ts
+    };
+
+    let call_event = sync_message::CallEvent {
+        conversation_id: Some(conv_id),
+        call_id: call.call_id,
+        timestamp: Some(call_ts),
+        r#type: Some(wire_type as i32),
+        direction: Some(wire_dir as i32),
+        event: Some(wire_event as i32),
+    };
+
+    let body = ContentBody::SynchronizeMessage(SyncMessage {
+        call_event: Some(call_event),
+        ..Default::default()
+    });
+
+    let main_content = Content {
+        metadata: Metadata {
+            sender: ServiceId::Aci(our_aci),
+            destination: ServiceId::Aci(our_aci),
+            sender_device: *DEFAULT_DEVICE_ID,
+            server_guid: None,
+            timestamp: call_ts,
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+        },
+        body,
+    };
+
+    vec![(main_content, thread.clone())]
+}
+
+/// Convert a backup `ChatUpdateMessage` carrying a `GroupCall` into a synthetic
+/// sync `call_event` Content, so it flows through the normal `save_message` +
+/// `save_call_history` pipeline. The 8-variant backup `group_call::State`
+/// collapses through the 4-value wire `Event` surface our state machine
+/// consumes — same shape as `individual_call_to_contents`, but with
+/// state→event and direction-derivation logic specific to groups.
+fn group_call_to_contents(
+    cu: &backup::ChatUpdateMessage,
+    thread: &Thread,
+    recipients: &HashMap<u64, RecipientInfo>,
+    our_aci: Aci,
+    fallback_ts: u64,
+) -> Vec<(Content, Thread)> {
+    use backup::chat_update_message::Update;
+    use backup::group_call;
+    use libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+    use sync_message::call_event::{Direction as WireDir, Event as WireEvent, Type as WireType};
+
+    let Some(Update::GroupCall(call)) = cu.update.as_ref() else {
+        return vec![];
+    };
+
+    // Only group threads are modelled. A non-Group thread here would mean the
+    // backup put a GroupCall on a 1:1 chat — out of spec; drop.
+    let Thread::Group(master_key) = thread else {
+        return vec![];
+    };
+
+    // conversation_id for a group call is the 32-byte derived group_id, not
+    // the master_key. Derive it the same way live sync would emit it so the
+    // downstream `resolve_call_peer` lookup matches.
+    let group_id: [u8; 32] =
+        GroupSecretParams::derive_from_master_key(GroupMasterKey::new(*master_key))
+            .get_group_identifier();
+    let conv_id: Vec<u8> = group_id.to_vec();
+
+    let state = group_call::State::try_from(call.state).unwrap_or(group_call::State::Generic);
+
+    // Direction: backup tells us who started the call. Compare the recipient's
+    // ACI to ours. OUTGOING_RING implies us regardless (the state alone is
+    // proof we initiated).
+    let started_by_us = call
+        .started_call_recipient_id
+        .and_then(|id| recipients.get(&id))
+        .and_then(|r| r.service_id)
+        .and_then(|s| s.aci())
+        .map(|a| a == our_aci)
+        .unwrap_or(matches!(state, group_call::State::OutgoingRing));
+    let wire_dir = if started_by_us {
+        WireDir::Outgoing
+    } else {
+        WireDir::Incoming
+    };
+
+    // 8 backup states → 4 wire events. `transition_group` then resolves to
+    // the final GroupCallStatus:
+    //   JOINED | ACCEPTED                              → Accepted    → Joined
+    //   MISSED | MISSED_NOTIFICATION_PROFILE | DECLINED → NotAccepted → Missed
+    //   GENERIC | RINGING | OUTGOING_RING | UNKNOWN    → Observed    → Generic
+    //
+    // DECLINED collapses to Missed for v1 — the state machine has no Declined
+    // path for groups from wire events, and the renderer applies the
+    // Declined/Missed labelling at render time based on direction anyway.
+    let wire_event = match state {
+        group_call::State::Joined | group_call::State::Accepted => WireEvent::Accepted,
+        group_call::State::Missed
+        | group_call::State::MissedNotificationProfile
+        | group_call::State::Declined => WireEvent::NotAccepted,
+        _ => WireEvent::Observed,
+    };
+
+    let call_ts = if call.started_call_timestamp != 0 {
+        call.started_call_timestamp
+    } else {
+        fallback_ts
+    };
+
+    let call_event = sync_message::CallEvent {
+        conversation_id: Some(conv_id),
+        call_id: call.call_id,
+        timestamp: Some(call_ts),
+        r#type: Some(WireType::GroupCall as i32),
+        direction: Some(wire_dir as i32),
+        event: Some(wire_event as i32),
+    };
+
+    let body = ContentBody::SynchronizeMessage(SyncMessage {
+        call_event: Some(call_event),
+        ..Default::default()
+    });
+
+    let main_content = Content {
+        metadata: Metadata {
+            sender: ServiceId::Aci(our_aci),
+            destination: ServiceId::Aci(our_aci),
+            sender_device: *DEFAULT_DEVICE_ID,
+            server_guid: None,
+            timestamp: call_ts,
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+        },
+        body,
+    };
+
+    vec![(main_content, thread.clone())]
 }

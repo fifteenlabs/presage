@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT master_key FROM groups WHERE group_id IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "master_key",
+        "ordinal": 0,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4aa87ab32d03cff1cc3455b3ca98b88b605782b9e83efb83c0c19d5f2ba07a48"
+}
