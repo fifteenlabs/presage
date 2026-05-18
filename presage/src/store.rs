@@ -12,7 +12,7 @@ use libsignal_service::{
         verified, DataMessage, EditMessage, GroupContextV2, SyncMessage, Verified,
     },
     protocol::{
-        Aci, IdentityKey, IdentityKeyPair, ProtocolAddress, ProtocolStore, SenderCertificate,
+        IdentityKey, IdentityKeyPair, ProtocolAddress, ProtocolStore, SenderCertificate,
         SenderKeyStore, ServiceId,
     },
     push_service::DEFAULT_DEVICE_ID,
@@ -25,7 +25,11 @@ use tracing::trace;
 
 use crate::{
     manager::RegistrationData,
-    model::{calls::CallHistoryEntry, contacts::Contact, groups::Group},
+    model::{
+        calls::{transition_call_history, CallEventInfo, CallHistoryEntry, CallPeer},
+        contacts::Contact,
+        groups::Group,
+    },
     AvatarBytes,
 };
 
@@ -232,6 +236,43 @@ pub trait ContentsStore: Send + Sync {
         _entry: &CallHistoryEntry,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
         async { Ok(()) }
+    }
+
+    /// Look up the canonical call history entry for a given `call_id`.
+    /// Returns `None` when no entry exists for this id.
+    ///
+    /// Default impl returns `None` so stores that don't model call history
+    /// still compile; persistent stores override it.
+    fn get_call_history(
+        &self,
+        _call_id: u64,
+    ) -> impl Future<Output = Result<Option<CallHistoryEntry>, Self::ContentsStoreError>> + Send
+    {
+        async { Ok(None) }
+    }
+
+    /// Merge a freshly-decoded sync `call_event` into the canonical call
+    /// history: load any prior entry, run the state machine, save the
+    /// result. Returns the merged entry, or `None` when the state machine
+    /// rejects the event (currently Adhoc / Unknown mode).
+    ///
+    /// Default impl chains `get_call_history` → `transition_call_history` →
+    /// `save_call_history`, so any store overriding the two underlying
+    /// methods gets ingestion for free.
+    fn ingest_call_event(
+        &self,
+        info: &CallEventInfo,
+        peer: &CallPeer,
+    ) -> impl Future<Output = Result<Option<CallHistoryEntry>, Self::ContentsStoreError>> + Send
+    {
+        async move {
+            let prev = self.get_call_history(info.call_id).await?;
+            let Some(entry) = transition_call_history(prev.as_ref(), info, peer.peer_id()) else {
+                return Ok(None);
+            };
+            self.save_call_history(&entry).await?;
+            Ok(Some(entry))
+        }
     }
 
     /// Get the expire timer from a [Thread], which corresponds to either [Contact::expire_timer]
@@ -600,32 +641,11 @@ impl TryFrom<&Content> for Thread {
                     .try_into()
                     .expect("Group master key to have 32 bytes"),
             )),
-            // [Call] Sync'd 1:1 call event (from another linked device).
-            // The peer lives in `call_event.conversation_id` (16 raw UUID
-            // bytes); the envelope's `metadata.sender` is our own ACI, so
-            // without this arm the call would land in sync-self. Adhoc and
-            // group call types fall through — they need group_id/room_id
-            // resolution out of scope here.
-            ContentBody::SynchronizeMessage(SyncMessage {
-                call_event: Some(call_event),
-                ..
-            }) if matches!(
-                sync_message::call_event::Type::try_from(call_event.r#type.unwrap_or(0)),
-                Ok(sync_message::call_event::Type::AudioCall
-                    | sync_message::call_event::Type::VideoCall)
-            ) =>
-            {
-                let bytes = call_event
-                    .conversation_id
-                    .as_deref()
-                    .ok_or(ThreadError::InvalidServiceId)?;
-                let uuid_bytes: [u8; 16] = bytes
-                    .try_into()
-                    .map_err(|_| ThreadError::InvalidServiceId)?;
-                let aci = Aci::from_uuid_bytes(uuid_bytes);
-                Ok(Self::Contact(ServiceId::from(aci)))
-            }
-            // [1-1] Any other message directly to us
+            // [1-1] Any other message directly to us.
+            // Sync `call_event` content is routed via the async
+            // `resolve_call_thread` resolver (see `save_message`) — it
+            // handles both 1:1 (UUID conversation_id) and group
+            // (derived group_id → master_key lookup).
             _ => Ok(Thread::Contact(content.metadata.sender)),
         }
     }

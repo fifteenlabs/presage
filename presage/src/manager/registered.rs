@@ -55,7 +55,7 @@ use crate::backup::{
     convert::{self, RecipientInfo},
     BackupImportProgress, Frame, FrameItem, TransferArchive,
 };
-use crate::model::calls::{extract_call_event, peer_id_from_thread, transition_call_history};
+use crate::model::calls::{extract_call_event, CallPeer};
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
 use crate::store::{
@@ -1736,20 +1736,17 @@ impl<S: Store> Manager<S, Registered> {
                     for (content, thread) in
                         convert::chat_item_to_contents(&ci, &recipients, &chats, aci)
                     {
-                        // Detect a synthesised sync `call_event` before moving
-                        // `content` into `save_message`. Backup rows carry one
-                        // event per call (final state); the state machine
-                        // collapses it into the canonical entry. Direct →
-                        // UUID peer_id; group → hex(master_key) peer_id —
-                        // both derived from the already-resolved `thread`
-                        // (avoids the async resolve_call_peer round-trip).
-                        let call_entry = extract_call_event(&content.body).and_then(|info| {
-                            let peer_id = peer_id_from_thread(&thread);
-                            transition_call_history(None, &info, peer_id)
-                        });
+                        // Synthesised sync `call_event` rows route through
+                        // `ingest_call_event` so the same load + state machine +
+                        // save pipeline runs for backup and live events alike.
+                        // The converter built this proto upstream from typed
+                        // backup data — `extract_call_event` reverses that to
+                        // hand the state machine its `CallEventInfo`.
+                        let call_info = extract_call_event(&content.body);
+                        let call_peer = CallPeer::from_thread(&thread);
                         self.store.save_message(&thread, content).await?;
-                        if let Some(entry) = call_entry {
-                            self.store.save_call_history(&entry).await?;
+                        if let (Some(info), Some(peer)) = (call_info, call_peer) {
+                            self.store.ingest_call_event(&info, &peer).await?;
                         }
                     }
                 }

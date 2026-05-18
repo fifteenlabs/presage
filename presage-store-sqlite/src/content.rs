@@ -9,7 +9,11 @@ use presage::{
         protocol::ServiceId,
         zkgroup::GroupMasterKeyBytes,
     },
-    model::{calls::CallHistoryEntry, contacts::Contact, groups::Group},
+    model::{
+        calls::{CallDirection, CallHistoryEntry, CallMode, CallStatus, CallType},
+        contacts::Contact,
+        groups::Group,
+    },
     proto::{Verified, verified},
     store::{ContentsStore, StickerPack, Thread},
 };
@@ -228,6 +232,36 @@ impl ContentsStore for SqliteStore {
         .execute(&self.db)
         .await?;
         Ok(())
+    }
+
+    async fn get_call_history(
+        &self,
+        call_id: u64,
+    ) -> Result<Option<CallHistoryEntry>, Self::ContentsStoreError> {
+        let call_id_signed = call_id as i64;
+        let Some(row) = query!(
+            r#"SELECT
+                call_id, peer_id, mode, call_type, direction, status, timestamp_ms
+               FROM call_history WHERE call_id = ? LIMIT 1"#,
+            call_id_signed,
+        )
+        .fetch_optional(&self.db)
+        .await?
+        else {
+            return Ok(None);
+        };
+        // CallStatus is mode-typed; parse `mode` first so the overlapping
+        // status strings ("Accepted", "Missed", …) land in the right variant.
+        let mode = CallMode::parse(&row.mode);
+        Ok(Some(CallHistoryEntry {
+            call_id: row.call_id as u64,
+            peer_id: row.peer_id,
+            mode,
+            call_type: CallType::parse(&row.call_type),
+            direction: CallDirection::parse(&row.direction),
+            status: CallStatus::parse(mode, &row.status),
+            timestamp_ms: row.timestamp_ms as u64,
+        }))
     }
 
     async fn delete_message(
