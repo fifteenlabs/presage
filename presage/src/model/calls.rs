@@ -315,6 +315,32 @@ pub fn extract_call_event(body: &ContentBody) -> Option<CallEventInfo> {
     })
 }
 
+/// Derive the `call_id` (u64) from a group call's `era_id` (string).
+///
+/// Mirrors RingRTC's `RingId::from_era_id` (`signalapp/ringrtc`,
+/// `src/rust/src/core/group_call.rs`). Used to correlate the in-band
+/// `DataMessage.group_call_update` (carries `era_id`) with the
+/// `SyncMessage.call_event` (carries `call_id`) for the same group call —
+/// render-time dedup uses it to suppress whichever surface is overshadowed.
+///
+/// Happy path: a 16-hex-char `era_id` parses directly as a u64. RingRTC
+/// reserves `0` as an invalid id and remaps it to `-1` (cast to `u64::MAX`).
+/// Otherwise SHA-256 the bytes and interpret the first 8 little-endian as i64.
+pub fn call_id_from_era_id(era_id: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    if era_id.len() == 16 {
+        if let Ok(i) = u64::from_str_radix(era_id, 16) {
+            if i == 0 {
+                return (-1i64) as u64;
+            }
+            return i;
+        }
+    }
+    let hash = Sha256::digest(era_id.as_bytes());
+    let bytes: [u8; 8] = hash[..8].try_into().expect("sha256 digest is 32 bytes");
+    i64::from_le_bytes(bytes) as u64
+}
+
 /// Returns the peer UUID string for a 1:1 `conversation_id` (16 raw UUID bytes).
 /// Returns `None` for group (32-byte group_id) and adhoc (room_id) payloads.
 pub fn call_conversation_id_to_peer_uuid(bytes: &[u8]) -> Option<String> {
@@ -821,5 +847,28 @@ mod tests {
         assert!(call_conversation_id_to_peer_uuid(&bytes32).is_none());
         assert!(call_conversation_id_to_thread(&bytes16).is_some());
         assert!(call_conversation_id_to_thread(&bytes32).is_none());
+    }
+
+    #[test]
+    fn call_id_from_era_id_hex_happy_path() {
+        // 16 hex chars parse directly as u64.
+        assert_eq!(
+            call_id_from_era_id("445aa0d4d45926be"),
+            0x445a_a0d4_d459_26be
+        );
+        // RingRTC reserves 0 → remaps to -1 (cast to u64).
+        assert_eq!(call_id_from_era_id("0000000000000000"), u64::MAX);
+    }
+
+    #[test]
+    fn call_id_from_era_id_sha_fallback() {
+        // Non-hex era_id falls through to SHA-256-truncate-LE.
+        // Verifies the algorithm is deterministic and non-zero for "abc".
+        let id = call_id_from_era_id("abc");
+        assert_ne!(id, 0);
+        // Same input → same output (deterministic).
+        assert_eq!(id, call_id_from_era_id("abc"));
+        // Different inputs → different outputs (no collision in this trivial case).
+        assert_ne!(id, call_id_from_era_id("xyz"));
     }
 }
