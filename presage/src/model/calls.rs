@@ -338,29 +338,6 @@ pub fn call_id_from_era_id(era_id: &str) -> u64 {
     i64::from_le_bytes(bytes) as u64
 }
 
-/// Returns the peer UUID string for a 1:1 `conversation_id` (16 raw UUID bytes).
-/// Returns `None` for group (32-byte group_id) and adhoc (room_id) payloads.
-pub fn call_conversation_id_to_peer_uuid(bytes: &[u8]) -> Option<String> {
-    if bytes.len() == 16 {
-        let uuid_bytes: [u8; 16] = bytes.try_into().ok()?;
-        Some(Uuid::from_bytes(uuid_bytes).to_string())
-    } else {
-        None
-    }
-}
-
-/// Convert a 1:1 `conversation_id` (16 raw UUID bytes) into a [`Thread::Contact`].
-/// Returns `None` for group/adhoc payloads.
-pub fn call_conversation_id_to_thread(bytes: &[u8]) -> Option<Thread> {
-    if bytes.len() == 16 {
-        let uuid_bytes: [u8; 16] = bytes.try_into().ok()?;
-        let aci = Aci::from_uuid_bytes(uuid_bytes);
-        Some(Thread::Contact(ServiceId::from(aci)))
-    } else {
-        None
-    }
-}
-
 /// Typed peer for a call event.
 ///
 /// `Direct` carries the peer's ACI (1:1); `Group` carries the group's
@@ -837,16 +814,6 @@ mod tests {
     }
 
     // ---- helpers ----
-
-    #[test]
-    fn conversation_id_helpers_only_match_16_bytes() {
-        let bytes16 = [0u8; 16];
-        let bytes32 = [0u8; 32];
-        assert!(call_conversation_id_to_peer_uuid(&bytes16).is_some());
-        assert!(call_conversation_id_to_peer_uuid(&bytes32).is_none());
-        assert!(call_conversation_id_to_thread(&bytes16).is_some());
-        assert!(call_conversation_id_to_thread(&bytes32).is_none());
-    }
 
     #[test]
     fn call_id_from_era_id_hex_happy_path() {
