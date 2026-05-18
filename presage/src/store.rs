@@ -333,6 +333,33 @@ pub trait ContentsStore: Send + Sync {
         master_key: GroupMasterKeyBytes,
     ) -> impl Future<Output = Result<Option<Group>, Self::ContentsStoreError>>;
 
+    /// Look up a stored group by its derived 32-byte `group_id` (the public
+    /// protocol identifier carried in sync `call_event` payloads). Returns
+    /// the matching `master_key` when the group is known.
+    ///
+    /// Default impl iterates `groups()` and derives each row's `group_id`
+    /// via `GroupSecretParams::get_group_identifier()` — O(N) per lookup
+    /// with one zkgroup derivation per row. Persistent stores should
+    /// override with an indexed lookup (O(log N), no crypto).
+    fn group_by_group_id(
+        &self,
+        group_id: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<GroupMasterKeyBytes>, Self::ContentsStoreError>> {
+        async move {
+            use libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+            let iter = self.groups().await?;
+            for result in iter {
+                let (master_key, _group) = result?;
+                let secret_params =
+                    GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+                if &secret_params.get_group_identifier() == group_id {
+                    return Ok(Some(master_key));
+                }
+            }
+            Ok(None)
+        }
+    }
+
     /// Save a group avatar in the cache
     fn save_group_avatar(
         &self,

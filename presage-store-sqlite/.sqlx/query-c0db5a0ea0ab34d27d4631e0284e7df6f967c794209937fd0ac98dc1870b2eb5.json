@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO call_history (\n                call_id,\n                peer_id,\n                mode,\n                call_type,\n                direction,\n                status,\n                timestamp_ms\n            ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "c0db5a0ea0ab34d27d4631e0284e7df6f967c794209937fd0ac98dc1870b2eb5"
+}

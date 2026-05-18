@@ -12,10 +12,7 @@ use libsignal_service::content::{Content, ContentBody};
 use libsignal_service::prelude::Uuid;
 use libsignal_service::proto::sync_message::call_event::{Direction, Event, Type};
 use libsignal_service::protocol::{Aci, ServiceId};
-use libsignal_service::zkgroup::{
-    groups::{GroupMasterKey, GroupSecretParams},
-    GroupMasterKeyBytes,
-};
+use libsignal_service::zkgroup::GroupMasterKeyBytes;
 
 use crate::store::{ContentsStore, Thread};
 
@@ -416,23 +413,14 @@ impl CallPeer {
 ///
 /// Sync `call_event.conversation_id` for group calls carries the 32-byte
 /// derived `group_id`, but the rest of presage indexes groups by `master_key`.
-/// The derivation is one-way (SHO hash), so we resolve by iterating all
-/// stored groups and computing each one's `group_id`. O(N) per lookup; fine
-/// for typical group counts.
+/// The derivation is one-way (SHO hash). Stores that index `group_id` as a
+/// column implement the lookup in O(log N) via SQL; the trait default falls
+/// back to iteration + per-row zkgroup derivation.
 pub async fn resolve_group_master_key_from_group_id<S: ContentsStore>(
     store: &S,
     target_group_id: &[u8; 32],
 ) -> Result<Option<GroupMasterKeyBytes>, S::ContentsStoreError> {
-    let iter = store.groups().await?;
-    for result in iter {
-        let (master_key, _group) = result?;
-        let secret_params =
-            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
-        if &secret_params.get_group_identifier() == target_group_id {
-            return Ok(Some(master_key));
-        }
-    }
-    Ok(None)
+    store.group_by_group_id(target_group_id).await
 }
 
 /// Resolve a [`CallEventInfo`] to its typed peer.
