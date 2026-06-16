@@ -633,3 +633,217 @@ fn group_call_to_contents(
 
     vec![(main_content, thread.clone())]
 }
+
+/// Build a presage `Contact` from a backup `Recipient` whose destination is a
+/// contact. Returns `None` for any other destination (self, group, distribution
+/// list, …) or when the ACI is missing/invalid.
+///
+/// The display `name` is composed exactly like the storage-service sync derives
+/// it (`Contact::try_from(ContactRecord)` in `model/contacts.rs`) — from the
+/// profile given/family name via `ProfileName` — so when the later storage sync
+/// re-saves the same contact it writes an identical string and the title never
+/// visibly changes.
+pub fn recipient_to_contact(r: &backup::Recipient) -> Option<crate::model::contacts::Contact> {
+    use libsignal_service::profile_name::ProfileName;
+    use libsignal_service::proto::backup::recipient::Destination;
+    use libsignal_service::utils::{phonenumber_from_signal, TryIntoE164};
+
+    let Some(Destination::Contact(c)) = r.destination.as_ref() else {
+        return None;
+    };
+
+    let uuid = c
+        .aci
+        .as_ref()
+        .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok())
+        .map(Uuid::from_bytes)?;
+
+    let pni = c
+        .pni
+        .as_ref()
+        .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok())
+        .map(Uuid::from_bytes);
+
+    // Backup stores e164 as a numeric; ContactRecord stores it as a string. Render
+    // it back to "+<digits>" so the same `try_into_e164`/`phonenumber_from_signal`
+    // path as the storage-sync conversion applies.
+    let phone_number = c
+        .e164
+        .filter(|n| *n != 0)
+        .and_then(|n| format!("+{n}").as_str().try_into_e164().ok())
+        .map(|e| phonenumber_from_signal(&e));
+
+    let name = ProfileName {
+        given_name: c.profile_given_name.clone().unwrap_or_default(),
+        family_name: c.profile_family_name.clone().filter(|s| !s.is_empty()),
+    }
+    .to_string();
+
+    let (nickname_given_name, nickname_family_name) = c
+        .nickname
+        .as_ref()
+        .map(|n| (n.given.clone(), n.family.clone()))
+        .unwrap_or_default();
+
+    Some(crate::model::contacts::Contact {
+        uuid,
+        phone_number,
+        name,
+        verified: Default::default(),
+        profile_key: c.profile_key.clone().unwrap_or_default(),
+        expire_timer: 0,
+        // Matches the model's serde default (`default_expire_timer_version`).
+        expire_timer_version: 2,
+        inbox_position: 0,
+        avatar: None,
+        pni,
+        username: c.username.clone().filter(|s| !s.is_empty()),
+        blocked: c.blocked,
+        whitelisted: false,
+        archived: false,
+        marked_unread: false,
+        muted_until_timestamp: 0,
+        hide_story: c.hide_story,
+        hidden: false,
+        unregistered_at_timestamp: 0,
+        pni_signature_verified: false,
+        system_given_name: c.system_given_name.clone(),
+        system_family_name: c.system_family_name.clone(),
+        system_nickname: c.system_nickname.clone(),
+        nickname_given_name,
+        nickname_family_name,
+        note: c.note.clone(),
+    })
+}
+
+/// Build a presage `Group` stub from a backup `Recipient` whose destination is a
+/// group, taking the title straight from the plaintext backup snapshot. Returns
+/// `None` for any other destination or a malformed master key.
+///
+/// `needs_hydration` stays `true` so the existing group-hydration path still
+/// enriches members/avatar from the network later — this only sources the
+/// *title* from the backup so the sidebar can render it without a round-trip.
+pub fn recipient_to_group(
+    r: &backup::Recipient,
+) -> Option<(
+    libsignal_service::zkgroup::GroupMasterKeyBytes,
+    crate::model::groups::Group,
+)> {
+    use libsignal_service::proto::backup::group::group_attribute_blob::Content;
+    use libsignal_service::proto::backup::recipient::Destination;
+
+    let Some(Destination::Group(g)) = r.destination.as_ref() else {
+        return None;
+    };
+    let master_key: libsignal_service::zkgroup::GroupMasterKeyBytes =
+        g.master_key.as_slice().try_into().ok()?;
+
+    let title = g
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.title.as_ref())
+        .and_then(|blob| blob.content.as_ref())
+        .and_then(|content| match content {
+            Content::Title(t) => Some(t.clone()),
+            _ => None,
+        })
+        .filter(|t| !t.is_empty());
+
+    let group = crate::model::groups::Group {
+        title,
+        avatar: None,
+        disappearing_messages_timer: None,
+        access_control: None,
+        revision: 0,
+        members: Vec::new(),
+        pending_members: Vec::new(),
+        requesting_members: Vec::new(),
+        invite_link_password: Vec::new(),
+        description: None,
+        needs_hydration: true,
+        blocked: g.blocked,
+        whitelisted: g.whitelisted,
+        archived: false,
+        marked_unread: false,
+        muted_until_timestamp: 0,
+        dont_notify_for_mentions_if_muted: false,
+        hide_story: g.hide_story,
+        story_send_mode: i64::from(g.story_send_mode),
+    };
+    Some((master_key, group))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libsignal_service::proto::backup::{self, recipient::Destination};
+
+    fn contact_recipient() -> backup::Recipient {
+        backup::Recipient {
+            id: 1,
+            destination: Some(Destination::Contact(backup::Contact {
+                aci: Some(vec![1u8; 16]),
+                e164: Some(15551234567),
+                profile_given_name: Some("Ada".to_string()),
+                profile_family_name: Some("Lovelace".to_string()),
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn group_recipient() -> backup::Recipient {
+        backup::Recipient {
+            id: 2,
+            destination: Some(Destination::Group(backup::Group {
+                master_key: vec![2u8; 32],
+                snapshot: Some(backup::group::GroupSnapshot {
+                    title: Some(backup::group::GroupAttributeBlob {
+                        content: Some(backup::group::group_attribute_blob::Content::Title(
+                            "Team Lovelace".to_string(),
+                        )),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn recipient_to_contact_extracts_identity_and_name() {
+        let contact = recipient_to_contact(&contact_recipient()).expect("contact");
+        assert_eq!(contact.uuid, Uuid::from_bytes([1u8; 16]));
+        assert_eq!(contact.name, "Ada Lovelace");
+        assert!(contact.phone_number.is_some());
+    }
+
+    #[test]
+    fn recipient_to_group_extracts_master_key_and_title() {
+        let (master_key, group) = recipient_to_group(&group_recipient()).expect("group");
+        assert_eq!(master_key, [2u8; 32]);
+        assert_eq!(group.title.as_deref(), Some("Team Lovelace"));
+        assert!(group.needs_hydration);
+    }
+
+    #[test]
+    fn converters_reject_mismatched_or_unsupported_destinations() {
+        // Wrong kind for each converter.
+        assert!(recipient_to_group(&contact_recipient()).is_none());
+        assert!(recipient_to_contact(&group_recipient()).is_none());
+
+        // Self / empty destinations yield nothing for either converter.
+        let self_recipient = backup::Recipient {
+            id: 3,
+            destination: Some(Destination::Self_(backup::Self_::default())),
+        };
+        assert!(recipient_to_contact(&self_recipient).is_none());
+        assert!(recipient_to_group(&self_recipient).is_none());
+
+        let empty = backup::Recipient {
+            id: 4,
+            destination: None,
+        };
+        assert!(recipient_to_contact(&empty).is_none());
+        assert!(recipient_to_group(&empty).is_none());
+    }
+}

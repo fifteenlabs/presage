@@ -1780,6 +1780,21 @@ impl<S: Store> Manager<S, Registered> {
                     if let Some((id, info)) = convert::recipient_info(&r, aci) {
                         recipients.insert(id, info);
                     }
+                    // Persist the recipient's display data (contact name / group
+                    // title) as we see it — Recipient frames precede the Chat and
+                    // ChatItem frames that reference them, so by the time
+                    // `save_message` runs the store can title the conversation
+                    // immediately instead of falling back to the id until a later
+                    // storage-service sync / group hydration completes.
+                    if let Some(contact) = convert::recipient_to_contact(&r) {
+                        if let Err(e) = self.store.save_contact(&contact).await {
+                            warn!(%e, "backup import: failed to save contact");
+                        }
+                    } else if let Some((master_key, group)) = convert::recipient_to_group(&r) {
+                        if let Err(e) = self.store.save_group(master_key, group).await {
+                            warn!(%e, "backup import: failed to save group");
+                        }
+                    }
                 }
                 Some(FrameItem::Chat(c)) => {
                     if let Some((id, thread)) = convert::chat_to_thread(&c, &recipients) {
