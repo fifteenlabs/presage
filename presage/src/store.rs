@@ -160,6 +160,17 @@ pub trait StateStore {
     }
 }
 
+/// Per-recipient send progress carried by a backup `SendStatus` for an outgoing
+/// message. Ordinals follow Signal (Sent < Delivered < Read < Viewed); stores
+/// map them to their own representation.
+#[derive(Clone, Copy, Debug)]
+pub enum BackupSendStatus {
+    Sent,
+    Delivered,
+    Read,
+    Viewed,
+}
+
 /// Stores messages, contacts, groups and profiles
 pub trait ContentsStore: Send + Sync {
     type ContentsStoreError: StoreError;
@@ -241,6 +252,24 @@ pub trait ContentsStore: Send + Sync {
     fn save_call_history(
         &self,
         _entry: &CallHistoryEntry,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Restore per-message read / delivery state decoded from a linked-device
+    /// backup `ChatItem` (the wire `Content` produced by the converter can't
+    /// carry it). `read` is `Some` for incoming (was it read on the primary
+    /// device), `None` for outgoing. `send_states` is the per-recipient
+    /// `(recipient_service_id, status, updated_at_ms)` for outgoing (empty for
+    /// incoming). Called once per ChatItem just after `save_message`. Default
+    /// no-op so stores that don't model this still compile; persistent stores
+    /// override it.
+    fn restore_backup_message_state(
+        &self,
+        _thread: &Thread,
+        _ts: u64,
+        _read: Option<bool>,
+        _send_states: &[(String, BackupSendStatus, u64)],
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
         async { Ok(()) }
     }
