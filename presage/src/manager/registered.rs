@@ -1955,6 +1955,19 @@ impl<S: Store> Manager<S, Registered> {
                             self.store.ingest_call_event(&info, &peer).await?;
                         }
                     }
+                    // Restore read / delivery state the wire `Content` can't carry,
+                    // so linked history shows correct unread badges + outgoing ticks.
+                    if let Some((thread, ts, read, send_states)) =
+                        convert::chat_item_backup_state(&ci, &recipients, &chats)
+                    {
+                        if let Err(e) = self
+                            .store
+                            .restore_backup_message_state(&thread, ts, read, &send_states)
+                            .await
+                        {
+                            warn!(%e, "backup import: failed to restore message state");
+                        }
+                    }
                 }
                 _ => {}
             }

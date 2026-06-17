@@ -19,7 +19,7 @@ use libsignal_service::{
 };
 
 use super::ChatItem;
-use crate::store::Thread;
+use crate::store::{BackupSendStatus, Thread};
 
 /// Resolved identity of a backup recipient — either a contact's ACI or a group's master key.
 pub struct RecipientInfo {
@@ -296,6 +296,53 @@ pub fn chat_item_to_contents(
             _ => vec![],
         },
         _ => vec![],
+    }
+}
+
+/// Extract read / per-recipient send state from a backup `ChatItem` so the store
+/// can restore it after the row is saved — the wire `Content` the converter
+/// produces can't carry it. Returns `(thread, ts, read, send_states)`; `read` is
+/// `Some` for incoming, `None` for outgoing. Returns `None` when the chat is
+/// unknown or directional details are absent.
+pub fn chat_item_backup_state(
+    item: &ChatItem,
+    recipients: &HashMap<u64, RecipientInfo>,
+    chats: &HashMap<u64, Thread>,
+) -> Option<(
+    Thread,
+    u64,
+    Option<bool>,
+    Vec<(String, BackupSendStatus, u64)>,
+)> {
+    let thread = chats.get(&item.chat_id).cloned()?;
+    let ts = item.date_sent;
+    match item.directional_details.as_ref()? {
+        DirectionalDetails::Incoming(inc) => Some((thread, ts, Some(inc.read), Vec::new())),
+        DirectionalDetails::Outgoing(out) => {
+            let send_states = out
+                .send_status
+                .iter()
+                .filter_map(|s| {
+                    let recipient = recipients
+                        .get(&s.recipient_id)
+                        .and_then(|r| r.service_id)
+                        .map(|sid| sid.service_id_string())?;
+                    let status = match s.delivery_status.as_ref()? {
+                        backup::send_status::DeliveryStatus::Sent(_) => BackupSendStatus::Sent,
+                        backup::send_status::DeliveryStatus::Delivered(_) => {
+                            BackupSendStatus::Delivered
+                        }
+                        backup::send_status::DeliveryStatus::Read(_) => BackupSendStatus::Read,
+                        backup::send_status::DeliveryStatus::Viewed(_) => BackupSendStatus::Viewed,
+                        // Pending / Skipped / Failed → no tick (Sent fallback).
+                        _ => return None,
+                    };
+                    Some((recipient, status, s.timestamp))
+                })
+                .collect();
+            Some((thread, ts, None, send_states))
+        }
+        _ => None, // Directionless
     }
 }
 
