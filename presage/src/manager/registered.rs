@@ -16,6 +16,7 @@ use libsignal_service::{
     content::{Content, ContentBody, DataMessageFlags, Metadata},
     encrypt_device_name,
     groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
+    libsignal_account_keys::AccountEntropyPool,
     master_key::StorageServiceKey,
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
     prelude::{phonenumber::PhoneNumber, MasterKey, MessageSenderError, ProtobufMessage, Uuid},
@@ -28,7 +29,7 @@ use libsignal_service::{
     protocol::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
     },
-    provisioning::ProvisioningError,
+    provisioning::{ProvisioningError, ProvisioningSecrets},
     push_service::linking::{TransferArchiveError, TransferArchiveResult},
     push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
     sender::{AttachmentSpec, AttachmentUploadError},
@@ -877,15 +878,15 @@ impl<S: Store> Manager<S, Registered> {
                                         use libsignal_service::content::sync_message::fetch_latest::Type as FetchType;
                                         if fetch_latest.r#type() == FetchType::StorageManifest {
                                             let mut store = state.store.clone();
-                                            let mut push_service = state.push_service.clone();
+                                            let push_service = state.push_service.clone();
                                             let storage_key = StorageServiceKey::from_master_key(
                                                 &state.master_key,
                                             );
                                             tokio::task::spawn_local(async move {
                                                 if let Err(e) = sync_storage_service(
                                                     &mut store,
-                                                    &mut push_service,
-                                                    &storage_key,
+                                                    &push_service,
+                                                    storage_key,
                                                 )
                                                 .await
                                                 {
@@ -1512,20 +1513,31 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         let credentials = self.credentials();
+        let master_key = self.master_key().await?;
         let mut account_manager = AccountManager::new(
             self.identified_push_service(),
             self.identified_websocket(false).await?,
             Some(self.state.data.profile_key),
         );
 
+        let mut rng = rand::rng();
+        // presage does not persist the account entropy pool — linked devices are keyed
+        // off the explicit master key (mirroring the `account_entropy_pool: None` handling
+        // in the key-sync path), so a fresh AEP is generated for the provisioning message.
+        let account_entropy_pool = AccountEntropyPool::generate(&mut rng);
         account_manager
             .link_device(
-                &mut rand::rng(),
+                &mut rng,
                 secondary,
                 &self.store.aci_protocol_store(),
                 &self.store.pni_protocol_store(),
-                credentials,
-                Some(self.master_key().await?),
+                ProvisioningSecrets {
+                    credentials,
+                    master_key: Some(master_key),
+                    ephemeral_backup_key: None,
+                    account_entropy_pool,
+                    media_root_backup_key: None,
+                },
             )
             .await?;
         Ok(())
@@ -1561,8 +1573,8 @@ impl<S: Store> Manager<S, Registered> {
 
     pub async fn sync_storage_service(&mut self) -> Result<(), Error<S::Error>> {
         let storage_key = StorageServiceKey::from_master_key(&self.master_key().await?);
-        let mut push_service = self.identified_push_service();
-        sync_storage_service(&mut self.store, &mut push_service, &storage_key).await
+        let push_service = self.identified_push_service();
+        sync_storage_service(&mut self.store, &push_service, storage_key).await
     }
 
     pub async fn hydrate_groups(&mut self) -> Result<(), Error<S::Error>> {
@@ -2357,31 +2369,20 @@ const STORAGE_SERVICE_BATCH_SIZE: usize = 2500;
 
 async fn sync_storage_service<S: Store>(
     store: &mut S,
-    push_service: &mut PushService,
-    storage_key: &StorageServiceKey,
+    push_service: &PushService,
+    storage_key: StorageServiceKey,
 ) -> Result<(), Error<S::Error>> {
     use libsignal_service::{
-        proto::{manifest_record::identifier::Type as StorageType, ReadOperation},
-        push_service::{decrypt_manifest, decrypt_storage_record},
+        proto::manifest_record::identifier::Type as StorageType, StorageService,
     };
 
-    debug!("storage sync: fetching credentials");
-    let credentials = push_service
-        .get_storage_credentials()
-        .await
-        .map_err(Error::ServiceError)?;
-    debug!(
-        "storage sync: got credentials username={}",
-        credentials.username
-    );
+    debug!("storage sync: authenticating with storage service");
+    let storage_service =
+        StorageService::new(push_service.clone(), storage_key).await?;
 
     let local_version = store.fetch_storage_manifest_version().await?;
     debug!(local_version, "storage sync: fetching manifest");
-    let Some(manifest) = push_service
-        .get_storage_manifest(&credentials, Some(local_version))
-        .await
-        .map_err(Error::ServiceError)?
-    else {
+    let Some(manifest_record) = storage_service.manifest_if_changed(local_version).await? else {
         debug!(
             local_version,
             "storage sync: server version unchanged (204), skipping"
@@ -2390,16 +2391,13 @@ async fn sync_storage_service<S: Store>(
         store.clear_storage_sync_cursor().await.ok();
         return Ok(());
     };
+    let manifest_version = manifest_record.version;
     debug!(
-        version = manifest.version,
-        local_version, "storage sync: got manifest"
-    );
-
-    let manifest_record = decrypt_manifest(&manifest, storage_key).map_err(Error::ServiceError)?;
-    debug!(
+        version = manifest_version,
+        local_version,
         identifiers = manifest_record.identifiers.len(),
         has_record_ikm = !manifest_record.record_ikm.is_empty(),
-        "storage sync: decrypted manifest"
+        "storage sync: got and decrypted manifest"
     );
 
     let record_ikm: Option<Vec<u8>> = if manifest_record.record_ikm.is_empty() {
@@ -2439,7 +2437,7 @@ async fn sync_storage_service<S: Store>(
     // skip the batches already completed in the prior attempt. A cursor
     // for any other version is stale — discard and start fresh.
     let resume_from = match store.fetch_storage_sync_cursor().await? {
-        Some(cursor) if cursor.target_version == manifest.version => {
+        Some(cursor) if cursor.target_version == manifest_version => {
             debug!(
                 target_version = cursor.target_version,
                 next_batch_index = cursor.next_batch_index,
@@ -2450,7 +2448,7 @@ async fn sync_storage_service<S: Store>(
         Some(stale) => {
             debug!(
                 stale_version = stale.target_version,
-                current_version = manifest.version,
+                current_version = manifest_version,
                 "storage sync: stale cursor for old manifest version, discarding"
             );
             store.clear_storage_sync_cursor().await.ok();
@@ -2470,27 +2468,13 @@ async fn sync_storage_service<S: Store>(
             size = batch.len(),
             "storage sync: fetching batch"
         );
-        let items = push_service
-            .get_storage_records(
-                &credentials,
-                ReadOperation {
-                    read_key: batch.to_vec(),
-                },
-            )
-            .await
-            .map_err(Error::ServiceError)?;
-        debug!(count = items.len(), "storage sync: got storage items");
-        total_processed += items.len();
+        let records = storage_service
+            .read_items(batch.to_vec(), record_ikm.as_deref())
+            .await?;
+        debug!(count = records.len(), "storage sync: got storage records");
+        total_processed += records.len();
 
-        for item in &items {
-            let record = match decrypt_storage_record(item, storage_key, record_ikm.as_deref()) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(%e, "storage sync: failed to decrypt storage item, skipping");
-                    continue;
-                }
-            };
-
+        for record in records {
             match record.record {
                 Some(libsignal_service::proto::storage_record::Record::Contact(cr)) => {
                     debug!(aci = %cr.aci, name = %cr.given_name, "storage sync: saving contact");
@@ -2583,7 +2567,7 @@ async fn sync_storage_service<S: Store>(
         // dies after this point, the next sync targeting this same manifest
         // version will resume at batch i+1.
         let cursor = StorageSyncCursor {
-            target_version: manifest.version,
+            target_version: manifest_version,
             next_batch_index: (i + 1) as u32,
         };
         if let Err(e) = store.store_storage_sync_cursor(&cursor).await {
@@ -2592,14 +2576,14 @@ async fn sync_storage_service<S: Store>(
     }
 
     store
-        .store_storage_manifest_version(manifest.version)
+        .store_storage_manifest_version(manifest_version)
         .await?;
     // Sync completed end-to-end — clear the cursor so it doesn't survive
     // as a stale entry on the next call.
     store.clear_storage_sync_cursor().await.ok();
     info!(
         count = total_processed,
-        version = manifest.version,
+        version = manifest_version,
         "storage service sync complete"
     );
     Ok(())

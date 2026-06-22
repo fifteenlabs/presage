@@ -5,6 +5,7 @@ use futures::{future, StreamExt};
 use libsignal_service::configuration::SignalServers;
 use libsignal_service::prelude::PushService;
 use libsignal_service::protocol::IdentityKeyPair;
+use libsignal_service::master_key::MasterKey;
 use libsignal_service::provisioning::{
     link_device, NewDeviceRegistration, SecondaryDeviceProvisioning,
 };
@@ -142,8 +143,9 @@ impl<S: Store> Manager<S, Linking> {
                     profile_key,
                 };
 
-                if let Some(ref master_key) = master_key {
-                    store.store_master_key(Some(master_key)).await?;
+                if let Some(master_key) = &master_key {
+                    let master_key = MasterKey::from_slice(master_key)?;
+                    store.store_master_key(Some(&master_key)).await?;
                 }
                 if let Some(ref backup_key) = backup_key {
                     store.store_backup_key(Some(backup_key)).await?;
