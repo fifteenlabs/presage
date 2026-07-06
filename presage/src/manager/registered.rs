@@ -1063,7 +1063,7 @@ impl<S: Store> Manager<S, Registered> {
                                         .await;
 
                                     if let Err(error) = result {
-                                        warn!(%error, "Error sending blocked contacts to other devices");
+                                        warn!(%error, "Error requesting keys from primary device");
                                     }
                                 });
                             }
@@ -1642,21 +1642,15 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         let credentials = self.credentials();
-        let master_key = self.master_key().await?;
         let mut account_manager = AccountManager::new(
             self.identified_push_service(),
             self.identified_websocket(false).await?,
             Some(self.state.data.profile_key),
         );
 
-        let mut rng = rand::rng();
-        // presage does not persist the account entropy pool — linked devices are keyed
-        // off the explicit master key (mirroring the `account_entropy_pool: None` handling
-        // in the key-sync path), so a fresh AEP is generated for the provisioning message.
-        let account_entropy_pool = AccountEntropyPool::generate(&mut rng);
         account_manager
             .link_device(
-                &mut rng,
+                &mut rand::rng(),
                 secondary,
                 &self.store.aci_protocol_store(),
                 &self.store.pni_protocol_store(),
@@ -1704,7 +1698,11 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     pub async fn sync_storage_service(&mut self) -> Result<(), Error<S::Error>> {
-        let storage_key = StorageServiceKey::from_master_key(&self.master_key().await?);
+        let master_key = self
+            .master_key()
+            .await?
+            .ok_or_else(|| Error::MissingKeyError("master_key".into()))?;
+        let storage_key = StorageServiceKey::from_master_key(&master_key);
         let push_service = self.identified_push_service();
         sync_storage_service(&mut self.store, &push_service, storage_key).await
     }

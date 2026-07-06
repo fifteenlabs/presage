@@ -78,6 +78,8 @@ impl<S: Store> Manager<S, Confirmation> {
 
         let skip_device_transfer = true;
 
+        // #457 moved `register_account` from `AccountManager` onto the identified
+        // websocket and it now takes the e164 number + password explicitly.
         let VerifyAccountResponse {
             aci,
             pni,
