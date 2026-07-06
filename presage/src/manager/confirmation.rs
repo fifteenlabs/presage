@@ -11,7 +11,6 @@ use libsignal_service::utils::TryIntoE164;
 use libsignal_service::websocket::account::{AccountAttributes, DeviceCapabilities};
 use libsignal_service::websocket::registration::{RegistrationMethod, VerifyAccountResponse};
 use libsignal_service::zkgroup::profiles::ProfileKey;
-use libsignal_service::AccountManager;
 use rand::RngCore;
 use tracing::trace;
 
@@ -102,18 +101,19 @@ impl<S: Store> Manager<S, Confirmation> {
             .await?;
 
         let skip_device_transfer = true;
-        let mut account_manager = AccountManager::new(
-            identified_push_service,
-            identified_websocket,
-            Some(profile_key),
-        );
+        let phone_number_e164 = phone_number
+            .try_into_e164()
+            .expect("valid phone number")
+            .to_string();
 
+        // #457 moved `register_account` from `AccountManager` onto the identified
+        // websocket and it now takes the e164 number + password explicitly.
         let VerifyAccountResponse {
             aci,
             pni,
             storage_capable: _,
             number: _,
-        } = account_manager
+        } = identified_websocket
             .register_account(
                 &mut rng,
                 RegistrationMethod::SessionId(&session.id),
@@ -125,14 +125,24 @@ impl<S: Store> Manager<S, Confirmation> {
                     registration_lock: None,
                     unidentified_access_key: Some(profile_key.derive_access_key().to_vec()),
                     unrestricted_unidentified_access: false, // TODO: make this configurable?
-                    capabilities: DeviceCapabilities::default(),
+                    capabilities: Some(DeviceCapabilities {
+                        storage: true,
+                        transfer: false,
+                        attachment_backfill: false,
+                        spqr: true,
+                        profiles_v2: false,
+                        username_change_sync_message: true,
+                    }),
                     discoverable_by_phone_number: true,
-                    pin: None,
+                    voice: false,
+                    video: false,
                     recovery_password: None,
                 },
                 &mut self.store.aci_protocol_store(),
                 &mut self.store.pni_protocol_store(),
                 skip_device_transfer,
+                &phone_number_e164,
+                password,
             )
             .await?;
 
