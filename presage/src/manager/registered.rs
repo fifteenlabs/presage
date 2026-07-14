@@ -1428,6 +1428,22 @@ impl<S: Store> Manager<S, Registered> {
         }))
     }
 
+    /// Downloads and decrypts a single sticker's image bytes straight from the
+    /// sticker CDN (`/stickers/{pack_id}/full/{sticker_id}`) — no manifest, no
+    /// whole-pack download, and no "install" sync to other devices. Only
+    /// `pack_id`/`pack_key`/`sticker_id` are needed, so this can render a
+    /// received sticker whose per-message `data` attachment is unavailable
+    /// (e.g. dropped on backup import).
+    pub async fn download_sticker(
+        &self,
+        pack_id: &[u8],
+        pack_key: &[u8],
+        sticker_id: u32,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
+        let mut unidentified_websocket = self.unidentified_websocket().await?;
+        download_sticker::<S>(&mut unidentified_websocket, pack_id, pack_key, sticker_id).await
+    }
+
     /// Installs a sticker pack and notifies other registered devices
     pub async fn install_sticker_pack(
         &mut self,
