@@ -12,4 +12,9 @@ pub enum Received {
 
     /// Incoming decrypted message with metadata and content
     Content(Box<Content>),
+
+    /// The identified websocket closed. Carries the typed reason so the client
+    /// can classify the drop (unlink / connected-elsewhere / transient) and
+    /// decide whether to reconnect. Yielded once, as the final stream item.
+    Disconnected(libsignal_service::websocket::DisconnectReason),
 }
