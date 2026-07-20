@@ -776,17 +776,13 @@ impl<S: Store> Manager<S, Registered> {
                                                 });
                                             }
                                             RequestType::Blocked => {
-                                                warn!("storing blocked user is not implemented yet! we will not report blocked users to the device requesting the sync.");
+                                                let blocked =
+                                                    collect_blocked_contacts(&state.store).await;
                                                 let mut message_sender =
                                                     state.message_sender.clone();
                                                 tokio::task::spawn_local(async move {
                                                     let result = message_sender.send_sync_message(SyncMessage {
-                                                    blocked: Some(libsignal_service::content::sync_message::Blocked {
-                                                        numbers: vec![],
-                                                        acis: vec![],
-                                                        acis_binary: vec![],
-                                                        group_ids: vec![],
-                                                    }),
+                                                    blocked: Some(blocked),
                                                     ..SyncMessage::with_padding(&mut rand::rng())
                                                 }).await;
 
@@ -1185,6 +1181,7 @@ impl<S: Store> Manager<S, Registered> {
                 needs_receipt: false,
                 unidentified_sender: false,
                 was_plaintext: false,
+                report_spam_token: None,
             },
             body: content_body,
         };
@@ -1198,6 +1195,54 @@ impl<S: Store> Manager<S, Registered> {
         )
         .await?;
 
+        Ok(())
+    }
+
+    /// Block or unblock a recipient. Persists the flag locally, then syncs the
+    /// full blocked list to our own linked devices via a `Blocked` sync message.
+    /// A recipient not yet in the contact list is stored as a minimal blocked
+    /// record so the block still takes effect.
+    pub async fn set_blocked(
+        &mut self,
+        service_id: ServiceId,
+        blocked: bool,
+    ) -> Result<(), Error<S::Error>> {
+        let mut contact = match self.store.contact_by_id(&service_id).await? {
+            Some(contact) => contact,
+            None => Contact::minimal(service_id.raw_uuid()),
+        };
+        contact.blocked = blocked;
+        self.store.save_contact(&contact).await?;
+        self.send_blocked_sync().await
+    }
+
+    /// Broadcast the current blocked list to our own linked devices.
+    async fn send_blocked_sync(&mut self) -> Result<(), Error<S::Error>> {
+        let blocked = collect_blocked_contacts(&self.store).await;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as u64;
+        let sync_message = SyncMessage {
+            blocked: Some(blocked),
+            ..SyncMessage::with_padding(&mut rand::rng())
+        };
+        self.send_message(self.state.data.service_ids.aci(), sync_message, timestamp)
+            .await
+    }
+
+    /// Report a received message as spam to the Signal servers. `server_guid`
+    /// identifies the offending message and `token` is its `report_spam_token`
+    /// from the envelope, if any (see [`Metadata`]).
+    pub async fn report_spam(
+        &self,
+        sender: ServiceId,
+        server_guid: Uuid,
+        token: Option<Vec<u8>>,
+    ) -> Result<(), Error<S::Error>> {
+        self.identified_push_service()
+            .report_spam(&sender, server_guid, token)
+            .await?;
         Ok(())
     }
 
@@ -1313,6 +1358,7 @@ impl<S: Store> Manager<S, Registered> {
                 needs_receipt: false, // TODO: this is just wrong
                 unidentified_sender: false,
                 was_plaintext: false,
+                report_spam_token: None,
             },
             body: content_body,
         };
@@ -1959,6 +2005,38 @@ impl<S: Store> Manager<S, Registered> {
             }
         }
         Ok(())
+    }
+}
+
+/// Build the `Blocked` sync payload from locally-stored blocked contacts.
+///
+/// Group blocking is deferred (this covers 1:1 contacts), so `group_ids` is
+/// always empty. Blocking is keyed by ACI; `numbers` is left empty as modern
+/// Signal identifies blocked recipients by service id. Store-read errors are
+/// logged and treated as "nothing blocked" rather than propagated.
+async fn collect_blocked_contacts<S: Store>(
+    store: &S,
+) -> libsignal_service::content::sync_message::Blocked {
+    let mut acis = Vec::new();
+    let mut acis_binary = Vec::new();
+    match store.contacts().await {
+        Ok(iter) => {
+            for contact in iter.flatten() {
+                if contact.blocked {
+                    acis.push(contact.uuid.to_string());
+                    acis_binary.push(contact.uuid.as_bytes().to_vec());
+                }
+            }
+        }
+        Err(error) => {
+            warn!(%error, "failed to read contacts while building blocked list");
+        }
+    }
+    libsignal_service::content::sync_message::Blocked {
+        numbers: Vec::new(),
+        acis,
+        acis_binary,
+        group_ids: Vec::new(),
     }
 }
 
@@ -2613,6 +2691,10 @@ async fn sync_storage_service<S: Store>(
                         contact.inbox_position = existing.inbox_position;
                         contact.avatar = existing.avatar;
                         contact.verified = existing.verified;
+                        // MVP (FIF-914): there is no storage-service *write* path yet,
+                        // so a locally-set block would otherwise be clobbered by this
+                        // read-only sync. Keep a local block sticky.
+                        contact.blocked = contact.blocked || existing.blocked;
                     }
                     if let Err(e) = store.save_contact(&contact).await {
                         warn!(%e, "storage sync: failed to save contact");

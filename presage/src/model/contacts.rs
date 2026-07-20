@@ -99,6 +99,24 @@ impl From<libsignal_service::models::Contact> for Contact {
     }
 }
 
+impl Contact {
+    /// Build a bare contact record for a recipient we've never synced, keyed
+    /// only by its ACI. Used when blocking someone who isn't in the contact
+    /// list yet — every other field takes its default.
+    pub fn minimal(uuid: Uuid) -> Self {
+        libsignal_service::models::Contact {
+            uuid,
+            phone_number: None,
+            name: String::new(),
+            expire_timer: 0,
+            expire_timer_version: default_expire_timer_version(),
+            inbox_position: 0,
+            avatar: None,
+        }
+        .into()
+    }
+}
+
 impl TryFrom<libsignal_service::proto::ContactRecord> for Contact {
     type Error = &'static str;
 
