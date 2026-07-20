@@ -1069,6 +1069,9 @@ impl<S: Store> Manager<S, Registered> {
                             }
                             return Some((Received::QueueEmpty, state));
                         }
+                        Some(Ok(Incoming::Disconnected(reason))) => {
+                            return Some((Received::Disconnected(reason), state));
+                        }
                         Some(Err(error)) => {
                             error!(%error, "unexpected error in message receiving loop")
                         }
