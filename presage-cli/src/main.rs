@@ -624,6 +624,9 @@ async fn receive<S: Store>(
                 )
                 .await
             }
+            Received::Disconnected(reason) => {
+                println!("disconnected: {reason:?}");
+            }
         }
     }
 
@@ -1003,6 +1006,9 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                             return true;
                         }
                         Received::Content(_) => print!("."),
+                        Received::Disconnected(_) => {
+                            // Ignore transient disconnects; keep waiting for contacts.
+                        }
                     }
                 }
                 false

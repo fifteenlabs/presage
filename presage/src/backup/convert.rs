@@ -268,8 +268,10 @@ fn reactions_to_contents(
 /// Returns the main message first, followed by one entry per reaction (each reconstructed
 /// as its own `DataMessage::reaction` envelope, matching Signal's wire format).
 ///
-/// Pure dispatcher: each item kind has its own helper. Unknown item kinds and
-/// unsupported `UpdateMessage` sub-variants drop silently (empty vec).
+/// Pure dispatcher: each item kind has its own helper. `SimpleUpdate`
+/// block/unblock rows are reconstructed into `MessageRequestResponse` sync
+/// Contents; unknown item kinds and other `UpdateMessage` sub-variants drop
+/// silently (empty vec).
 pub fn chat_item_to_contents(
     item: &ChatItem,
     recipients: &HashMap<u64, RecipientInfo>,
@@ -295,11 +297,24 @@ pub fn chat_item_to_contents(
             Some(backup::chat_update_message::Update::GroupCall(_)) => {
                 group_call_to_contents(cu, &thread, recipients, our_aci, timestamp)
             }
+            Some(backup::chat_update_message::Update::SimpleUpdate(_)) => {
+                simple_update_to_contents(cu, &thread, our_aci, timestamp)
+            }
             _ => vec![],
         },
         _ => vec![],
     }
 }
+
+/// Restored read/delivery state for a backup message row:
+/// `(thread, timestamp, read, per-recipient send states)`. `read` is `Some`
+/// for incoming rows, `None` for outgoing.
+type BackupMessageState = (
+    Thread,
+    u64,
+    Option<bool>,
+    Vec<(String, BackupSendStatus, u64)>,
+);
 
 /// Extract read / per-recipient send state from a backup `ChatItem` so the store
 /// can restore it after the row is saved — the wire `Content` the converter
@@ -310,12 +325,7 @@ pub fn chat_item_backup_state(
     item: &ChatItem,
     recipients: &HashMap<u64, RecipientInfo>,
     chats: &HashMap<u64, Thread>,
-) -> Option<(
-    Thread,
-    u64,
-    Option<bool>,
-    Vec<(String, BackupSendStatus, u64)>,
-)> {
+) -> Option<BackupMessageState> {
     let thread = chats.get(&item.chat_id).cloned()?;
     let ts = item.date_sent;
     match item.directional_details.as_ref()? {
@@ -568,6 +578,65 @@ fn individual_call_to_contents(
             server_guid: None,
             timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64).unwrap_or_default(),
             server_timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64).unwrap_or_default(),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            report_spam_token: None,
+        },
+        body,
+    };
+
+    vec![(main_content, thread.clone())]
+}
+
+/// Convert a backup `ChatUpdateMessage` carrying a `SimpleChatUpdate` of type
+/// `BLOCKED`/`UNBLOCKED` into the same `SyncMessage.message_request_response`
+/// Content the app synthesises live, so it flows through `save_message` and is
+/// rendered as a "You blocked/unblocked X" system row. Other `SimpleChatUpdate`
+/// types (identity, spam-report, etc.) and non-Contact threads drop — block
+/// history is 1:1-only, matching the rest of the block/unblock feature.
+fn simple_update_to_contents(
+    cu: &backup::ChatUpdateMessage,
+    thread: &Thread,
+    our_aci: Aci,
+    timestamp: u64,
+) -> Vec<(Content, Thread)> {
+    use backup::chat_update_message::Update;
+    use backup::simple_chat_update::Type as SimpleType;
+    use sync_message::message_request_response::Type as MrrType;
+    use sync_message::MessageRequestResponse;
+
+    let Some(Update::SimpleUpdate(su)) = cu.update.as_ref() else {
+        return vec![];
+    };
+    // Block/unblock rows live on the 1:1 chat with the blocked contact; a
+    // SimpleUpdate on a group chat is out of scope (group blocking deferred).
+    let Thread::Contact(peer) = thread else {
+        return vec![];
+    };
+    let mrr_type = match su.r#type() {
+        SimpleType::Blocked => MrrType::Block,
+        SimpleType::Unblocked => MrrType::Accept,
+        _ => return vec![],
+    };
+
+    let body = ContentBody::SynchronizeMessage(SyncMessage {
+        message_request_response: Some(MessageRequestResponse {
+            thread_aci_binary: Some(peer.raw_uuid().as_bytes().to_vec()),
+            r#type: Some(mrr_type as i32),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let ts = chrono::DateTime::from_timestamp_millis(timestamp as i64).unwrap_or_default();
+    let main_content = Content {
+        metadata: Metadata {
+            sender: ServiceId::Aci(our_aci),
+            destination: *peer,
+            sender_device: *DEFAULT_DEVICE_ID,
+            server_guid: None,
+            timestamp: ts,
+            server_timestamp: ts,
             needs_receipt: false,
             unidentified_sender: false,
             was_plaintext: false,
