@@ -312,6 +312,7 @@ impl TryInto<Content> for SqlMessage {
             unidentified_sender,
             server_guid: None,
             was_plaintext,
+            report_spam_token: None,
         };
         Content::from_proto(body, metadata).map_err(|_| SqliteStoreError::InvalidFormat)
     }

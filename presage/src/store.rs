@@ -814,6 +814,7 @@ pub async fn save_trusted_identity_message<S: Store>(
             needs_receipt: false,
             unidentified_sender: false,
             was_plaintext: false,
+            report_spam_token: None,
         },
         body: SyncMessage {
             verified: Some(Verified {
