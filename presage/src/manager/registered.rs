@@ -591,7 +591,6 @@ impl<S: Store> Manager<S, Registered> {
             master_key: Option<MasterKey>,
             account_entropy_pool: Option<AccountEntropyPool>,
             registration_type: RegistrationType,
-            push_service: PushService,
         }
 
         let identified_push_service = self.identified_push_service();
@@ -644,7 +643,6 @@ impl<S: Store> Manager<S, Registered> {
             master_key: self.master_key().await?,
             account_entropy_pool: self.account_entropy_pool().await?,
             registration_type: self.registration_type(),
-            push_service: identified_push_service,
         };
 
         debug!("starting to consume incoming message stream");
@@ -933,37 +931,11 @@ impl<S: Store> Manager<S, Registered> {
                                         }
                                     }
 
-                                    // storage manifest fetch request — trigger a full storage sync
-                                    if let ContentBody::SynchronizeMessage(SyncMessage {
-                                        fetch_latest: Some(fetch_latest),
-                                        ..
-                                    }) = &content.body
-                                    {
-                                        use libsignal_service::content::sync_message::fetch_latest::Type as FetchType;
-                                        if fetch_latest.r#type() == FetchType::StorageManifest {
-                                            if let Some(master_key) = &state.master_key {
-                                                let mut store = state.store.clone();
-                                                let push_service = state.push_service.clone();
-                                                let storage_key =
-                                                    StorageServiceKey::from_master_key(master_key);
-                                                tokio::task::spawn_local(async move {
-                                                    if let Err(e) = sync_storage_service(
-                                                        &mut store,
-                                                        &push_service,
-                                                        storage_key,
-                                                    )
-                                                    .await
-                                                    {
-                                                        warn!(%e, "storage service sync failed");
-                                                    }
-                                                });
-                                            } else {
-                                                warn!(
-                                                    "storage manifest fetch requested but no master key is available yet"
-                                                );
-                                            }
-                                        }
-                                    }
+                                    // NB: `FetchLatest { StorageManifest }` is intentionally NOT
+                                    // handled here. It is delivered to the app as
+                                    // `Received::Content`; the client drives the storage sync +
+                                    // its own UI refresh (keeps storage-service orchestration in
+                                    // the client layer, matching Signal Desktop).
 
                                     // group update
                                     if let ContentBody::DataMessage(DataMessage {
@@ -2691,10 +2663,6 @@ async fn sync_storage_service<S: Store>(
                         contact.inbox_position = existing.inbox_position;
                         contact.avatar = existing.avatar;
                         contact.verified = existing.verified;
-                        // MVP (FIF-914): there is no storage-service *write* path yet,
-                        // so a locally-set block would otherwise be clobbered by this
-                        // read-only sync. Keep a local block sticky.
-                        contact.blocked = contact.blocked || existing.blocked;
                     }
                     if let Err(e) = store.save_contact(&contact).await {
                         warn!(%e, "storage sync: failed to save contact");
