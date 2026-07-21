@@ -150,6 +150,7 @@ impl ContentsStore for SqliteStore {
             server_guid: _,
             was_plaintext,
             server_timestamp: _,
+            report_spam_token: _,
         } = metadata;
 
         let sender_device: u8 = sender_device.into();
