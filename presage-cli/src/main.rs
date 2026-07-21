@@ -627,6 +627,9 @@ async fn receive<S: Store>(
             Received::DecryptionError(c) => {
                 println!("failed to receive a message from a contact: {c:?}")
             }
+            Received::Disconnected(reason) => {
+                println!("disconnected: {reason:?}");
+            }
         }
     }
 
@@ -1008,6 +1011,9 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                         Received::Content(_) => print!("."),
                         Received::DecryptionError(_) => {
                             println!("failed to receive a message from a contact")
+                        }
+                        Received::Disconnected(_) => {
+                            // Ignore transient disconnects; keep waiting for contacts.
                         }
                     }
                 }
