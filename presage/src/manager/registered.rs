@@ -52,7 +52,7 @@ use libsignal_service::{
 use libsignal_service::{
     libsignal_account_keys::AccountEntropyPool, proto::addressable_message::Author,
 };
-use rand::rng;
+use rand::{rng, rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::io::AsyncWriteExt;
@@ -2096,8 +2096,13 @@ async fn upsert_group<S: Store>(
 
     if upsert_group {
         debug!("fetching and saving group");
+        // `rand::rng()` hands back a `ThreadRng` (`Rc<UnsafeCell<..>>`), and the
+        // temporary lives across the await below — which would make this future,
+        // and everything calling it, `!Send` for no reason. Seed a `StdRng`
+        // instead: same CSPRNG guarantees, and the future stays `Send`.
+        let mut csprng = StdRng::from_os_rng();
         match groups_manager
-            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
+            .fetch_encrypted_group(&mut csprng, master_key_bytes)
             .await
         {
             Ok(encrypted_group) => {
@@ -2120,8 +2125,11 @@ async fn hydrate_group<S: Store>(
     groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
     master_key: libsignal_service::zkgroup::GroupMasterKeyBytes,
 ) -> Result<(), Error<S::Error>> {
+    // Seeded from the OS rather than `rand::rng()` so the future stays `Send`
+    // — see the note in `upsert_group`.
+    let mut csprng = StdRng::from_os_rng();
     match groups_manager
-        .fetch_encrypted_group(&mut rand::rng(), master_key.as_ref())
+        .fetch_encrypted_group(&mut csprng, master_key.as_ref())
         .await
     {
         Ok(encrypted_group) => {
