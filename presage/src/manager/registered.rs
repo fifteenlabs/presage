@@ -9,6 +9,7 @@ use chrono::TimeZone;
 use futures::{future, AsyncReadExt, Stream, StreamExt};
 use libsignal_service::proto::addressable_message::Author;
 use libsignal_service::protocol::ProtocolAddress;
+use libsignal_service::session_lock::SessionLocks;
 use libsignal_service::{
     attachment_cipher::decrypt_in_place,
     backup::{FileReaderFactory, FramesReader, MessageBackupKey, VarintDelimitedReader},
@@ -86,6 +87,14 @@ pub struct Registered {
     pub(crate) identified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Identified>>>>,
     pub(crate) unidentified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Unidentified>>>>,
     pub(crate) unidentified_sender_certificate: Arc<Mutex<Option<SenderCertificate>>>,
+    /// Shared by every cipher and sender this manager builds — and, since
+    /// `Manager` clones share `state`, by every clone of it. That sharing is
+    /// what keeps a send and a concurrent decrypt off the same session.
+    ///
+    /// One map covers both the ACI and PNI stores. Their session records are
+    /// distinct, so this is marginally stricter than needed, but PNI sessions
+    /// are rare and the alternative is two maps to keep in step.
+    pub(crate) session_locks: SessionLocks,
 
     pub(crate) data: RegistrationData,
 }
@@ -104,6 +113,7 @@ impl Registered {
             identified_websocket: Default::default(),
             unidentified_websocket: Default::default(),
             unidentified_sender_certificate: Default::default(),
+            session_locks: Default::default(),
             data,
         }
     }
@@ -1588,6 +1598,7 @@ impl<S: Store> Manager<S, Registered> {
                 self.state.data.service_ids.aci.to_string(),
                 self.state.device_id(),
             ),
+            self.state.session_locks.clone(),
         )
     }
 
@@ -1601,6 +1612,7 @@ impl<S: Store> Manager<S, Registered> {
                 self.state.data.service_ids.pni.to_string(),
                 self.state.device_id(),
             ),
+            self.state.session_locks.clone(),
         )
     }
 
