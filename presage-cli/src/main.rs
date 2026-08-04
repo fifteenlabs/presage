@@ -247,6 +247,15 @@ enum Cmd {
         #[clap(value_parser = parse_service_id)]
         service_id: Option<ServiceId>,
     },
+    #[clap(about = "Create a group")]
+    CreateGroup {
+        #[clap(long, short = 'n', help = "Group title")]
+        name: String,
+        /// Repeatable. A member whose profile key credential cannot be obtained joins as a
+        /// pending invite rather than failing the creation.
+        #[clap(long, short = 'm', value_parser = parse_service_id)]
+        member: Vec<ServiceId>,
+    },
     #[clap(about = "Print various statistics useful for debugging")]
     Stats,
 }
@@ -1119,6 +1128,28 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+        Cmd::CreateGroup { name, member } => {
+            // Not `load_registered_and_receive` — see the note on GetCredential.
+            let mut manager = Manager::load_registered(store).await?;
+
+            // Report the membership split up front: it is decided by whether we hold a
+            // usable profile key credential, and is the most surprising part of the result.
+            for candidate in manager.group_member_candidates(&member).await? {
+                println!(
+                    "{}: {}",
+                    candidate.service_id.service_id_string(),
+                    if candidate.credential.is_some() {
+                        "full member"
+                    } else {
+                        "pending invite (no profile key credential)"
+                    }
+                );
+            }
+
+            let master_key = manager.create_group(&name, None, None, &member).await?;
+            println!("created group {name:?}");
+            println!("master key: {}", hex::encode(master_key));
         }
         Cmd::Stats => {
             let manager = load_registered_and_receive(store).await?;

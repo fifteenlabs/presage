@@ -17,7 +17,10 @@ use libsignal_service::{
     configuration::{ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, DataMessageFlags, Metadata},
     encrypt_device_name,
-    groups_v2::{decrypt_group, GroupMemberCandidate, GroupsManager, InMemoryCredentialsCache},
+    groups_v2::{
+        decrypt_group, AccessControl, AccessRequired, GroupMemberCandidate, GroupOperations,
+        GroupsManager, InMemoryCredentialsCache, Timer,
+    },
     libsignal_account_keys::AccountEntropyPool,
     master_key::StorageServiceKey,
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
@@ -46,11 +49,11 @@ use libsignal_service::{
     zkgroup::{
         groups::{GroupMasterKey, GroupSecretParams},
         profiles::{ExpiringProfileKeyCredential, ProfileKey},
-        ServerPublicParams,
+        GroupMasterKeyBytes, ServerPublicParams,
     },
     AccountManager, Profile, ProfileCredentialRequest, ServiceIdExt,
 };
-use rand::{SeedableRng, rng, rngs::StdRng};
+use rand::{rng, rngs::StdRng, RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::io::AsyncWriteExt;
@@ -494,6 +497,110 @@ impl<S: Store> Manager<S, Registered> {
             });
         }
         Ok(candidates)
+    }
+
+    /// Create a group, returning its master key.
+    ///
+    /// The master key is generated locally — the group id derives from it, so the server
+    /// assigns nothing and only validates the member presentations. Members whose profile
+    /// key credential could not be obtained join as pending invites rather than failing the
+    /// creation, matching Signal-Desktop.
+    ///
+    /// Unlike Desktop, the disappearing-messages timer goes into the create proto rather
+    /// than a follow-up group change, so creation stays a single operation.
+    pub async fn create_group(
+        &mut self,
+        title: &str,
+        description: Option<&str>,
+        expire_timer: Option<Timer>,
+        members: &[ServiceId],
+    ) -> Result<GroupMasterKeyBytes, Error<S::Error>> {
+        // See `upsert_group`: a `ThreadRng` temporary across the awaits below would make
+        // this future `!Send` for no reason.
+        let mut csprng = StdRng::from_os_rng();
+        let mut master_key_bytes: GroupMasterKeyBytes = [0u8; 32];
+        csprng.fill_bytes(&mut master_key_bytes);
+        let group_secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key_bytes));
+
+        let self_credential = self.own_profile_key_credential().await?;
+        let candidates = self.group_member_candidates(members).await?;
+
+        // Signal-Desktop's create-time defaults. `add_from_invite_link` is deliberately
+        // unsatisfiable: a new group has no invite link until one is explicitly created.
+        let access_control = AccessControl {
+            attributes: AccessRequired::Member,
+            members: AccessRequired::Member,
+            add_from_invite_link: AccessRequired::Unsatisfiable,
+            member_label: AccessRequired::Member,
+        };
+
+        let server_public_params = self
+            .state
+            .service_configuration()
+            .zkgroup_server_public_params;
+
+        let encrypted_group = GroupOperations::new(group_secret_params)
+            .encrypt_group_with_credentials(
+                title,
+                description,
+                expire_timer.as_ref(),
+                Some(&access_control),
+                &self_credential,
+                &candidates,
+                &server_public_params,
+                // Avatars are not supported yet: there is no group-avatar upload endpoint.
+                String::new(),
+                &mut csprng,
+            )?;
+
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        groups_manager
+            .create_group(&mut csprng, &master_key_bytes, encrypted_group)
+            .await?;
+
+        // Read back rather than trusting the write's response body, whose shape differs
+        // between endpoint versions. This also makes the local copy canonically the
+        // server's, revision included.
+        let group = decrypt_group(
+            &master_key_bytes,
+            groups_manager
+                .fetch_encrypted_group(&mut csprng, &master_key_bytes)
+                .await?,
+        )?;
+        self.store.save_group(master_key_bytes, group).await?;
+
+        // Members are not notified by the server; the creator announces the group with an
+        // otherwise-empty message carrying only the group context, as Desktop does. Must
+        // follow `save_group`, which is where the recipient list is read from.
+        //
+        // Failure here is logged, not propagated: the group already exists server-side, and
+        // reporting an error would invite a retry that creates a second one.
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_millis() as u64;
+        // The group context is what makes this message mean anything: `MessageSender`
+        // fans the body out verbatim and attaches nothing itself, so without `group_v2`
+        // the recipient gets a bodiless message with no group association and drops it.
+        // Signal-Desktop's `sendGroupUpdate` is the same shape — an otherwise-empty
+        // message whose only payload is the group context at the new revision.
+        let announcement = DataMessage {
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key_bytes.to_vec()),
+                revision: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        if let Err(e) = self
+            .send_message_to_group(&master_key_bytes, announcement, timestamp)
+            .await
+        {
+            warn!(%e, "group created but announcing it to members failed");
+        }
+
+        Ok(master_key_bytes)
     }
 
     /// One member's credential, or `None` with a reason logged. Never fails the caller.

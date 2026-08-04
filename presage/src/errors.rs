@@ -37,6 +37,8 @@ pub enum Error<S: std::error::Error> {
     ProfileManagerError(#[from] libsignal_service::ProfileManagerError),
     #[error("profile key credential error: {0}")]
     ProfileCredentialError(#[from] libsignal_service::ProfileCredentialError),
+    #[error("group encoding/decoding error: {0}")]
+    GroupDecodingError(#[from] libsignal_service::groups_v2::GroupDecodingError),
     #[error("libsignal-service sending error: {0}")]
     MessageSenderError(Box<MessageSenderError>),
     #[error("this client is already registered with Signal")]
