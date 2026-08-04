@@ -35,6 +35,8 @@ pub enum Error<S: std::error::Error> {
     StorageServiceError(#[from] libsignal_service::StorageServiceError),
     #[error("libsignal-service error: {0}")]
     ProfileManagerError(#[from] libsignal_service::ProfileManagerError),
+    #[error("profile key credential error: {0}")]
+    ProfileCredentialError(#[from] libsignal_service::ProfileCredentialError),
     #[error("libsignal-service sending error: {0}")]
     MessageSenderError(Box<MessageSenderError>),
     #[error("this client is already registered with Signal")]

@@ -238,6 +238,15 @@ enum Cmd {
         #[clap(long, short = 'u')]
         username: String,
     },
+    #[clap(
+        about = "Fetch an expiring profile key credential — the input group creation needs \
+                 to add someone as a full member rather than a pending invite"
+    )]
+    GetCredential {
+        /// Service ID to fetch for. Omit to fetch our own.
+        #[clap(value_parser = parse_service_id)]
+        service_id: Option<ServiceId>,
+    },
     #[clap(about = "Print various statistics useful for debugging")]
     Stats,
 }
@@ -1063,6 +1072,52 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             match resolved_service_id {
                 Some(service_id) => println!("{username} => {}", service_id.service_id_string()),
                 None => println!("{username} => no matching account found"),
+            }
+        }
+        Cmd::GetCredential { service_id } => {
+            // Deliberately not `load_registered_and_receive`: that spawns a receive loop
+            // which drains and persists the whole pending message queue as a side effect,
+            // contaminating any store being used for before/after comparisons. The
+            // credential fetch only needs the websockets, which the manager opens on demand.
+            let mut manager = Manager::load_registered(store).await?;
+
+            match service_id {
+                // Self goes over the authenticated socket, as Signal-Desktop does, and
+                // is a hard error: group creation cannot proceed without it.
+                None => {
+                    let credential = manager.own_profile_key_credential().await?;
+                    println!(
+                        "self: credential OK, expires {}",
+                        credential.get_expiration_time().epoch_seconds()
+                    );
+                }
+                // Anyone else goes unauthenticated, authorised by the access key derived
+                // from their profile key.
+                Some(service_id) => {
+                    let profile_key = manager.store().profile_key(&service_id).await?;
+                    println!(
+                        "{}: profile key {}",
+                        service_id.service_id_string(),
+                        if profile_key.is_some() {
+                            "found in signal_profile_keys"
+                        } else {
+                            "MISSING — will be a pending invite"
+                        }
+                    );
+
+                    let candidates = manager.group_member_candidates(&[service_id]).await?;
+                    match candidates.first().and_then(|c| c.credential.as_ref()) {
+                        Some(credential) => println!(
+                            "{}: credential OK, expires {} — joins as FULL MEMBER",
+                            service_id.service_id_string(),
+                            credential.get_expiration_time().epoch_seconds()
+                        ),
+                        None => println!(
+                            "{}: no credential — joins as PENDING INVITE",
+                            service_id.service_id_string()
+                        ),
+                    }
+                }
             }
         }
         Cmd::Stats => {

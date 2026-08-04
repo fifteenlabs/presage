@@ -17,7 +17,7 @@ use libsignal_service::{
     configuration::{ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, DataMessageFlags, Metadata},
     encrypt_device_name,
-    groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
+    groups_v2::{decrypt_group, GroupMemberCandidate, GroupsManager, InMemoryCredentialsCache},
     libsignal_account_keys::AccountEntropyPool,
     master_key::StorageServiceKey,
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
@@ -45,9 +45,10 @@ use libsignal_service::{
     },
     zkgroup::{
         groups::{GroupMasterKey, GroupSecretParams},
-        profiles::ProfileKey,
+        profiles::{ExpiringProfileKeyCredential, ProfileKey},
+        ServerPublicParams,
     },
-    AccountManager, Profile, ServiceIdExt,
+    AccountManager, Profile, ProfileCredentialRequest, ServiceIdExt,
 };
 use rand::{SeedableRng, rng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
@@ -432,6 +433,122 @@ impl<S: Store> Manager<S, Registered> {
             .save_profile(aci.into(), profile_key, profile.clone())
             .await;
         Ok(profile)
+    }
+
+    /// Fetch our own expiring profile key credential.
+    ///
+    /// Required — and non-optional — to create a group: the creator is always a full
+    /// member, so a failure here is fatal rather than a downgrade to a pending invite.
+    ///
+    /// Uses the authenticated socket, as Signal-Desktop does for self.
+    pub async fn own_profile_key_credential(
+        &mut self,
+    ) -> Result<ExpiringProfileKeyCredential, Error<S::Error>> {
+        let aci = self.state.data.service_ids.aci();
+        let profile_key = self.state.data.profile_key;
+        let server_public_params = self
+            .state
+            .service_configuration()
+            .zkgroup_server_public_params;
+
+        // See the note in `upsert_group`: a `ThreadRng` temporary living across the
+        // await below would make this future `!Send` for no reason.
+        let mut csprng = StdRng::from_os_rng();
+        let request =
+            ProfileCredentialRequest::new(&mut csprng, &server_public_params, aci, profile_key);
+
+        let response = self
+            .identified_websocket(false)
+            .await?
+            .retrieve_own_profile_key_credential(aci, profile_key, request.hex())
+            .await?;
+
+        Ok(request.receive(&response, SystemTime::now())?)
+    }
+
+    /// Resolve group member candidates for the given service IDs.
+    ///
+    /// Returns exactly what `GroupOperations::encrypt_group_with_credentials` consumes:
+    /// a candidate carrying a credential joins as a full member, one without joins as a
+    /// pending invite. Three things collapse to `credential: None`, all of them normal —
+    /// no profile key on file, a PNI-only contact (credentials are ACI-only), or a failed
+    /// fetch. None of them is fatal, mirroring Signal-Desktop, which downgrades the member
+    /// rather than failing the whole group.
+    pub async fn group_member_candidates(
+        &mut self,
+        members: &[ServiceId],
+    ) -> Result<Vec<GroupMemberCandidate>, Error<S::Error>> {
+        let server_public_params = self
+            .state
+            .service_configuration()
+            .zkgroup_server_public_params;
+
+        let mut candidates = Vec::with_capacity(members.len());
+        for service_id in members {
+            let credential = self
+                .member_profile_key_credential(*service_id, &server_public_params)
+                .await;
+            candidates.push(GroupMemberCandidate {
+                service_id: *service_id,
+                credential,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// One member's credential, or `None` with a reason logged. Never fails the caller.
+    async fn member_profile_key_credential(
+        &mut self,
+        service_id: ServiceId,
+        server_public_params: &ServerPublicParams,
+    ) -> Option<ExpiringProfileKeyCredential> {
+        // Credentials are ACI-only, so a PNI-only contact can only ever be invited.
+        let Some(aci) = service_id.aci() else {
+            debug!(service_id = %service_id.service_id_string(), "no credential: PNI-only contact");
+            return None;
+        };
+        let profile_key = match self.store.profile_key(&service_id).await {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                debug!(service_id = %service_id.service_id_string(), "no credential: no profile key on file");
+                return None;
+            }
+            Err(e) => {
+                warn!(service_id = %service_id.service_id_string(), %e, "no credential: profile key lookup failed");
+                return None;
+            }
+        };
+
+        let mut csprng = StdRng::from_os_rng();
+        let request =
+            ProfileCredentialRequest::new(&mut csprng, server_public_params, aci, profile_key);
+
+        let mut websocket = match self.unidentified_websocket().await {
+            Ok(ws) => ws,
+            Err(e) => {
+                warn!(service_id = %service_id.service_id_string(), %e, "no credential: unidentified websocket unavailable");
+                return None;
+            }
+        };
+        let response = match websocket
+            .retrieve_profile_key_credential(aci, profile_key, request.hex())
+            .await
+        {
+            Ok(response) => response,
+            // 401/403 means our profile key is stale; 404 that the version is unknown.
+            Err(e) => {
+                warn!(service_id = %service_id.service_id_string(), %e, "no credential: fetch failed");
+                return None;
+            }
+        };
+
+        match request.receive(&response, SystemTime::now()) {
+            Ok(credential) => Some(credential),
+            Err(e) => {
+                warn!(service_id = %service_id.service_id_string(), %e, "no credential: response did not verify");
+                None
+            }
+        }
     }
 
     /// Updates the user's profile information.
