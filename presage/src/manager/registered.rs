@@ -28,8 +28,10 @@ use libsignal_service::{
     profile_cipher::ProfileCipher,
     proto::{
         data_message::Delete,
+        manifest_record, storage_record,
         sync_message::{self, sticker_pack_operation, StickerPackOperation},
-        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, SyncMessage, Verified,
+        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, GroupV2Record, ManifestRecord,
+        StorageRecord, SyncMessage, Verified,
     },
     protocol::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
@@ -51,7 +53,7 @@ use libsignal_service::{
         profiles::{ExpiringProfileKeyCredential, ProfileKey},
         GroupMasterKeyBytes, ServerPublicParams,
     },
-    AccountManager, Profile, ProfileCredentialRequest, ServiceIdExt,
+    AccountManager, Profile, ProfileCredentialRequest, ServiceIdExt, StorageService,
 };
 use rand::{rng, rngs::StdRng, RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -570,6 +572,25 @@ impl<S: Store> Manager<S, Registered> {
         )?;
         self.store.save_group(master_key_bytes, group).await?;
 
+        // Our own linked devices learn about the group from the storage manifest, not from
+        // the fan-out below, which excludes self. Non-fatal for the same reason as the
+        // fan-out: the group already exists, and surfacing an error here would invite a
+        // retry that creates a second one.
+        let storage_record = StorageRecord {
+            record: Some(storage_record::Record::GroupV2(GroupV2Record {
+                master_key: master_key_bytes.to_vec(),
+                // Desktop sets `profileSharing: true` at create, which is this field.
+                whitelisted: true,
+                ..Default::default()
+            })),
+        };
+        if let Err(e) = self
+            .append_storage_record(manifest_record::identifier::Type::Groupv2, storage_record)
+            .await
+        {
+            warn!(%e, "group created but adding it to the storage manifest failed");
+        }
+
         // Members are not notified by the server; the creator announces the group with an
         // otherwise-empty message carrying only the group context, as Desktop does. Must
         // follow `save_group`, which is where the recipient list is read from.
@@ -601,6 +622,110 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         Ok(master_key_bytes)
+    }
+
+    /// Append one record to the account's storage manifest.
+    ///
+    /// Every existing identifier is copied through **verbatim**, including record types
+    /// presage does not model (account, story distribution lists, call links, chat
+    /// folders, notification profiles). The server treats the manifest as the complete
+    /// index of the account, so anything dropped here would be deleted from every device
+    /// the user owns — which is why this appends rather than regenerating the way
+    /// Signal-Desktop's `generateManifest` does.
+    ///
+    /// Deliberately offers no way to express an update or a delete: those require
+    /// re-encoding records we cannot decode.
+    async fn append_storage_record(
+        &mut self,
+        item_type: manifest_record::identifier::Type,
+        record: StorageRecord,
+    ) -> Result<(), Error<S::Error>> {
+        /// The phone writes to this manifest too, so a conflict is routine rather than
+        /// exceptional; retry a few times before giving up.
+        const MAX_ATTEMPTS: usize = 3;
+
+        let master_key = self
+            .master_key()
+            .await?
+            .ok_or_else(|| Error::MissingKeyError("master_key".into()))?;
+        // `StorageService::new` takes ownership and the key isn't `Clone`; re-deriving is a
+        // single HMAC, so keep a second one for the encrypt helpers below.
+        let storage_service = StorageService::new(
+            self.identified_push_service(),
+            StorageServiceKey::from_master_key(&master_key),
+        )
+        .await?;
+        let storage_key = StorageServiceKey::from_master_key(&master_key);
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            let current = storage_service.manifest().await?;
+            let version = current.version + 1;
+
+            // Storage IDs are 16 random bytes, and a record is only ever addressed by the
+            // id it was inserted under.
+            let mut raw_id = vec![0u8; 16];
+            StdRng::from_os_rng().fill_bytes(&mut raw_id);
+
+            let mut identifiers = current.identifiers.clone();
+            identifiers.push(manifest_record::Identifier {
+                raw: raw_id.clone(),
+                r#type: item_type.into(),
+            });
+
+            // `record_ikm` must be carried forward unchanged: item keys derive from it, so
+            // dropping it would make every existing item undecryptable.
+            let record_ikm = (!current.record_ikm.is_empty()).then(|| current.record_ikm.clone());
+            let new_manifest = ManifestRecord {
+                version,
+                source_device: self.state.device_id().into(),
+                identifiers,
+                record_ikm: current.record_ikm.clone(),
+            };
+
+            let encrypted_manifest = StorageService::encrypt_manifest(&storage_key, &new_manifest);
+            let encrypted_item =
+                StorageService::encrypt_item(&storage_key, raw_id, &record, record_ikm.as_deref());
+
+            match storage_service
+                .write_items(encrypted_manifest, vec![encrypted_item], Vec::new())
+                .await
+            {
+                Ok(()) => {
+                    self.store.store_storage_manifest_version(version).await?;
+                    debug!(version, "storage manifest: appended record");
+
+                    // Tell the other devices to sync — the same FetchLatest that appv2
+                    // listens for. Best-effort: the record is already written.
+                    if let Err(e) = self
+                        .new_message_sender()
+                        .await?
+                        .send_sync_message(SyncMessage {
+                            fetch_latest: Some(sync_message::FetchLatest {
+                                r#type: Some(
+                                    sync_message::fetch_latest::Type::StorageManifest.into(),
+                                ),
+                            }),
+                            ..SyncMessage::with_padding(&mut rand::rng())
+                        })
+                        .await
+                    {
+                        warn!(%e, "storage manifest written but notifying other devices failed");
+                    }
+                    return Ok(());
+                }
+                Err(libsignal_service::StorageServiceError::Conflict(remote)) => {
+                    debug!(
+                        attempt,
+                        our_version = version,
+                        remote_version = remote.version,
+                        "storage manifest: version conflict, retrying"
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Err(Error::StorageManifestConflict)
     }
 
     /// One member's credential, or `None` with a reason logged. Never fails the caller.

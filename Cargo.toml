@@ -8,5 +8,8 @@ quickcheck_async = { git = 'https://github.com/nytopop/quickcheck_async', rev = 
 libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = '2a42b3354c9194700d08aa070f70a131a470e7dc' }
 
 [patch."https://github.com/whisperfish/libsignal-service-rs.git"]
-libsignal-service = { git = "https://github.com/fifteenlabs/libsignal-service-rs", rev = "1acd0844556cb6ce18542ee0a05e9ae6463165d4" }
+# TEMP (FIF-901): local path so the profile-key-credential work is testable
+# before it is pushed. Restore the git rev before committing/pushing:
+# libsignal-service = { git = "https://github.com/fifteenlabs/libsignal-service-rs", rev = "1acd0844556cb6ce18542ee0a05e9ae6463165d4" }
+libsignal-service = { path = "/Users/eduardofalvo/fifteen/libsignal-service-rs" }
 
