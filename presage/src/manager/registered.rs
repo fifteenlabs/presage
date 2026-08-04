@@ -1712,13 +1712,17 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     pub async fn sync_storage_service(&mut self) -> Result<(), Error<S::Error>> {
+        // FIF-993: entry/exit bracket for the presage storage-service sync.
+        tracing::info!(target: "fif993", "sync_storage_service: START (presage)");
         let master_key = self
             .master_key()
             .await?
             .ok_or_else(|| Error::MissingKeyError("master_key".into()))?;
         let storage_key = StorageServiceKey::from_master_key(&master_key);
         let push_service = self.identified_push_service();
-        sync_storage_service(&mut self.store, &push_service, storage_key).await
+        let result = sync_storage_service(&mut self.store, &push_service, storage_key).await;
+        tracing::info!(target: "fif993", ok = result.is_ok(), "sync_storage_service: DONE (presage)");
+        result
     }
 
     pub async fn hydrate_groups(&mut self) -> Result<(), Error<S::Error>> {
@@ -2735,6 +2739,40 @@ async fn sync_storage_service<S: Store>(
             match record.record {
                 Some(libsignal_service::proto::storage_record::Record::Contact(cr)) => {
                     debug!(aci = %cr.aci, name = %cr.given_name, "storage sync: saving contact");
+                    // FIF-993: the raw record exactly as received, before any
+                    // conversion. `ContactRecord` is a full snapshot, not a delta, so an
+                    // empty field here means the *writing* device had nothing — and
+                    // proto3 gives these scalars no presence, so "unset" and "empty" are
+                    // indistinguishable on the wire. Lengths are logged alongside the
+                    // values because that distinction is the whole question.
+                    // NOTE: logs contact names / phone numbers. Debug only.
+                    tracing::info!(
+                        target: "fif993",
+                        aci = %cr.aci,
+                        aci_binary_len = cr.aci_binary.len(),
+                        given_name = %cr.given_name,
+                        given_name_len = cr.given_name.len(),
+                        family_name = %cr.family_name,
+                        family_name_len = cr.family_name.len(),
+                        profile_key_len = cr.profile_key.len(),
+                        identity_key_len = cr.identity_key.len(),
+                        e164 = %cr.e164,
+                        e164_len = cr.e164.len(),
+                        pni = %cr.pni,
+                        pni_binary_len = cr.pni_binary.len(),
+                        username = %cr.username,
+                        system_given_name = %cr.system_given_name,
+                        system_family_name = %cr.system_family_name,
+                        system_nickname = %cr.system_nickname,
+                        nickname_given = ?cr.nickname.as_ref().map(|n| n.given.clone()),
+                        nickname_family = ?cr.nickname.as_ref().map(|n| n.family.clone()),
+                        note_len = cr.note.len(),
+                        blocked = cr.blocked,
+                        whitelisted = cr.whitelisted,
+                        hidden = cr.hidden,
+                        archived = cr.archived,
+                        "storage sync: RAW ContactRecord as received from storage service",
+                    );
                     let mut contact: Contact = match Contact::try_from(cr) {
                         Ok(c) => c,
                         Err(e) => {
@@ -2747,9 +2785,33 @@ async fn sync_storage_service<S: Store>(
                     // restore what the record cannot carry, and refuse to let an empty
                     // record field overwrite local data.
                     let service_id = ServiceId::Aci(Aci::from(contact.uuid));
-                    if let Ok(Some(existing)) = store.contact_by_id(&service_id).await {
-                        merge_contact_from_storage(&mut contact, existing);
-                    }
+                    let existing_contact = store.contact_by_id(&service_id).await.ok().flatten();
+                    let existing_name = existing_contact.as_ref().map(|e| e.name.clone());
+                    let existing_profile_key_len =
+                        existing_contact.as_ref().map(|e| e.profile_key.len());
+                    let is_new_contact = existing_contact.is_none();
+                    // FIF-993: the fields an empty record would have wiped, had the guard
+                    // above not held them. `name` is the reported symptom; the other four
+                    // share the same cause.
+                    let wipe_prevented = existing_contact
+                        .map(|existing| merge_contact_from_storage(&mut contact, existing))
+                        .unwrap_or_default();
+                    tracing::info!(
+                        target: "fif993",
+                        aci = %contact.uuid,
+                        existing_name = ?existing_name,
+                        new_name = %contact.name,
+                        new_system_given = %contact.system_given_name,
+                        new_system_family = %contact.system_family_name,
+                        new_system_nickname = %contact.system_nickname,
+                        new_nickname_given = %contact.nickname_given_name,
+                        new_nickname_family = %contact.nickname_family_name,
+                        existing_profile_key_len = ?existing_profile_key_len,
+                        new_profile_key_len = contact.profile_key.len(),
+                        wipe_prevented = ?wipe_prevented,
+                        is_new_contact,
+                        "storage sync: rebuilt Contact from ContactRecord, about to save_contact",
+                    );
                     if let Err(e) = store.save_contact(&contact).await {
                         warn!(%e, "storage sync: failed to save contact");
                     }
