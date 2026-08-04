@@ -1946,6 +1946,17 @@ impl<S: Store> Manager<S, Registered> {
                         if let Err(e) = self.store.save_contact(&contact).await {
                             warn!(%e, "backup import: failed to save contact");
                         }
+                        // Same reason as the storage-sync path: the backup carries the
+                        // profile key, so record it where `profile_key()` will find it.
+                        if let Some(profile_key) = contact_profile_key(&contact) {
+                            if let Err(e) = self
+                                .store
+                                .upsert_profile_key(&contact.uuid, profile_key)
+                                .await
+                            {
+                                warn!(%e, "backup import: failed to upsert profile key");
+                            }
+                        }
                     } else if let Some((master_key, group)) = convert::recipient_to_group(&r) {
                         if let Err(e) = self.store.save_group(master_key, group).await {
                             warn!(%e, "backup import: failed to save group");
@@ -2559,6 +2570,17 @@ async fn register_pre_keys<S: Store>(
 /// Signal Desktop uses 2500; the server's hard limit is ~5120.
 const STORAGE_SERVICE_BATCH_SIZE: usize = 2500;
 
+/// Parse a [`Contact`]'s raw profile-key bytes into a [`ProfileKey`].
+///
+/// The field is a `Vec<u8>` that is legitimately empty — `Contact::minimal` and a
+/// `ContactRecord` carrying no key both produce one — so anything that isn't exactly
+/// 32 bytes is treated as absent.
+fn contact_profile_key(contact: &Contact) -> Option<ProfileKey> {
+    <[u8; 32]>::try_from(contact.profile_key.as_slice())
+        .ok()
+        .map(ProfileKey::create)
+}
+
 async fn sync_storage_service<S: Store>(
     store: &mut S,
     push_service: &PushService,
@@ -2690,6 +2712,14 @@ async fn sync_storage_service<S: Store>(
                     if let Err(e) = store.save_contact(&contact).await {
                         warn!(%e, "storage sync: failed to save contact");
                     }
+                    // Keep `profile_keys` in step with the contact row — it is the
+                    // table `ContentsStore::profile_key` reads, and until now only the
+                    // first-sight message path wrote to it.
+                    if let Some(profile_key) = contact_profile_key(&contact) {
+                        if let Err(e) = store.upsert_profile_key(&contact.uuid, profile_key).await {
+                            warn!(%e, "storage sync: failed to upsert profile key");
+                        }
+                    }
                 }
                 Some(libsignal_service::proto::storage_record::Record::GroupV2(gr)) => {
                     let master_key: libsignal_service::zkgroup::GroupMasterKeyBytes =
@@ -2779,4 +2809,34 @@ async fn sync_storage_service<S: Store>(
         "storage service sync complete"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contact_with_profile_key(bytes: Vec<u8>) -> Contact {
+        let mut contact = Contact::minimal(Uuid::nil());
+        contact.profile_key = bytes;
+        contact
+    }
+
+    #[test]
+    fn contact_profile_key_accepts_32_bytes() {
+        let bytes = vec![7u8; 32];
+        let key = contact_profile_key(&contact_with_profile_key(bytes.clone()))
+            .expect("32 bytes is a profile key");
+        assert_eq!(key.bytes.as_slice(), bytes.as_slice());
+    }
+
+    #[test]
+    fn contact_profile_key_rejects_empty() {
+        // What `Contact::minimal` and a `ContactRecord` with no key both produce.
+        assert!(contact_profile_key(&Contact::minimal(Uuid::nil())).is_none());
+    }
+
+    #[test]
+    fn contact_profile_key_rejects_wrong_length() {
+        assert!(contact_profile_key(&contact_with_profile_key(vec![7u8; 31])).is_none());
+    }
 }
