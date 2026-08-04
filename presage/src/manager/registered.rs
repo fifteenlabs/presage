@@ -2581,6 +2581,49 @@ fn contact_profile_key(contact: &Contact) -> Option<ProfileKey> {
         .map(ProfileKey::create)
 }
 
+/// Merge the locally-stored contact into one rebuilt from a `ContactRecord`, and report
+/// which at-risk fields were protected.
+///
+/// A `ContactRecord` is a full snapshot, but only of what the *writing* device knew — and
+/// proto3 gives these scalars no presence, so an empty value is indistinguishable from an
+/// unset one and carries no information. Letting one overwrite local data loses the
+/// contact's name, profile key, phone number, PNI or username for nothing.
+///
+/// A *non-empty* remote value still wins. Storage sync is the only channel that delivers a
+/// renamed contact to the app — presage only re-fetches a profile on first sight or a
+/// profile-key rotation — so remote stays authoritative whenever it has something to say.
+fn merge_contact_from_storage(contact: &mut Contact, existing: Contact) -> Vec<&'static str> {
+    // Not carried by ContactRecord at all — always local.
+    contact.expire_timer = existing.expire_timer;
+    contact.expire_timer_version = existing.expire_timer_version;
+    contact.inbox_position = existing.inbox_position;
+    contact.avatar = existing.avatar;
+    contact.verified = existing.verified;
+
+    let mut preserved = Vec::new();
+    if contact.name.is_empty() && !existing.name.is_empty() {
+        contact.name = existing.name;
+        preserved.push("name");
+    }
+    if contact.profile_key.is_empty() && !existing.profile_key.is_empty() {
+        contact.profile_key = existing.profile_key;
+        preserved.push("profile_key");
+    }
+    if contact.phone_number.is_none() && existing.phone_number.is_some() {
+        contact.phone_number = existing.phone_number;
+        preserved.push("phone_number");
+    }
+    if contact.pni.is_none() && existing.pni.is_some() {
+        contact.pni = existing.pni;
+        preserved.push("pni");
+    }
+    if contact.username.is_none() && existing.username.is_some() {
+        contact.username = existing.username;
+        preserved.push("username");
+    }
+    preserved
+}
+
 async fn sync_storage_service<S: Store>(
     store: &mut S,
     push_service: &PushService,
@@ -2700,14 +2743,12 @@ async fn sync_storage_service<S: Store>(
                         }
                     };
 
-                    // Preserve locally-derived fields not present in ContactRecord
+                    // Merge the stored contact into the one rebuilt from the record:
+                    // restore what the record cannot carry, and refuse to let an empty
+                    // record field overwrite local data.
                     let service_id = ServiceId::Aci(Aci::from(contact.uuid));
                     if let Ok(Some(existing)) = store.contact_by_id(&service_id).await {
-                        contact.expire_timer = existing.expire_timer;
-                        contact.expire_timer_version = existing.expire_timer_version;
-                        contact.inbox_position = existing.inbox_position;
-                        contact.avatar = existing.avatar;
-                        contact.verified = existing.verified;
+                        merge_contact_from_storage(&mut contact, existing);
                     }
                     if let Err(e) = store.save_contact(&contact).await {
                         warn!(%e, "storage sync: failed to save contact");
@@ -2838,5 +2879,84 @@ mod tests {
     #[test]
     fn contact_profile_key_rejects_wrong_length() {
         assert!(contact_profile_key(&contact_with_profile_key(vec![7u8; 31])).is_none());
+    }
+
+    /// A contact as the store holds it: everything populated.
+    fn stored_contact() -> Contact {
+        let mut c = Contact::minimal(Uuid::nil());
+        c.name = "Local Name".into();
+        c.profile_key = vec![7u8; 32];
+        c.phone_number = Some(
+            libsignal_service::prelude::phonenumber::parse(None, "+15555550123").expect("valid"),
+        );
+        c.pni = Some(Uuid::from_u128(1));
+        c.username = Some("local.42".into());
+        c.expire_timer = 3600;
+        c.expire_timer_version = 9;
+        c.inbox_position = 5;
+        c
+    }
+
+    /// A contact as rebuilt from a `ContactRecord` that carried nothing but an ACI —
+    /// the "whitelisted-only stub" shape observed in real storage-service data.
+    fn empty_record_contact() -> Contact {
+        Contact::minimal(Uuid::nil())
+    }
+
+    #[test]
+    fn empty_record_does_not_wipe_local_fields() {
+        let mut incoming = empty_record_contact();
+        let preserved = merge_contact_from_storage(&mut incoming, stored_contact());
+
+        assert_eq!(incoming.name, "Local Name");
+        assert_eq!(incoming.profile_key, vec![7u8; 32]);
+        assert!(incoming.phone_number.is_some());
+        assert_eq!(incoming.pni, Some(Uuid::from_u128(1)));
+        assert_eq!(incoming.username.as_deref(), Some("local.42"));
+        assert_eq!(
+            preserved,
+            ["name", "profile_key", "phone_number", "pni", "username"]
+        );
+    }
+
+    #[test]
+    fn non_empty_record_still_wins() {
+        // The decision not to follow Signal-Desktop's second condition: storage sync is
+        // the only channel that delivers a rename, so a record with something to say must
+        // overwrite the local value.
+        let mut incoming = empty_record_contact();
+        incoming.name = "Renamed Remotely".into();
+        incoming.profile_key = vec![9u8; 32];
+        incoming.username = Some("remote.99".into());
+
+        let preserved = merge_contact_from_storage(&mut incoming, stored_contact());
+
+        assert_eq!(incoming.name, "Renamed Remotely");
+        assert_eq!(incoming.profile_key, vec![9u8; 32]);
+        assert_eq!(incoming.username.as_deref(), Some("remote.99"));
+        // Only the fields the record left empty were protected.
+        assert_eq!(preserved, ["phone_number", "pni"]);
+    }
+
+    #[test]
+    fn fields_absent_from_the_record_are_always_restored() {
+        let mut incoming = empty_record_contact();
+        incoming.name = "Renamed Remotely".into();
+
+        merge_contact_from_storage(&mut incoming, stored_contact());
+
+        assert_eq!(incoming.expire_timer, 3600);
+        assert_eq!(incoming.expire_timer_version, 9);
+        assert_eq!(incoming.inbox_position, 5);
+        assert!(incoming.avatar.is_none());
+    }
+
+    #[test]
+    fn nothing_is_preserved_when_the_store_is_also_empty() {
+        let mut incoming = empty_record_contact();
+        let preserved = merge_contact_from_storage(&mut incoming, empty_record_contact());
+
+        assert!(preserved.is_empty());
+        assert!(incoming.name.is_empty());
     }
 }
