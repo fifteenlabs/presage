@@ -238,6 +238,24 @@ enum Cmd {
         #[clap(long, short = 'u')]
         username: String,
     },
+    #[clap(
+        about = "Fetch an expiring profile key credential — the input group creation needs \
+                 to add someone as a full member rather than a pending invite"
+    )]
+    GetCredential {
+        /// Service ID to fetch for. Omit to fetch our own.
+        #[clap(value_parser = parse_service_id)]
+        service_id: Option<ServiceId>,
+    },
+    #[clap(about = "Create a group")]
+    CreateGroup {
+        #[clap(long, short = 'n', help = "Group title")]
+        name: String,
+        /// Repeatable. A member whose profile key credential cannot be obtained joins as a
+        /// pending invite rather than failing the creation.
+        #[clap(long, short = 'm', value_parser = parse_service_id)]
+        member: Vec<ServiceId>,
+    },
     #[clap(about = "Print various statistics useful for debugging")]
     Stats,
 }
@@ -1069,6 +1087,98 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             match resolved_service_id {
                 Some(service_id) => println!("{username} => {}", service_id.service_id_string()),
                 None => println!("{username} => no matching account found"),
+            }
+        }
+        Cmd::GetCredential { service_id } => {
+            // Deliberately not `load_registered_and_receive`: that spawns a receive loop
+            // which drains and persists the whole pending message queue as a side effect,
+            // contaminating any store being used for before/after comparisons. The
+            // credential fetch only needs the websockets, which the manager opens on demand.
+            let mut manager = Manager::load_registered(store).await?;
+
+            match service_id {
+                // Self goes over the authenticated socket, as Signal-Desktop does, and
+                // is a hard error: group creation cannot proceed without it.
+                None => {
+                    let credential = manager.own_profile_key_credential().await?;
+                    println!(
+                        "self: credential OK, expires {}",
+                        credential.get_expiration_time().epoch_seconds()
+                    );
+                }
+                // Anyone else goes unauthenticated, authorised by the access key derived
+                // from their profile key.
+                Some(service_id) => {
+                    let profile_key = manager.store().profile_key(&service_id).await?;
+                    println!(
+                        "{}: profile key {}",
+                        service_id.service_id_string(),
+                        if profile_key.is_some() {
+                            "found in signal_profile_keys"
+                        } else {
+                            "MISSING — will be a pending invite"
+                        }
+                    );
+
+                    let candidates = manager.group_member_candidates(&[service_id]).await?;
+                    match candidates.first().and_then(|c| c.credential.as_ref()) {
+                        Some(credential) => println!(
+                            "{}: credential OK, expires {} — joins as FULL MEMBER",
+                            service_id.service_id_string(),
+                            credential.get_expiration_time().epoch_seconds()
+                        ),
+                        None => println!(
+                            "{}: no credential — joins as PENDING INVITE",
+                            service_id.service_id_string()
+                        ),
+                    }
+                }
+            }
+        }
+        Cmd::CreateGroup { name, member } => {
+            // Not `load_registered_and_receive` — see the note on GetCredential.
+            let mut manager = Manager::load_registered(store).await?;
+
+            // Report the membership split up front: it is decided by whether we hold a
+            // usable profile key credential, and is the most surprising part of the result.
+            for candidate in manager.group_member_candidates(&member).await? {
+                println!(
+                    "{}: {}",
+                    candidate.service_id.service_id_string(),
+                    if candidate.credential.is_some() {
+                        "full member"
+                    } else {
+                        "pending invite (no profile key credential)"
+                    }
+                );
+            }
+
+            let master_key = manager.create_group(&name, None, None, &member).await?;
+            println!("created group {name:?}");
+            println!("master key: {}", hex::encode(master_key));
+
+            // `create_group` no longer announces: the announcement is a plain message send,
+            // so it belongs on a durable queue that the library has no notion of. With no
+            // queue here, send it inline — without this the members are never told the
+            // group exists.
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_millis() as u64;
+            let announcement = DataMessage {
+                group_v2: Some(GroupContextV2 {
+                    master_key: Some(master_key.to_vec()),
+                    revision: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            match manager
+                .send_message_to_group(&master_key, announcement, timestamp)
+                .await
+            {
+                Ok(()) => println!("announced the group to its members"),
+                Err(e) => println!("WARNING: announcing the group to its members failed: {e}"),
             }
         }
         Cmd::Stats => {

@@ -35,6 +35,14 @@ pub enum Error<S: std::error::Error> {
     StorageServiceError(#[from] libsignal_service::StorageServiceError),
     #[error("libsignal-service error: {0}")]
     ProfileManagerError(#[from] libsignal_service::ProfileManagerError),
+    #[error("profile key credential error: {0}")]
+    ProfileCredentialError(#[from] libsignal_service::ProfileCredentialError),
+    #[error("group encoding/decoding error: {0}")]
+    GroupDecodingError(#[from] libsignal_service::groups_v2::GroupDecodingError),
+    /// Another device kept winning the race to write the storage manifest. Distinct from a
+    /// transport failure: the write was well-formed, we just never got a turn.
+    #[error("gave up writing the storage manifest after repeated version conflicts")]
+    StorageManifestConflict,
     #[error("libsignal-service sending error: {0}")]
     MessageSenderError(Box<MessageSenderError>),
     #[error("this client is already registered with Signal")]

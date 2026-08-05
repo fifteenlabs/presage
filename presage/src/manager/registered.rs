@@ -18,7 +18,10 @@ use libsignal_service::{
     configuration::{ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, Metadata},
     encrypt_device_name,
-    groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
+    groups_v2::{
+        decrypt_group, AccessControl, AccessRequired, GroupMemberCandidate, GroupOperations,
+        GroupsManager, InMemoryCredentialsCache, Timer,
+    },
     libsignal_account_keys::AccountEntropyPool,
     master_key::StorageServiceKey,
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
@@ -26,8 +29,10 @@ use libsignal_service::{
     profile_cipher::ProfileCipher,
     proto::{
         data_message::Delete,
+        manifest_record, storage_record,
         sync_message::{self, sticker_pack_operation, StickerPackOperation},
-        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, SyncMessage, Verified,
+        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, GroupV2Record, ManifestRecord,
+        StorageRecord, SyncMessage, Verified,
     },
     protocol::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
@@ -46,14 +51,15 @@ use libsignal_service::{
     },
     zkgroup::{
         groups::{GroupMasterKey, GroupSecretParams},
-        profiles::ProfileKey,
+        profiles::{ExpiringProfileKeyCredential, ProfileKey},
+        GroupMasterKeyBytes, ServerPublicParams,
     },
-    AccountManager, Profile, ServiceIdExt,
+    AccountManager, Profile, ProfileCredentialRequest, ServiceIdExt, StorageService,
 };
 use libsignal_service::{
     libsignal_account_keys::AccountEntropyPool, proto::addressable_message::Author,
 };
-use rand::{rng, rngs::StdRng, SeedableRng};
+use rand::{rng, rngs::StdRng, RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::io::AsyncWriteExt;
@@ -437,6 +443,325 @@ impl<S: Store> Manager<S, Registered> {
             .save_profile(aci.into(), profile_key, profile.clone())
             .await;
         Ok(profile)
+    }
+
+    /// Fetch our own expiring profile key credential.
+    ///
+    /// Required — and non-optional — to create a group: the creator is always a full
+    /// member, so a failure here is fatal rather than a downgrade to a pending invite.
+    ///
+    /// Uses the authenticated socket, as Signal-Desktop does for self.
+    pub async fn own_profile_key_credential(
+        &mut self,
+    ) -> Result<ExpiringProfileKeyCredential, Error<S::Error>> {
+        let aci = self.state.data.service_ids.aci();
+        let profile_key = self.state.data.profile_key;
+        let server_public_params = self
+            .state
+            .service_configuration()
+            .zkgroup_server_public_params;
+
+        // See the note in `upsert_group`: a `ThreadRng` temporary living across the
+        // await below would make this future `!Send` for no reason.
+        let mut csprng = StdRng::from_os_rng();
+        let request =
+            ProfileCredentialRequest::new(&mut csprng, &server_public_params, aci, profile_key);
+
+        let response = self
+            .identified_websocket(false)
+            .await?
+            .retrieve_own_profile_key_credential(&request)
+            .await?;
+
+        Ok(request.receive(&response, SystemTime::now())?)
+    }
+
+    /// Resolve group member candidates for the given service IDs.
+    ///
+    /// Returns exactly what `GroupOperations::encrypt_group_with_credentials` consumes:
+    /// a candidate carrying a credential joins as a full member, one without joins as a
+    /// pending invite. Three things collapse to `credential: None`, all of them normal —
+    /// no profile key on file, a PNI-only contact (credentials are ACI-only), or a failed
+    /// fetch. None of them is fatal, mirroring Signal-Desktop, which downgrades the member
+    /// rather than failing the whole group.
+    pub async fn group_member_candidates(
+        &mut self,
+        members: &[ServiceId],
+    ) -> Result<Vec<GroupMemberCandidate>, Error<S::Error>> {
+        let server_public_params = self
+            .state
+            .service_configuration()
+            .zkgroup_server_public_params;
+
+        let mut candidates = Vec::with_capacity(members.len());
+        for service_id in members {
+            let credential = self
+                .member_profile_key_credential(*service_id, &server_public_params)
+                .await;
+            candidates.push(GroupMemberCandidate {
+                service_id: *service_id,
+                credential,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// Create a group, returning its master key.
+    ///
+    /// The master key is generated locally — the group id derives from it, so the server
+    /// assigns nothing and only validates the member presentations. Members whose profile
+    /// key credential could not be obtained join as pending invites rather than failing the
+    /// creation, matching Signal-Desktop.
+    ///
+    /// Unlike Desktop, the disappearing-messages timer goes into the create proto rather
+    /// than a follow-up group change, so creation stays a single operation.
+    pub async fn create_group(
+        &mut self,
+        title: &str,
+        description: Option<&str>,
+        expire_timer: Option<Timer>,
+        members: &[ServiceId],
+    ) -> Result<GroupMasterKeyBytes, Error<S::Error>> {
+        // See `upsert_group`: a `ThreadRng` temporary across the awaits below would make
+        // this future `!Send` for no reason.
+        let mut csprng = StdRng::from_os_rng();
+        let mut master_key_bytes: GroupMasterKeyBytes = [0u8; 32];
+        csprng.fill_bytes(&mut master_key_bytes);
+        let group_secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key_bytes));
+
+        let self_credential = self.own_profile_key_credential().await?;
+        let candidates = self.group_member_candidates(members).await?;
+
+        // Signal-Desktop's create-time defaults. `add_from_invite_link` is deliberately
+        // unsatisfiable: a new group has no invite link until one is explicitly created.
+        let access_control = AccessControl {
+            attributes: AccessRequired::Member,
+            members: AccessRequired::Member,
+            add_from_invite_link: AccessRequired::Unsatisfiable,
+            member_label: AccessRequired::Member,
+        };
+
+        let server_public_params = self
+            .state
+            .service_configuration()
+            .zkgroup_server_public_params;
+
+        let encrypted_group = GroupOperations::new(group_secret_params)
+            .encrypt_group_with_credentials(
+                title,
+                description,
+                expire_timer.as_ref(),
+                Some(&access_control),
+                &self_credential,
+                &candidates,
+                &server_public_params,
+                // Avatars are not supported yet: there is no group-avatar upload endpoint.
+                String::new(),
+                &mut csprng,
+            )?;
+
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        groups_manager
+            .create_group(&mut csprng, &master_key_bytes, encrypted_group)
+            .await?;
+
+        // Read back rather than trusting the write's response body, whose shape differs
+        // between endpoint versions. This also makes the local copy canonically the
+        // server's, revision included.
+        let group = decrypt_group(
+            &master_key_bytes,
+            groups_manager
+                .fetch_encrypted_group(&mut csprng, &master_key_bytes)
+                .await?,
+        )?;
+        self.store.save_group(master_key_bytes, group).await?;
+
+        // Our own linked devices learn about the group from the storage manifest, not from
+        // the fan-out below, which excludes self. Non-fatal for the same reason as the
+        // fan-out: the group already exists, and surfacing an error here would invite a
+        // retry that creates a second one.
+        let storage_record = StorageRecord {
+            record: Some(storage_record::Record::GroupV2(GroupV2Record {
+                master_key: master_key_bytes.to_vec(),
+                // Desktop sets `profileSharing: true` at create, which is this field.
+                whitelisted: true,
+                ..Default::default()
+            })),
+        };
+        if let Err(e) = self
+            .append_storage_record(manifest_record::identifier::Type::Groupv2, storage_record)
+            .await
+        {
+            warn!(%e, "group created but adding it to the storage manifest failed");
+        }
+
+        // The members are NOT notified here. The server tells nobody about a new group;
+        // the creator has to announce it with an otherwise-empty message carrying only the
+        // group context, exactly as Signal-Desktop's `sendGroupUpdate` does.
+        //
+        // That announcement is a plain message send, so it belongs on the caller's durable
+        // send queue rather than inline here: Desktop enqueues its `GroupUpdate` on the
+        // DB-backed `conversationJobQueue` and retries it for a day, while keeping the
+        // `PUT` itself inline. Doing it inline meant a failure could only be logged — the
+        // group already exists, so returning an error would invite a retry that creates a
+        // second one — which silently cost the members their invite.
+        //
+        // Callers must send a `DataMessage` whose only payload is `group_v2` at revision 0
+        // to this group. `Manager::send_message_to_group` saves it locally as it sends, so
+        // that is also what gives the creator its own "created the group" row.
+        Ok(master_key_bytes)
+    }
+
+    /// Append one record to the account's storage manifest.
+    ///
+    /// Every existing identifier is copied through **verbatim**, including record types
+    /// presage does not model (account, story distribution lists, call links, chat
+    /// folders, notification profiles). The server treats the manifest as the complete
+    /// index of the account, so anything dropped here would be deleted from every device
+    /// the user owns — which is why this appends rather than regenerating the way
+    /// Signal-Desktop's `generateManifest` does.
+    ///
+    /// Deliberately offers no way to express an update or a delete: those require
+    /// re-encoding records we cannot decode.
+    async fn append_storage_record(
+        &mut self,
+        item_type: manifest_record::identifier::Type,
+        record: StorageRecord,
+    ) -> Result<(), Error<S::Error>> {
+        /// The phone writes to this manifest too, so a conflict is routine rather than
+        /// exceptional; retry a few times before giving up.
+        const MAX_ATTEMPTS: usize = 3;
+
+        let master_key = self
+            .master_key()
+            .await?
+            .ok_or_else(|| Error::MissingKeyError("master_key".into()))?;
+        let storage_service = StorageService::new(
+            self.identified_push_service(),
+            StorageServiceKey::from_master_key(&master_key),
+        )
+        .await?;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            let current = storage_service.manifest().await?;
+            let version = current.version + 1;
+
+            // Storage IDs are 16 random bytes, and a record is only ever addressed by the
+            // id it was inserted under.
+            let mut raw_id = vec![0u8; 16];
+            StdRng::from_os_rng().fill_bytes(&mut raw_id);
+
+            let mut identifiers = current.identifiers.clone();
+            identifiers.push(manifest_record::Identifier {
+                raw: raw_id.clone(),
+                r#type: item_type.into(),
+            });
+
+            // `record_ikm` must be carried forward unchanged: item keys derive from it, so
+            // dropping it would make every existing item undecryptable. `write_items`
+            // encrypts the record with whatever this manifest declares, so the two cannot
+            // disagree.
+            let new_manifest = ManifestRecord {
+                version,
+                source_device: self.state.device_id().into(),
+                identifiers,
+                record_ikm: current.record_ikm.clone(),
+            };
+
+            match storage_service
+                .write_items(new_manifest, vec![(raw_id, record.clone())], Vec::new())
+                .await
+            {
+                Ok(()) => {
+                    self.store.store_storage_manifest_version(version).await?;
+                    debug!(version, "storage manifest: appended record");
+
+                    // Tell the other devices to sync — the same FetchLatest that appv2
+                    // listens for. Best-effort: the record is already written.
+                    if let Err(e) = self
+                        .new_message_sender()
+                        .await?
+                        .send_sync_message(SyncMessage {
+                            fetch_latest: Some(sync_message::FetchLatest {
+                                r#type: Some(
+                                    sync_message::fetch_latest::Type::StorageManifest.into(),
+                                ),
+                            }),
+                            ..SyncMessage::with_padding(&mut rand::rng())
+                        })
+                        .await
+                    {
+                        warn!(%e, "storage manifest written but notifying other devices failed");
+                    }
+                    return Ok(());
+                }
+                // A conflict means another device wrote in between; the next iteration
+                // re-reads the manifest and rebuilds on top of it.
+                Err(libsignal_service::StorageServiceError::Conflict) => {
+                    debug!(
+                        attempt,
+                        our_version = version,
+                        "storage manifest: version conflict, retrying"
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Err(Error::StorageManifestConflict)
+    }
+
+    /// One member's credential, or `None` with a reason logged. Never fails the caller.
+    async fn member_profile_key_credential(
+        &mut self,
+        service_id: ServiceId,
+        server_public_params: &ServerPublicParams,
+    ) -> Option<ExpiringProfileKeyCredential> {
+        // Credentials are ACI-only, so a PNI-only contact can only ever be invited.
+        let Some(aci) = service_id.aci() else {
+            debug!(service_id = %service_id.service_id_string(), "no credential: PNI-only contact");
+            return None;
+        };
+        let profile_key = match self.store.profile_key(&service_id).await {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                debug!(service_id = %service_id.service_id_string(), "no credential: no profile key on file");
+                return None;
+            }
+            Err(e) => {
+                warn!(service_id = %service_id.service_id_string(), %e, "no credential: profile key lookup failed");
+                return None;
+            }
+        };
+
+        let mut csprng = StdRng::from_os_rng();
+        let request =
+            ProfileCredentialRequest::new(&mut csprng, server_public_params, aci, profile_key);
+
+        let mut websocket = match self.unidentified_websocket().await {
+            Ok(ws) => ws,
+            Err(e) => {
+                warn!(service_id = %service_id.service_id_string(), %e, "no credential: unidentified websocket unavailable");
+                return None;
+            }
+        };
+        let response = match websocket.retrieve_profile_key_credential(&request).await {
+            Ok(response) => response,
+            // 401/403 means our profile key is stale; 404 that the version is unknown.
+            Err(e) => {
+                warn!(service_id = %service_id.service_id_string(), %e, "no credential: fetch failed");
+                return None;
+            }
+        };
+
+        match request.receive(&response, SystemTime::now()) {
+            Ok(credential) => Some(credential),
+            Err(e) => {
+                warn!(service_id = %service_id.service_id_string(), %e, "no credential: response did not verify");
+                None
+            }
+        }
     }
 
     /// Updates the user's profile information.
@@ -1747,13 +2072,17 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     pub async fn sync_storage_service(&mut self) -> Result<(), Error<S::Error>> {
+        // FIF-993: entry/exit bracket for the presage storage-service sync.
+        tracing::info!(target: "fif993", "sync_storage_service: START (presage)");
         let master_key = self
             .master_key()
             .await?
             .ok_or_else(|| Error::MissingKeyError("master_key".into()))?;
         let storage_key = StorageServiceKey::from_master_key(&master_key);
         let push_service = self.identified_push_service();
-        sync_storage_service(&mut self.store, &push_service, storage_key).await
+        let result = sync_storage_service(&mut self.store, &push_service, storage_key).await;
+        tracing::info!(target: "fif993", ok = result.is_ok(), "sync_storage_service: DONE (presage)");
+        result
     }
 
     pub async fn hydrate_groups(&mut self) -> Result<(), Error<S::Error>> {
@@ -1980,6 +2309,17 @@ impl<S: Store> Manager<S, Registered> {
                     if let Some(contact) = convert::recipient_to_contact(&r) {
                         if let Err(e) = self.store.save_contact(&contact).await {
                             warn!(%e, "backup import: failed to save contact");
+                        }
+                        // Same reason as the storage-sync path: the backup carries the
+                        // profile key, so record it where `profile_key()` will find it.
+                        if let Some(profile_key) = contact_profile_key(&contact) {
+                            if let Err(e) = self
+                                .store
+                                .upsert_profile_key(&contact.uuid, profile_key)
+                                .await
+                            {
+                                warn!(%e, "backup import: failed to upsert profile key");
+                            }
                         }
                     } else if let Some((master_key, group)) = convert::recipient_to_group(&r) {
                         if let Err(e) = self.store.save_group(master_key, group).await {
@@ -2594,6 +2934,60 @@ async fn register_pre_keys<S: Store>(
 /// Signal Desktop uses 2500; the server's hard limit is ~5120.
 const STORAGE_SERVICE_BATCH_SIZE: usize = 2500;
 
+/// Parse a [`Contact`]'s raw profile-key bytes into a [`ProfileKey`].
+///
+/// The field is a `Vec<u8>` that is legitimately empty — `Contact::minimal` and a
+/// `ContactRecord` carrying no key both produce one — so anything that isn't exactly
+/// 32 bytes is treated as absent.
+fn contact_profile_key(contact: &Contact) -> Option<ProfileKey> {
+    <[u8; 32]>::try_from(contact.profile_key.as_slice())
+        .ok()
+        .map(ProfileKey::create)
+}
+
+/// Merge the locally-stored contact into one rebuilt from a `ContactRecord`, and report
+/// which at-risk fields were protected.
+///
+/// A `ContactRecord` is a full snapshot, but only of what the *writing* device knew — and
+/// proto3 gives these scalars no presence, so an empty value is indistinguishable from an
+/// unset one and carries no information. Letting one overwrite local data loses the
+/// contact's name, profile key, phone number, PNI or username for nothing.
+///
+/// A *non-empty* remote value still wins. Storage sync is the only channel that delivers a
+/// renamed contact to the app — presage only re-fetches a profile on first sight or a
+/// profile-key rotation — so remote stays authoritative whenever it has something to say.
+fn merge_contact_from_storage(contact: &mut Contact, existing: Contact) -> Vec<&'static str> {
+    // Not carried by ContactRecord at all — always local.
+    contact.expire_timer = existing.expire_timer;
+    contact.expire_timer_version = existing.expire_timer_version;
+    contact.inbox_position = existing.inbox_position;
+    contact.avatar = existing.avatar;
+    contact.verified = existing.verified;
+
+    let mut preserved = Vec::new();
+    if contact.name.is_empty() && !existing.name.is_empty() {
+        contact.name = existing.name;
+        preserved.push("name");
+    }
+    if contact.profile_key.is_empty() && !existing.profile_key.is_empty() {
+        contact.profile_key = existing.profile_key;
+        preserved.push("profile_key");
+    }
+    if contact.phone_number.is_none() && existing.phone_number.is_some() {
+        contact.phone_number = existing.phone_number;
+        preserved.push("phone_number");
+    }
+    if contact.pni.is_none() && existing.pni.is_some() {
+        contact.pni = existing.pni;
+        preserved.push("pni");
+    }
+    if contact.username.is_none() && existing.username.is_some() {
+        contact.username = existing.username;
+        preserved.push("username");
+    }
+    preserved
+}
+
 async fn sync_storage_service<S: Store>(
     store: &mut S,
     push_service: &PushService,
@@ -2705,6 +3099,40 @@ async fn sync_storage_service<S: Store>(
             match record.record {
                 Some(libsignal_service::proto::storage_record::Record::Contact(cr)) => {
                     debug!(aci = %cr.aci, name = %cr.given_name, "storage sync: saving contact");
+                    // FIF-993: the raw record exactly as received, before any
+                    // conversion. `ContactRecord` is a full snapshot, not a delta, so an
+                    // empty field here means the *writing* device had nothing — and
+                    // proto3 gives these scalars no presence, so "unset" and "empty" are
+                    // indistinguishable on the wire. Lengths are logged alongside the
+                    // values because that distinction is the whole question.
+                    // NOTE: logs contact names / phone numbers. Debug only.
+                    tracing::info!(
+                        target: "fif993",
+                        aci = %cr.aci,
+                        aci_binary_len = cr.aci_binary.len(),
+                        given_name = %cr.given_name,
+                        given_name_len = cr.given_name.len(),
+                        family_name = %cr.family_name,
+                        family_name_len = cr.family_name.len(),
+                        profile_key_len = cr.profile_key.len(),
+                        identity_key_len = cr.identity_key.len(),
+                        e164 = %cr.e164,
+                        e164_len = cr.e164.len(),
+                        pni = %cr.pni,
+                        pni_binary_len = cr.pni_binary.len(),
+                        username = %cr.username,
+                        system_given_name = %cr.system_given_name,
+                        system_family_name = %cr.system_family_name,
+                        system_nickname = %cr.system_nickname,
+                        nickname_given = ?cr.nickname.as_ref().map(|n| n.given.clone()),
+                        nickname_family = ?cr.nickname.as_ref().map(|n| n.family.clone()),
+                        note_len = cr.note.len(),
+                        blocked = cr.blocked,
+                        whitelisted = cr.whitelisted,
+                        hidden = cr.hidden,
+                        archived = cr.archived,
+                        "storage sync: RAW ContactRecord as received from storage service",
+                    );
                     let mut contact: Contact = match Contact::try_from(cr) {
                         Ok(c) => c,
                         Err(e) => {
@@ -2713,17 +3141,47 @@ async fn sync_storage_service<S: Store>(
                         }
                     };
 
-                    // Preserve locally-derived fields not present in ContactRecord
+                    // Merge the stored contact into the one rebuilt from the record:
+                    // restore what the record cannot carry, and refuse to let an empty
+                    // record field overwrite local data.
                     let service_id = ServiceId::Aci(Aci::from(contact.uuid));
-                    if let Ok(Some(existing)) = store.contact_by_id(&service_id).await {
-                        contact.expire_timer = existing.expire_timer;
-                        contact.expire_timer_version = existing.expire_timer_version;
-                        contact.inbox_position = existing.inbox_position;
-                        contact.avatar = existing.avatar;
-                        contact.verified = existing.verified;
-                    }
+                    let existing_contact = store.contact_by_id(&service_id).await.ok().flatten();
+                    let existing_name = existing_contact.as_ref().map(|e| e.name.clone());
+                    let existing_profile_key_len =
+                        existing_contact.as_ref().map(|e| e.profile_key.len());
+                    let is_new_contact = existing_contact.is_none();
+                    // FIF-993: the fields an empty record would have wiped, had the guard
+                    // above not held them. `name` is the reported symptom; the other four
+                    // share the same cause.
+                    let wipe_prevented = existing_contact
+                        .map(|existing| merge_contact_from_storage(&mut contact, existing))
+                        .unwrap_or_default();
+                    tracing::info!(
+                        target: "fif993",
+                        aci = %contact.uuid,
+                        existing_name = ?existing_name,
+                        new_name = %contact.name,
+                        new_system_given = %contact.system_given_name,
+                        new_system_family = %contact.system_family_name,
+                        new_system_nickname = %contact.system_nickname,
+                        new_nickname_given = %contact.nickname_given_name,
+                        new_nickname_family = %contact.nickname_family_name,
+                        existing_profile_key_len = ?existing_profile_key_len,
+                        new_profile_key_len = contact.profile_key.len(),
+                        wipe_prevented = ?wipe_prevented,
+                        is_new_contact,
+                        "storage sync: rebuilt Contact from ContactRecord, about to save_contact",
+                    );
                     if let Err(e) = store.save_contact(&contact).await {
                         warn!(%e, "storage sync: failed to save contact");
+                    }
+                    // Keep `profile_keys` in step with the contact row — it is the
+                    // table `ContentsStore::profile_key` reads, and until now only the
+                    // first-sight message path wrote to it.
+                    if let Some(profile_key) = contact_profile_key(&contact) {
+                        if let Err(e) = store.upsert_profile_key(&contact.uuid, profile_key).await {
+                            warn!(%e, "storage sync: failed to upsert profile key");
+                        }
                     }
                 }
                 Some(libsignal_service::proto::storage_record::Record::GroupV2(gr)) => {
@@ -2814,4 +3272,113 @@ async fn sync_storage_service<S: Store>(
         "storage service sync complete"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contact_with_profile_key(bytes: Vec<u8>) -> Contact {
+        let mut contact = Contact::minimal(Uuid::nil());
+        contact.profile_key = bytes;
+        contact
+    }
+
+    #[test]
+    fn contact_profile_key_accepts_32_bytes() {
+        let bytes = vec![7u8; 32];
+        let key = contact_profile_key(&contact_with_profile_key(bytes.clone()))
+            .expect("32 bytes is a profile key");
+        assert_eq!(key.bytes.as_slice(), bytes.as_slice());
+    }
+
+    #[test]
+    fn contact_profile_key_rejects_empty() {
+        // What `Contact::minimal` and a `ContactRecord` with no key both produce.
+        assert!(contact_profile_key(&Contact::minimal(Uuid::nil())).is_none());
+    }
+
+    #[test]
+    fn contact_profile_key_rejects_wrong_length() {
+        assert!(contact_profile_key(&contact_with_profile_key(vec![7u8; 31])).is_none());
+    }
+
+    /// A contact as the store holds it: everything populated.
+    fn stored_contact() -> Contact {
+        let mut c = Contact::minimal(Uuid::nil());
+        c.name = "Local Name".into();
+        c.profile_key = vec![7u8; 32];
+        c.phone_number = Some(
+            libsignal_service::prelude::phonenumber::parse(None, "+15555550123").expect("valid"),
+        );
+        c.pni = Some(Uuid::from_u128(1));
+        c.username = Some("local.42".into());
+        c.expire_timer = 3600;
+        c.expire_timer_version = 9;
+        c.inbox_position = 5;
+        c
+    }
+
+    /// A contact as rebuilt from a `ContactRecord` that carried nothing but an ACI —
+    /// the "whitelisted-only stub" shape observed in real storage-service data.
+    fn empty_record_contact() -> Contact {
+        Contact::minimal(Uuid::nil())
+    }
+
+    #[test]
+    fn empty_record_does_not_wipe_local_fields() {
+        let mut incoming = empty_record_contact();
+        let preserved = merge_contact_from_storage(&mut incoming, stored_contact());
+
+        assert_eq!(incoming.name, "Local Name");
+        assert_eq!(incoming.profile_key, vec![7u8; 32]);
+        assert!(incoming.phone_number.is_some());
+        assert_eq!(incoming.pni, Some(Uuid::from_u128(1)));
+        assert_eq!(incoming.username.as_deref(), Some("local.42"));
+        assert_eq!(
+            preserved,
+            ["name", "profile_key", "phone_number", "pni", "username"]
+        );
+    }
+
+    #[test]
+    fn non_empty_record_still_wins() {
+        // The decision not to follow Signal-Desktop's second condition: storage sync is
+        // the only channel that delivers a rename, so a record with something to say must
+        // overwrite the local value.
+        let mut incoming = empty_record_contact();
+        incoming.name = "Renamed Remotely".into();
+        incoming.profile_key = vec![9u8; 32];
+        incoming.username = Some("remote.99".into());
+
+        let preserved = merge_contact_from_storage(&mut incoming, stored_contact());
+
+        assert_eq!(incoming.name, "Renamed Remotely");
+        assert_eq!(incoming.profile_key, vec![9u8; 32]);
+        assert_eq!(incoming.username.as_deref(), Some("remote.99"));
+        // Only the fields the record left empty were protected.
+        assert_eq!(preserved, ["phone_number", "pni"]);
+    }
+
+    #[test]
+    fn fields_absent_from_the_record_are_always_restored() {
+        let mut incoming = empty_record_contact();
+        incoming.name = "Renamed Remotely".into();
+
+        merge_contact_from_storage(&mut incoming, stored_contact());
+
+        assert_eq!(incoming.expire_timer, 3600);
+        assert_eq!(incoming.expire_timer_version, 9);
+        assert_eq!(incoming.inbox_position, 5);
+        assert!(incoming.avatar.is_none());
+    }
+
+    #[test]
+    fn nothing_is_preserved_when_the_store_is_also_empty() {
+        let mut incoming = empty_record_contact();
+        let preserved = merge_contact_from_storage(&mut incoming, empty_record_contact());
+
+        assert!(preserved.is_empty());
+        assert!(incoming.name.is_empty());
+    }
 }
