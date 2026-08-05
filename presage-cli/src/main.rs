@@ -1150,6 +1150,30 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             let master_key = manager.create_group(&name, None, None, &member).await?;
             println!("created group {name:?}");
             println!("master key: {}", hex::encode(master_key));
+
+            // `create_group` no longer announces: the announcement is a plain message send,
+            // so it belongs on a durable queue that the library has no notion of. With no
+            // queue here, send it inline — without this the members are never told the
+            // group exists.
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_millis() as u64;
+            let announcement = DataMessage {
+                group_v2: Some(GroupContextV2 {
+                    master_key: Some(master_key.to_vec()),
+                    revision: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            match manager
+                .send_message_to_group(&master_key, announcement, timestamp)
+                .await
+            {
+                Ok(()) => println!("announced the group to its members"),
+                Err(e) => println!("WARNING: announcing the group to its members failed: {e}"),
+            }
         }
         Cmd::Stats => {
             let manager = load_registered_and_receive(store).await?;

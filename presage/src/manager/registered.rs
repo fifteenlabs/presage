@@ -465,7 +465,7 @@ impl<S: Store> Manager<S, Registered> {
         let response = self
             .identified_websocket(false)
             .await?
-            .retrieve_own_profile_key_credential(aci, profile_key, request.hex())
+            .retrieve_own_profile_key_credential(&request)
             .await?;
 
         Ok(request.receive(&response, SystemTime::now())?)
@@ -591,36 +591,20 @@ impl<S: Store> Manager<S, Registered> {
             warn!(%e, "group created but adding it to the storage manifest failed");
         }
 
-        // Members are not notified by the server; the creator announces the group with an
-        // otherwise-empty message carrying only the group context, as Desktop does. Must
-        // follow `save_group`, which is where the recipient list is read from.
+        // The members are NOT notified here. The server tells nobody about a new group;
+        // the creator has to announce it with an otherwise-empty message carrying only the
+        // group context, exactly as Signal-Desktop's `sendGroupUpdate` does.
         //
-        // Failure here is logged, not propagated: the group already exists server-side, and
-        // reporting an error would invite a retry that creates a second one.
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time went backwards")
-            .as_millis() as u64;
-        // The group context is what makes this message mean anything: `MessageSender`
-        // fans the body out verbatim and attaches nothing itself, so without `group_v2`
-        // the recipient gets a bodiless message with no group association and drops it.
-        // Signal-Desktop's `sendGroupUpdate` is the same shape — an otherwise-empty
-        // message whose only payload is the group context at the new revision.
-        let announcement = DataMessage {
-            group_v2: Some(GroupContextV2 {
-                master_key: Some(master_key_bytes.to_vec()),
-                revision: Some(0),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        if let Err(e) = self
-            .send_message_to_group(&master_key_bytes, announcement, timestamp)
-            .await
-        {
-            warn!(%e, "group created but announcing it to members failed");
-        }
-
+        // That announcement is a plain message send, so it belongs on the caller's durable
+        // send queue rather than inline here: Desktop enqueues its `GroupUpdate` on the
+        // DB-backed `conversationJobQueue` and retries it for a day, while keeping the
+        // `PUT` itself inline. Doing it inline meant a failure could only be logged — the
+        // group already exists, so returning an error would invite a retry that creates a
+        // second one — which silently cost the members their invite.
+        //
+        // Callers must send a `DataMessage` whose only payload is `group_v2` at revision 0
+        // to this group. `Manager::send_message_to_group` saves it locally as it sends, so
+        // that is also what gives the creator its own "created the group" row.
         Ok(master_key_bytes)
     }
 
@@ -648,14 +632,11 @@ impl<S: Store> Manager<S, Registered> {
             .master_key()
             .await?
             .ok_or_else(|| Error::MissingKeyError("master_key".into()))?;
-        // `StorageService::new` takes ownership and the key isn't `Clone`; re-deriving is a
-        // single HMAC, so keep a second one for the encrypt helpers below.
         let storage_service = StorageService::new(
             self.identified_push_service(),
             StorageServiceKey::from_master_key(&master_key),
         )
         .await?;
-        let storage_key = StorageServiceKey::from_master_key(&master_key);
 
         for attempt in 1..=MAX_ATTEMPTS {
             let current = storage_service.manifest().await?;
@@ -673,8 +654,9 @@ impl<S: Store> Manager<S, Registered> {
             });
 
             // `record_ikm` must be carried forward unchanged: item keys derive from it, so
-            // dropping it would make every existing item undecryptable.
-            let record_ikm = (!current.record_ikm.is_empty()).then(|| current.record_ikm.clone());
+            // dropping it would make every existing item undecryptable. `write_items`
+            // encrypts the record with whatever this manifest declares, so the two cannot
+            // disagree.
             let new_manifest = ManifestRecord {
                 version,
                 source_device: self.state.device_id().into(),
@@ -682,12 +664,8 @@ impl<S: Store> Manager<S, Registered> {
                 record_ikm: current.record_ikm.clone(),
             };
 
-            let encrypted_manifest = StorageService::encrypt_manifest(&storage_key, &new_manifest);
-            let encrypted_item =
-                StorageService::encrypt_item(&storage_key, raw_id, &record, record_ikm.as_deref());
-
             match storage_service
-                .write_items(encrypted_manifest, vec![encrypted_item], Vec::new())
+                .write_items(new_manifest, vec![(raw_id, record.clone())], Vec::new())
                 .await
             {
                 Ok(()) => {
@@ -713,11 +691,12 @@ impl<S: Store> Manager<S, Registered> {
                     }
                     return Ok(());
                 }
-                Err(libsignal_service::StorageServiceError::Conflict(remote)) => {
+                // A conflict means another device wrote in between; the next iteration
+                // re-reads the manifest and rebuilds on top of it.
+                Err(libsignal_service::StorageServiceError::Conflict) => {
                     debug!(
                         attempt,
                         our_version = version,
-                        remote_version = remote.version,
                         "storage manifest: version conflict, retrying"
                     );
                 }
@@ -762,10 +741,7 @@ impl<S: Store> Manager<S, Registered> {
                 return None;
             }
         };
-        let response = match websocket
-            .retrieve_profile_key_credential(aci, profile_key, request.hex())
-            .await
-        {
+        let response = match websocket.retrieve_profile_key_credential(&request).await {
             Ok(response) => response,
             // 401/403 means our profile key is stale; 404 that the version is unknown.
             Err(e) => {
