@@ -306,21 +306,27 @@ pub fn chat_item_to_contents(
     }
 }
 
-/// Restored read/delivery state for a backup message row:
-/// `(thread, timestamp, read, per-recipient send states)`. `read` is `Some`
-/// for incoming rows, `None` for outgoing.
-type BackupMessageState = (
-    Thread,
-    u64,
-    Option<bool>,
-    Vec<(String, BackupSendStatus, u64)>,
-);
+/// Restored state for a backup message row that the wire `Content` cannot
+/// carry: read state, per-recipient send status, and when the message reached
+/// the device that made the backup.
+pub struct BackupMessageState {
+    pub thread: Thread,
+    /// The message's sent timestamp — how the row is addressed.
+    pub ts: u64,
+    /// `Some` for incoming rows, `None` for outgoing.
+    pub read: Option<bool>,
+    pub send_states: Vec<(String, BackupSendStatus, u64)>,
+    /// `dateReceived` from the backup: when the exporting device learned of this
+    /// message. Restoring it keeps imported history in the order the primary
+    /// device showed it, rather than re-deriving an order from send timestamps.
+    /// `None` when the backup omitted it.
+    pub date_received: Option<u64>,
+}
 
-/// Extract read / per-recipient send state from a backup `ChatItem` so the store
-/// can restore it after the row is saved — the wire `Content` the converter
-/// produces can't carry it. Returns `(thread, ts, read, send_states)`; `read` is
-/// `Some` for incoming, `None` for outgoing. Returns `None` when the chat is
-/// unknown or directional details are absent.
+/// Extract read / per-recipient send state and arrival time from a backup
+/// `ChatItem` so the store can restore them after the row is saved — the wire
+/// `Content` the converter produces carries none of it. Returns `None` when the
+/// chat is unknown or directional details are absent.
 pub fn chat_item_backup_state(
     item: &ChatItem,
     recipients: &HashMap<u64, RecipientInfo>,
@@ -329,7 +335,13 @@ pub fn chat_item_backup_state(
     let thread = chats.get(&item.chat_id).cloned()?;
     let ts = item.date_sent;
     match item.directional_details.as_ref()? {
-        DirectionalDetails::Incoming(inc) => Some((thread, ts, Some(inc.read), Vec::new())),
+        DirectionalDetails::Incoming(inc) => Some(BackupMessageState {
+            thread,
+            ts,
+            read: Some(inc.read),
+            send_states: Vec::new(),
+            date_received: Some(inc.date_received),
+        }),
         DirectionalDetails::Outgoing(out) => {
             let send_states = out
                 .send_status
@@ -352,7 +364,13 @@ pub fn chat_item_backup_state(
                     Some((recipient, status, s.timestamp))
                 })
                 .collect();
-            Some((thread, ts, None, send_states))
+            Some(BackupMessageState {
+                thread,
+                ts,
+                read: None,
+                send_states,
+                date_received: Some(out.date_received),
+            })
         }
         _ => None, // Directionless
     }

@@ -266,20 +266,24 @@ pub trait ContentsStore: Send + Sync {
         async { Ok(()) }
     }
 
-    /// Restore per-message read / delivery state decoded from a linked-device
-    /// backup `ChatItem` (the wire `Content` produced by the converter can't
-    /// carry it). `read` is `Some` for incoming (was it read on the primary
-    /// device), `None` for outgoing. `send_states` is the per-recipient
-    /// `(recipient_service_id, status, updated_at_ms)` for outgoing (empty for
-    /// incoming). Called once per ChatItem just after `save_message`. Default
-    /// no-op so stores that don't model this still compile; persistent stores
-    /// override it.
+    /// Restore per-message read / delivery state and arrival time decoded from a
+    /// linked-device backup `ChatItem` (the wire `Content` produced by the
+    /// converter can't carry any of it). `read` is `Some` for incoming (was it
+    /// read on the primary device), `None` for outgoing. `send_states` is the
+    /// per-recipient `(recipient_service_id, status, updated_at_ms)` for
+    /// outgoing (empty for incoming). `date_received` is the backup's
+    /// `dateReceived` — when the exporting device learned of the message —
+    /// which a store that orders history by arrival needs in order to place the
+    /// row where the primary device had it. Called once per ChatItem just after
+    /// `save_message`. Default no-op so stores that don't model this still
+    /// compile; persistent stores override it.
     fn restore_backup_message_state(
         &self,
         _thread: &Thread,
         _ts: u64,
         _read: Option<bool>,
         _send_states: &[(String, BackupSendStatus, u64)],
+        _date_received: Option<u64>,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
         async { Ok(()) }
     }
