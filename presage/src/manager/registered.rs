@@ -2314,14 +2314,20 @@ impl<S: Store> Manager<S, Registered> {
                             self.store.ingest_call_event(&info, &peer).await?;
                         }
                     }
-                    // Restore read / delivery state the wire `Content` can't carry,
-                    // so linked history shows correct unread badges + outgoing ticks.
-                    if let Some((thread, ts, read, send_states)) =
-                        convert::chat_item_backup_state(&ci, &recipients, &chats)
-                    {
+                    // Restore read / delivery state and arrival time — none of
+                    // which the wire `Content` can carry — so linked history
+                    // shows correct unread badges, outgoing ticks, and the same
+                    // ordering the primary device had.
+                    if let Some(state) = convert::chat_item_backup_state(&ci, &recipients, &chats) {
                         if let Err(e) = self
                             .store
-                            .restore_backup_message_state(&thread, ts, read, &send_states)
+                            .restore_backup_message_state(
+                                &state.thread,
+                                state.ts,
+                                state.read,
+                                &state.send_states,
+                                state.date_received,
+                            )
                             .await
                         {
                             warn!(%e, "backup import: failed to restore message state");
