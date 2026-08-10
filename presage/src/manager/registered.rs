@@ -2037,17 +2037,13 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     pub async fn sync_storage_service(&mut self) -> Result<(), Error<S::Error>> {
-        // FIF-993: entry/exit bracket for the presage storage-service sync.
-        tracing::info!(target: "fif993", "sync_storage_service: START (presage)");
         let master_key = self
             .master_key()
             .await?
             .ok_or_else(|| Error::MissingKeyError("master_key".into()))?;
         let storage_key = StorageServiceKey::from_master_key(&master_key);
         let push_service = self.identified_push_service();
-        let result = sync_storage_service(&mut self.store, &push_service, storage_key).await;
-        tracing::info!(target: "fif993", ok = result.is_ok(), "sync_storage_service: DONE (presage)");
-        result
+        sync_storage_service(&mut self.store, &push_service, storage_key).await
     }
 
     pub async fn hydrate_groups(&mut self) -> Result<(), Error<S::Error>> {
@@ -2271,7 +2267,21 @@ impl<S: Store> Manager<S, Registered> {
                     // `save_message` runs the store can title the conversation
                     // immediately instead of falling back to the id until a later
                     // storage-service sync / group hydration completes.
-                    if let Some(contact) = convert::recipient_to_contact(&r) {
+                    if let Some(mut contact) = convert::recipient_to_contact(&r) {
+                        // Same guard as the storage-sync path, for the same reason: a
+                        // Recipient frame is a snapshot of what the exporting device
+                        // knew, so an empty field in it must not wipe a populated row.
+                        // Reachable when a contact already exists — a storage sync that
+                        // beat the import, or a re-import over a live store.
+                        if let Some(existing) = self
+                            .store
+                            .contact_by_id(&ServiceId::Aci(Aci::from(contact.uuid)))
+                            .await
+                            .ok()
+                            .flatten()
+                        {
+                            merge_contact_from_snapshot(&mut contact, existing);
+                        }
                         if let Err(e) = self.store.save_contact(&contact).await {
                             warn!(%e, "backup import: failed to save contact");
                         }
@@ -2815,13 +2825,25 @@ async fn upsert_contact_from_profile<S: Store>(
                 note: String::new(),
             });
 
-            contact.name = decrypted_profile
+            // A profile with no name says nothing about what this contact is called:
+            // the profile name proper lives in `signal_profiles` (written by
+            // `save_profile` on the same fetch), and `Contact::name` is the weaker
+            // fallback *below* it in display order. Blanking it on a nameless profile
+            // dropped that fallback for nothing — the same reasoning as
+            // `merge_contact_from_snapshot`, on the receive path instead of a sync.
+            let fetched_name = decrypted_profile
                 .name
                 .map(|pn| pn.to_string())
                 .unwrap_or_default();
+            if !fetched_name.is_empty() {
+                contact.name = fetched_name;
+            }
             contact.profile_key = profile_key.bytes.to_vec();
             contact.expire_timer = data_message.expire_timer.unwrap_or_default();
-            contact.expire_timer_version = data_message.expire_timer_version.unwrap_or(1);
+            contact.expire_timer_version = merged_expire_timer_version(
+                data_message.expire_timer_version,
+                contact.expire_timer_version,
+            );
 
             info!(%sender_uuid, "saved contact on first sight");
 
@@ -2916,19 +2938,36 @@ fn contact_profile_key(contact: &Contact) -> Option<ProfileKey> {
         .map(ProfileKey::create)
 }
 
-/// Merge the locally-stored contact into one rebuilt from a `ContactRecord`, and report
+/// The `expire_timer_version` to keep after a first-sight profile fetch: the incoming one
+/// when it is newer, otherwise whatever is already stored. Never lower than `stored`.
+///
+/// `Store::update_expire_timer` resolves conflicts with `version <= current_version`, so
+/// writing a smaller number here lets a stale update win later. Signal-Desktop hands the
+/// incoming version straight to its version-gated setter (`handleDataMessage`) rather than
+/// substituting a default; presage defaulted an absent version to 1, which downgraded every
+/// contact whose stored version had already moved past it.
+fn merged_expire_timer_version(incoming: Option<u32>, stored: u32) -> u32 {
+    match incoming {
+        Some(incoming) => incoming.max(stored),
+        None => stored,
+    }
+}
+
+/// Merge the locally-stored contact into one rebuilt from a remote snapshot, and report
 /// which at-risk fields were protected.
 ///
-/// A `ContactRecord` is a full snapshot, but only of what the *writing* device knew — and
-/// proto3 gives these scalars no presence, so an empty value is indistinguishable from an
-/// unset one and carries no information. Letting one overwrite local data loses the
-/// contact's name, profile key, phone number, PNI or username for nothing.
+/// Applies to both snapshot sources: a storage-service `ContactRecord` and a backup
+/// `Recipient` frame. Each is a full snapshot, but only of what the *writing* device knew —
+/// and proto3 gives these scalars no presence, so an empty value is indistinguishable from
+/// an unset one and carries no information. Letting one overwrite local data loses the
+/// contact's name, profile key, phone number, PNI or username for nothing. Neither source
+/// carries the locally-derived fields below, so both want them restored verbatim.
 ///
 /// A *non-empty* remote value still wins. Storage sync is the only channel that delivers a
 /// renamed contact to the app — presage only re-fetches a profile on first sight or a
 /// profile-key rotation — so remote stays authoritative whenever it has something to say.
-fn merge_contact_from_storage(contact: &mut Contact, existing: Contact) -> Vec<&'static str> {
-    // Not carried by ContactRecord at all — always local.
+fn merge_contact_from_snapshot(contact: &mut Contact, existing: Contact) -> Vec<&'static str> {
+    // Not carried by either snapshot source at all — always local.
     contact.expire_timer = existing.expire_timer;
     contact.expire_timer_version = existing.expire_timer_version;
     contact.inbox_position = existing.inbox_position;
@@ -3070,40 +3109,6 @@ async fn sync_storage_service<S: Store>(
             match record.record {
                 Some(libsignal_service::proto::storage_record::Record::Contact(cr)) => {
                     debug!(aci = %cr.aci, name = %cr.given_name, "storage sync: saving contact");
-                    // FIF-993: the raw record exactly as received, before any
-                    // conversion. `ContactRecord` is a full snapshot, not a delta, so an
-                    // empty field here means the *writing* device had nothing — and
-                    // proto3 gives these scalars no presence, so "unset" and "empty" are
-                    // indistinguishable on the wire. Lengths are logged alongside the
-                    // values because that distinction is the whole question.
-                    // NOTE: logs contact names / phone numbers. Debug only.
-                    tracing::info!(
-                        target: "fif993",
-                        aci = %cr.aci,
-                        aci_binary_len = cr.aci_binary.len(),
-                        given_name = %cr.given_name,
-                        given_name_len = cr.given_name.len(),
-                        family_name = %cr.family_name,
-                        family_name_len = cr.family_name.len(),
-                        profile_key_len = cr.profile_key.len(),
-                        identity_key_len = cr.identity_key.len(),
-                        e164 = %cr.e164,
-                        e164_len = cr.e164.len(),
-                        pni = %cr.pni,
-                        pni_binary_len = cr.pni_binary.len(),
-                        username = %cr.username,
-                        system_given_name = %cr.system_given_name,
-                        system_family_name = %cr.system_family_name,
-                        system_nickname = %cr.system_nickname,
-                        nickname_given = ?cr.nickname.as_ref().map(|n| n.given.clone()),
-                        nickname_family = ?cr.nickname.as_ref().map(|n| n.family.clone()),
-                        note_len = cr.note.len(),
-                        blocked = cr.blocked,
-                        whitelisted = cr.whitelisted,
-                        hidden = cr.hidden,
-                        archived = cr.archived,
-                        "storage sync: RAW ContactRecord as received from storage service",
-                    );
                     let mut contact: Contact = match Contact::try_from(cr) {
                         Ok(c) => c,
                         Err(e) => {
@@ -3116,33 +3121,9 @@ async fn sync_storage_service<S: Store>(
                     // restore what the record cannot carry, and refuse to let an empty
                     // record field overwrite local data.
                     let service_id = ServiceId::Aci(Aci::from(contact.uuid));
-                    let existing_contact = store.contact_by_id(&service_id).await.ok().flatten();
-                    let existing_name = existing_contact.as_ref().map(|e| e.name.clone());
-                    let existing_profile_key_len =
-                        existing_contact.as_ref().map(|e| e.profile_key.len());
-                    let is_new_contact = existing_contact.is_none();
-                    // FIF-993: the fields an empty record would have wiped, had the guard
-                    // above not held them. `name` is the reported symptom; the other four
-                    // share the same cause.
-                    let wipe_prevented = existing_contact
-                        .map(|existing| merge_contact_from_storage(&mut contact, existing))
-                        .unwrap_or_default();
-                    tracing::info!(
-                        target: "fif993",
-                        aci = %contact.uuid,
-                        existing_name = ?existing_name,
-                        new_name = %contact.name,
-                        new_system_given = %contact.system_given_name,
-                        new_system_family = %contact.system_family_name,
-                        new_system_nickname = %contact.system_nickname,
-                        new_nickname_given = %contact.nickname_given_name,
-                        new_nickname_family = %contact.nickname_family_name,
-                        existing_profile_key_len = ?existing_profile_key_len,
-                        new_profile_key_len = contact.profile_key.len(),
-                        wipe_prevented = ?wipe_prevented,
-                        is_new_contact,
-                        "storage sync: rebuilt Contact from ContactRecord, about to save_contact",
-                    );
+                    if let Some(existing) = store.contact_by_id(&service_id).await.ok().flatten() {
+                        merge_contact_from_snapshot(&mut contact, existing);
+                    }
                     if let Err(e) = store.save_contact(&contact).await {
                         warn!(%e, "storage sync: failed to save contact");
                     }
@@ -3299,7 +3280,7 @@ mod tests {
     #[test]
     fn empty_record_does_not_wipe_local_fields() {
         let mut incoming = empty_record_contact();
-        let preserved = merge_contact_from_storage(&mut incoming, stored_contact());
+        let preserved = merge_contact_from_snapshot(&mut incoming, stored_contact());
 
         assert_eq!(incoming.name, "Local Name");
         assert_eq!(incoming.profile_key, vec![7u8; 32]);
@@ -3322,7 +3303,7 @@ mod tests {
         incoming.profile_key = vec![9u8; 32];
         incoming.username = Some("remote.99".into());
 
-        let preserved = merge_contact_from_storage(&mut incoming, stored_contact());
+        let preserved = merge_contact_from_snapshot(&mut incoming, stored_contact());
 
         assert_eq!(incoming.name, "Renamed Remotely");
         assert_eq!(incoming.profile_key, vec![9u8; 32]);
@@ -3336,7 +3317,7 @@ mod tests {
         let mut incoming = empty_record_contact();
         incoming.name = "Renamed Remotely".into();
 
-        merge_contact_from_storage(&mut incoming, stored_contact());
+        merge_contact_from_snapshot(&mut incoming, stored_contact());
 
         assert_eq!(incoming.expire_timer, 3600);
         assert_eq!(incoming.expire_timer_version, 9);
@@ -3347,9 +3328,27 @@ mod tests {
     #[test]
     fn nothing_is_preserved_when_the_store_is_also_empty() {
         let mut incoming = empty_record_contact();
-        let preserved = merge_contact_from_storage(&mut incoming, empty_record_contact());
+        let preserved = merge_contact_from_snapshot(&mut incoming, empty_record_contact());
 
         assert!(preserved.is_empty());
         assert!(incoming.name.is_empty());
+    }
+
+    #[test]
+    fn newer_expire_timer_version_wins() {
+        assert_eq!(merged_expire_timer_version(Some(9), 4), 9);
+    }
+
+    #[test]
+    fn stale_expire_timer_version_is_ignored() {
+        // The downgrade that broke `update_expire_timer`'s `version <= current_version`
+        // conflict resolution: a later stale update would have been accepted over this.
+        assert_eq!(merged_expire_timer_version(Some(2), 7), 7);
+    }
+
+    #[test]
+    fn absent_expire_timer_version_leaves_the_stored_one() {
+        // Previously defaulted to 1, clobbering whatever the contact had reached.
+        assert_eq!(merged_expire_timer_version(None, 7), 7);
     }
 }
