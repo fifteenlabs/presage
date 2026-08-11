@@ -11,7 +11,9 @@ use libsignal_service::{
             file_pointer::locator_info::IntegrityCheck,
             message_attachment::Flag as AttachmentFlag,
         },
-        data_message, sync_message, AttachmentPointer, DataMessage, Preview, SyncMessage,
+        body_range::AssociatedValue,
+        data_message, sync_message, AttachmentPointer, BodyRange, DataMessage, Preview,
+        SyncMessage,
     },
     protocol::{Aci, ServiceId},
     push_service::DEFAULT_DEVICE_ID,
@@ -122,6 +124,37 @@ fn message_attachment_to_pointer(ma: &backup::MessageAttachment) -> Option<Attac
     file_pointer_to_attachment_pointer(fp, flags)
 }
 
+/// Converts a backup `Text`'s body ranges — @-mentions and text styles — to their
+/// wire form. Without this the body keeps its U+FFFC placeholder per mention but
+/// loses the target, so imported history renders a blank gap where the `@Name`
+/// should be.
+///
+/// Backup makes `start`/`length` required and carries the mentioned ACI as raw
+/// bytes, where the wire form has them optional and takes those bytes as-is in its
+/// binary field. The `Style` values are identical. A range with no associated value
+/// is dropped, as the backup spec requires.
+fn backup_body_ranges_to_wire(text: Option<&backup::Text>) -> Vec<BodyRange> {
+    let Some(text) = text else {
+        return Vec::new();
+    };
+    text.body_ranges
+        .iter()
+        .filter_map(|br| {
+            let associated_value = match br.associated_value.as_ref()? {
+                backup::body_range::AssociatedValue::MentionAci(aci) => {
+                    AssociatedValue::MentionAciBinary(aci.clone())
+                }
+                backup::body_range::AssociatedValue::Style(style) => AssociatedValue::Style(*style),
+            };
+            Some(BodyRange {
+                start: Some(br.start),
+                length: Some(br.length),
+                associated_value: Some(associated_value),
+            })
+        })
+        .collect()
+}
+
 /// Converts a backup `Quote` to a wire-format `DataMessage::Quote`. Returns `None` if the
 /// quoted author can't be resolved to an ACI (required by the wire format).
 fn backup_quote_to_dm_quote(
@@ -142,6 +175,7 @@ fn backup_quote_to_dm_quote(
         author_aci: Some(author_aci.service_id_string()),
         author_aci_binary: Some(author_aci_bytes.to_vec()),
         text: q.text.as_ref().map(|t| t.body.clone()),
+        body_ranges: backup_body_ranges_to_wire(q.text.as_ref()),
         r#type: Some(dm_type),
         ..Default::default()
     })
@@ -389,6 +423,7 @@ fn standard_message_to_contents(
 ) -> Vec<(Content, Thread)> {
     let dm = DataMessage {
         body: sm.text.as_ref().map(|t| t.body.clone()),
+        body_ranges: backup_body_ranges_to_wire(sm.text.as_ref()),
         attachments: sm
             .attachments
             .iter()
@@ -965,6 +1000,147 @@ mod tests {
         assert_eq!(master_key, [2u8; 32]);
         assert_eq!(group.title.as_deref(), Some("Team Lovelace"));
         assert!(group.needs_hydration);
+    }
+
+    /// A mentioning body: one U+FFFC placeholder, with the target carried
+    /// out-of-band in a body range — Signal's on-the-wire shape for `@Ada hi`.
+    fn mention_text() -> backup::Text {
+        backup::Text {
+            body: "\u{FFFC} hi".to_string(),
+            body_ranges: vec![backup::BodyRange {
+                start: 0,
+                length: 1,
+                associated_value: Some(backup::body_range::AssociatedValue::MentionAci(vec![
+                    1u8; 16
+                ])),
+            }],
+        }
+    }
+
+    /// An incoming ChatItem in chat 10 authored by recipient 1.
+    fn incoming_item() -> ChatItem {
+        ChatItem {
+            chat_id: 10,
+            author_id: 1,
+            date_sent: 1700000000000,
+            directional_details: Some(DirectionalDetails::Incoming(
+                backup::chat_item::IncomingMessageDetails {
+                    date_received: 1700000000001,
+                    read: true,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn sender_recipients() -> HashMap<u64, RecipientInfo> {
+        HashMap::from([(
+            1,
+            RecipientInfo {
+                service_id: Some(ServiceId::Aci(Aci::from(Uuid::from_bytes([9u8; 16])))),
+                group_master_key: None,
+            },
+        )])
+    }
+
+    fn incoming_data_message(sm: &backup::StandardMessage) -> DataMessage {
+        let our_aci = Aci::from(Uuid::from_bytes([7u8; 16]));
+        let thread = Thread::Contact(ServiceId::Aci(Aci::from(Uuid::from_bytes([9u8; 16]))));
+        let item = incoming_item();
+        let contents = standard_message_to_contents(
+            sm,
+            &item,
+            &thread,
+            &sender_recipients(),
+            our_aci,
+            item.date_sent,
+        );
+        match contents.into_iter().next().expect("one content").0.body {
+            ContentBody::DataMessage(dm) => dm,
+            other => panic!("expected a DataMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn standard_message_carries_mention_body_ranges() {
+        let sm = backup::StandardMessage {
+            text: Some(mention_text()),
+            ..Default::default()
+        };
+        let dm = incoming_data_message(&sm);
+
+        // Without the range the body is just a placeholder, and the app has
+        // nothing to resolve it against — it renders as a blank gap.
+        assert_eq!(dm.body.as_deref(), Some("\u{FFFC} hi"));
+        assert_eq!(dm.body_ranges.len(), 1);
+        let range = &dm.body_ranges[0];
+        assert_eq!(range.start, Some(0));
+        assert_eq!(range.length, Some(1));
+        assert_eq!(
+            range.associated_value,
+            Some(AssociatedValue::MentionAciBinary(vec![1u8; 16]))
+        );
+    }
+
+    #[test]
+    fn quote_carries_mention_body_ranges() {
+        let sm = backup::StandardMessage {
+            text: Some(backup::Text {
+                body: "agreed".to_string(),
+                body_ranges: Vec::new(),
+            }),
+            quote: Some(backup::Quote {
+                target_sent_timestamp: Some(1699999999000),
+                author_id: 1,
+                text: Some(mention_text()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let quote = incoming_data_message(&sm).quote.expect("quote");
+
+        // The reply preview renders the quoted text, so it needs the ranges too.
+        assert_eq!(quote.text.as_deref(), Some("\u{FFFC} hi"));
+        assert_eq!(quote.body_ranges.len(), 1);
+        assert_eq!(
+            quote.body_ranges[0].associated_value,
+            Some(AssociatedValue::MentionAciBinary(vec![1u8; 16]))
+        );
+    }
+
+    #[test]
+    fn styles_carry_and_valueless_body_ranges_are_dropped() {
+        let sm = backup::StandardMessage {
+            text: Some(backup::Text {
+                body: "bold text".to_string(),
+                body_ranges: vec![
+                    backup::BodyRange {
+                        start: 0,
+                        length: 4,
+                        associated_value: Some(backup::body_range::AssociatedValue::Style(
+                            backup::body_range::Style::Bold as i32,
+                        )),
+                    },
+                    // The backup spec: importers ignore these rather than erroring.
+                    backup::BodyRange {
+                        start: 5,
+                        length: 4,
+                        associated_value: None,
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let dm = incoming_data_message(&sm);
+
+        assert_eq!(dm.body_ranges.len(), 1);
+        assert_eq!(
+            dm.body_ranges[0].associated_value,
+            Some(AssociatedValue::Style(
+                backup::body_range::Style::Bold as i32
+            ))
+        );
     }
 
     #[test]
