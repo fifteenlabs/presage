@@ -71,7 +71,8 @@ use crate::model::calls::{extract_call_event, CallPeer};
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
 use crate::store::{
-    ContentsStore, Sticker, StickerPack, StickerPackManifest, StorageSyncCursor, Store, Thread,
+    ContactStorageIdentity, ContentsStore, Sticker, StickerPack, StickerPackManifest,
+    StorageSyncCursor, Store, Thread,
 };
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
 
@@ -3105,8 +3106,8 @@ async fn sync_storage_service<S: Store>(
         debug!(count = records.len(), "storage sync: got storage records");
         total_processed += records.len();
 
-        for record in records {
-            match record.record {
+        for item in records {
+            match item.record.record {
                 Some(libsignal_service::proto::storage_record::Record::Contact(cr)) => {
                     debug!(aci = %cr.aci, name = %cr.given_name, "storage sync: saving contact");
                     let mut contact: Contact = match Contact::try_from(cr) {
@@ -3126,6 +3127,20 @@ async fn sync_storage_service<S: Store>(
                     }
                     if let Err(e) = store.save_contact(&contact).await {
                         warn!(%e, "storage sync: failed to save contact");
+                    }
+                    // Remember where this record lives so it can be updated later. The
+                    // plaintext is stored as read: an update edits these bytes rather
+                    // than re-encoding a lossy `Contact`.
+                    let identity = ContactStorageIdentity {
+                        storage_id: item.key,
+                        storage_version: manifest_version,
+                        record: item.plaintext,
+                    };
+                    if let Err(e) = store
+                        .save_contact_storage_identity(&service_id, &identity)
+                        .await
+                    {
+                        warn!(%e, "storage sync: failed to save contact storage identity");
                     }
                     // Keep `profile_keys` in step with the contact row — it is the
                     // table `ContentsStore::profile_key` reads, and until now only the
