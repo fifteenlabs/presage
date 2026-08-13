@@ -3,6 +3,7 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::TimeZone;
@@ -70,9 +71,10 @@ use crate::backup::{
 use crate::model::calls::{extract_call_event, CallPeer};
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
+use crate::storage_record::StorageRecordEditError;
 use crate::store::{
     ContactStorageIdentity, ContentsStore, Sticker, StickerPack, StickerPackManifest,
-    StorageSyncCursor, Store, Thread,
+    StorageRecordKey, StorageSyncCursor, Store, Thread,
 };
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
 
@@ -609,6 +611,46 @@ impl<S: Store> Manager<S, Registered> {
         Ok(master_key_bytes)
     }
 
+    /// Tell our other devices to re-read the manifest — the same `FetchLatest`
+    /// the app listens for.
+    ///
+    /// Best-effort by design: the record is already written, so a failure here
+    /// costs propagation delay, not correctness.
+    async fn notify_storage_manifest_written(&mut self) {
+        let mut sender = match self.new_message_sender().await {
+            Ok(sender) => sender,
+            Err(e) => {
+                warn!(%e, "storage manifest written but building the sync sender failed");
+                return;
+            }
+        };
+
+        if let Err(e) = sender
+            .send_sync_message(SyncMessage {
+                fetch_latest: Some(sync_message::FetchLatest {
+                    r#type: Some(sync_message::fetch_latest::Type::StorageManifest.into()),
+                }),
+                ..SyncMessage::with_padding(&mut rand::rng())
+            })
+            .await
+        {
+            warn!(%e, "storage manifest written but notifying other devices failed");
+        }
+    }
+
+    /// An authenticated storage-service handle for this account.
+    async fn storage_service(&mut self) -> Result<StorageService, Error<S::Error>> {
+        let master_key = self
+            .master_key()
+            .await?
+            .ok_or_else(|| Error::MissingKeyError("master_key".into()))?;
+        Ok(StorageService::new(
+            self.identified_push_service(),
+            StorageServiceKey::from_master_key(&master_key),
+        )
+        .await?)
+    }
+
     /// Append one record to the account's storage manifest.
     ///
     /// Every existing identifier is copied through **verbatim**, including record types
@@ -629,15 +671,7 @@ impl<S: Store> Manager<S, Registered> {
         /// exceptional; retry a few times before giving up.
         const MAX_ATTEMPTS: usize = 3;
 
-        let master_key = self
-            .master_key()
-            .await?
-            .ok_or_else(|| Error::MissingKeyError("master_key".into()))?;
-        let storage_service = StorageService::new(
-            self.identified_push_service(),
-            StorageServiceKey::from_master_key(&master_key),
-        )
-        .await?;
+        let storage_service = self.storage_service().await?;
 
         for attempt in 1..=MAX_ATTEMPTS {
             let current = storage_service.manifest().await?;
@@ -666,30 +700,22 @@ impl<S: Store> Manager<S, Registered> {
             };
 
             match storage_service
-                .write_items(new_manifest, vec![(raw_id, record.clone())], Vec::new())
+                // Encoding here is lossless: this record was just built, so it
+                // has no unknown fields for prost to drop. An *edit* of a record
+                // read from the server must never do this — see
+                // [`crate::storage_record`].
+                .write_items(
+                    new_manifest,
+                    vec![(raw_id, record.encode_to_vec())],
+                    Vec::new(),
+                )
                 .await
             {
                 Ok(()) => {
                     self.store.store_storage_manifest_version(version).await?;
                     debug!(version, "storage manifest: appended record");
 
-                    // Tell the other devices to sync — the same FetchLatest that appv2
-                    // listens for. Best-effort: the record is already written.
-                    if let Err(e) = self
-                        .new_message_sender()
-                        .await?
-                        .send_sync_message(SyncMessage {
-                            fetch_latest: Some(sync_message::FetchLatest {
-                                r#type: Some(
-                                    sync_message::fetch_latest::Type::StorageManifest.into(),
-                                ),
-                            }),
-                            ..SyncMessage::with_padding(&mut rand::rng())
-                        })
-                        .await
-                    {
-                        warn!(%e, "storage manifest written but notifying other devices failed");
-                    }
+                    self.notify_storage_manifest_written().await;
                     return Ok(());
                 }
                 // A conflict means another device wrote in between; the next iteration
@@ -705,6 +731,248 @@ impl<S: Store> Manager<S, Registered> {
             }
         }
 
+        Err(Error::StorageManifestConflict)
+    }
+
+    /// Build and write a manifest that replaces one record with another: the new
+    /// bytes go in under a fresh identifier and the old identifier is deleted, in
+    /// a single write.
+    ///
+    /// A record is immutable under its identifier, so this is the only shape an
+    /// update can take. `new_record` is an encoded `StorageRecord` and is written
+    /// byte-for-byte — build it with [`crate::storage_record`], not by re-encoding
+    /// a decoded record.
+    ///
+    /// `current` must be the manifest as the server holds it *now*, and the caller
+    /// must already be caught up to it. Both are the caller's job because the
+    /// recovery for either being untrue is a sync, which this layer cannot do
+    /// without knowing what it was editing.
+    async fn write_replacing_storage_record(
+        &self,
+        storage_service: &StorageService,
+        current: &ManifestRecord,
+        item_type: manifest_record::identifier::Type,
+        old_raw_id: &[u8],
+        new_record: Vec<u8>,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
+        let mut new_raw_id = vec![0u8; 16];
+        StdRng::from_os_rng().fill_bytes(&mut new_raw_id);
+        if new_raw_id == old_raw_id {
+            // 2^-128, but inserting and deleting the same key in one write is
+            // the one shape the server is entitled to interpret either way.
+            warn!("storage manifest: generated identifier collided with the old one");
+            return Err(Error::StorageManifestConflict);
+        }
+
+        // Substitute in place: every other identifier keeps its bytes, its type
+        // and its position. The server treats the manifest as the complete index
+        // of the account, so an identifier dropped here is deleted from every
+        // device the user owns — including the record types presage cannot model.
+        let mut identifiers = Vec::with_capacity(current.identifiers.len());
+        let mut replaced = 0usize;
+        for id in &current.identifiers {
+            if id.raw == old_raw_id {
+                replaced += 1;
+                identifiers.push(manifest_record::Identifier {
+                    raw: new_raw_id.clone(),
+                    r#type: item_type.into(),
+                });
+            } else {
+                if id.raw == new_raw_id {
+                    warn!("storage manifest: generated identifier already in use");
+                    return Err(Error::StorageManifestConflict);
+                }
+                identifiers.push(id.clone());
+            }
+        }
+
+        // Being caught up should make this unreachable: our identifier was in the
+        // manifest at the version we synced, and we are still at that version. It
+        // survives as a guard against a peer that rewrites records in place.
+        if replaced != 1 {
+            debug!(
+                replaced,
+                "storage manifest: record is not at the identifier we hold"
+            );
+            return Err(Error::StorageRecordMoved);
+        }
+
+        // A substitution changes no counts. If it did, we would be about to orphan
+        // or duplicate a record on every device the user owns.
+        debug_assert_eq!(identifiers.len(), current.identifiers.len());
+
+        let new_manifest = ManifestRecord {
+            version: current.version + 1,
+            source_device: self.state.device_id().into(),
+            identifiers,
+            record_ikm: current.record_ikm.clone(),
+        };
+
+        match storage_service
+            .write_items(
+                new_manifest,
+                vec![(new_raw_id.clone(), new_record)],
+                vec![old_raw_id.to_vec()],
+            )
+            .await
+        {
+            Ok(()) => Ok(new_raw_id),
+            Err(libsignal_service::StorageServiceError::Conflict) => {
+                Err(Error::StorageManifestConflict)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Apply `edit` to a storage-service record and publish the result.
+    ///
+    /// `edit` receives the record as the server last gave it to us and returns the
+    /// bytes to write, or `None` when the record already says what we want — which
+    /// skips the write entirely rather than republishing an identical record.
+    ///
+    /// The caller supplies the *edit* rather than a finished record on purpose. A
+    /// conflict means another device rewrote the account, so the retry has to
+    /// re-read that contact and re-apply the change to whatever it now says;
+    /// resending bytes derived from a stale snapshot is exactly what
+    /// [`StorageServiceError::Conflict`] warns against.
+    ///
+    /// ## Only ever writing while caught up
+    ///
+    /// Each pass compares our stored manifest version against the server's, and
+    /// syncs first if they differ. Two things follow, and they are why the check is
+    /// here rather than a conditional further down:
+    ///
+    /// - The stored record bytes are provably current. A record is immutable under
+    ///   its identifier, so if we are at the server's version, what we hold under
+    ///   that identifier *is* what the server holds. No read is needed to confirm
+    ///   it — which is why this does not fetch the record it is about to edit.
+    /// - Recording `version + 1` after the write is unconditionally safe. Writing
+    ///   while behind would claim a version whose records we never read, and the
+    ///   next `manifest_if_changed` would answer 204 and skip them for good.
+    ///
+    /// On a conflict the local edit wins: it is re-applied over the freshly synced
+    /// record. Signal-Desktop and Signal-Android both drop the local change here
+    /// instead, but a block the user asked for a moment ago should not evaporate
+    /// because an unrelated device touched the same contact.
+    ///
+    /// The record is marked as needing a storage sync before the first attempt and
+    /// unmarked only once the server has taken the write, so an exhausted retry or
+    /// a crash leaves a durable record of what still needs publishing.
+    ///
+    /// Note the syncs here apply remote state to the local row, which can revert
+    /// the very field being published. The published *bytes* stay correct — they
+    /// are rebuilt from the edit — but keeping the local row in step needs the
+    /// pending-change guard in the sync merge.
+    ///
+    /// Callers must hold the storage-service lock.
+    pub async fn update_storage_record(
+        &mut self,
+        key: &StorageRecordKey,
+        edit: impl Fn(&[u8]) -> Result<Option<Vec<u8>>, StorageRecordEditError>,
+    ) -> Result<(), Error<S::Error>> {
+        /// Matches Signal-Android's `StorageSyncJob` (3 runs). Signal-Desktop
+        /// effectively allows 2 before latching off for the rest of the process.
+        const MAX_WRITE_ATTEMPTS: usize = 3;
+        /// Catching up does not consume a write attempt, so the loop needs its own
+        /// ceiling. Reaching it means we lost the race to sync repeatedly, which is
+        /// the same outcome as losing it at the write.
+        const MAX_PASSES: usize = 6;
+        /// Roughly Desktop's 1s/5s and Android's ~2s/4s. A conflict means another
+        /// writer is active right now, so retrying immediately just loses again.
+        const BACKOFF: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
+
+        // Irrefutable while `StorageRecordKey` has one variant, and deliberately
+        // so: adding a second turns this into a compile error here and at every
+        // store call below, which is where the group/account work has to start.
+        let StorageRecordKey::Contact(service_id) = key;
+
+        self.store
+            .set_contact_needs_storage_sync(service_id, true)
+            .await?;
+
+        let storage_service = self.storage_service().await?;
+        let mut write_attempts = 0usize;
+
+        for _ in 0..MAX_PASSES {
+            let local_version = self.store.fetch_storage_manifest_version().await?;
+            let current = storage_service.manifest().await?;
+
+            if current.version != local_version {
+                debug!(
+                    local_version,
+                    remote_version = current.version,
+                    "storage manifest: behind the server, syncing before writing"
+                );
+                // Also refreshes this contact's stored identifier and bytes, so the
+                // next pass edits what the server actually holds.
+                self.sync_storage_service().await?;
+                continue;
+            }
+
+            let Some(identity) = self.store.contact_storage_identity(service_id).await? else {
+                return Err(Error::StorageRecordUnknown);
+            };
+
+            let Some(new_record) = edit(&identity.record)? else {
+                debug!("storage manifest: record already current, skipping write");
+                self.store
+                    .set_contact_needs_storage_sync(service_id, false)
+                    .await?;
+                return Ok(());
+            };
+
+            match self
+                .write_replacing_storage_record(
+                    &storage_service,
+                    &current,
+                    key.item_type(),
+                    &identity.storage_id,
+                    new_record.clone(),
+                )
+                .await
+            {
+                Ok(new_raw_id) => {
+                    let version = current.version + 1;
+                    self.store.store_storage_manifest_version(version).await?;
+                    // Only now is the write real. Committing earlier would leave us
+                    // pointing at an identifier the server never accepted.
+                    self.store
+                        .save_contact_storage_identity(
+                            service_id,
+                            &ContactStorageIdentity {
+                                storage_id: new_raw_id,
+                                storage_version: version,
+                                record: new_record,
+                            },
+                        )
+                        .await?;
+                    self.store
+                        .set_contact_needs_storage_sync(service_id, false)
+                        .await?;
+                    debug!(version, "storage manifest: replaced contact record");
+                    self.notify_storage_manifest_written().await;
+                    return Ok(());
+                }
+                Err(Error::StorageManifestConflict) | Err(Error::StorageRecordMoved) => {
+                    write_attempts += 1;
+                    if write_attempts >= MAX_WRITE_ATTEMPTS {
+                        break;
+                    }
+                    let backoff = BACKOFF[write_attempts - 1];
+                    debug!(
+                        write_attempts,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "storage manifest: conflict, backing off before retry"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // The flag stays set: the change is still pending, and a later storage
+        // operation is expected to flush it.
+        warn!("storage manifest: gave up publishing contact record after conflicts");
         Err(Error::StorageManifestConflict)
     }
 

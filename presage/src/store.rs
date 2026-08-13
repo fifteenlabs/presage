@@ -9,6 +9,7 @@ use libsignal_service::{
     pre_keys::PreKeysStore,
     prelude::{Content, MasterKey, ProfileKey, Uuid},
     proto::{
+        manifest_record,
         sync_message::{self, Sent},
         verified, DataMessage, EditMessage, GroupContextV2, SyncMessage, Verified,
     },
@@ -51,6 +52,27 @@ pub trait StoreError: std::error::Error + Sync + Send {}
 pub struct StorageSyncCursor {
     pub target_version: u64,
     pub next_batch_index: u32,
+}
+
+/// Which storage-service record an update targets.
+///
+/// One variant today, because contacts are the only records anything writes.
+/// Groups and the account record get their own when something needs them — the
+/// point of naming the axis now is that adding a variant becomes a compile error
+/// at every site that has to care, rather than a silently contact-shaped API that
+/// has to be unpicked later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageRecordKey {
+    Contact(ServiceId),
+}
+
+impl StorageRecordKey {
+    /// The manifest identifier type this record is filed under.
+    pub fn item_type(&self) -> manifest_record::identifier::Type {
+        match self {
+            Self::Contact(_) => manifest_record::identifier::Type::Contact,
+        }
+    }
 }
 
 /// Where a contact's storage-service record currently lives, and what it says.
