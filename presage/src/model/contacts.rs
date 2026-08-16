@@ -205,3 +205,52 @@ impl TryFrom<libsignal_service::proto::ContactRecord> for Contact {
         })
     }
 }
+
+impl Contact {
+    /// Build a `ContactRecord` for a contact the storage service has never seen.
+    ///
+    /// **Only safe when the account holds no record for this contact.** [`Contact`]
+    /// is a lossy view of `ContactRecord` — it has no `identity_key`,
+    /// `identity_state` or `avatar_color`, and it collapses `given_name` and
+    /// `family_name` into one string — so using this to *replace* an existing
+    /// record would erase those fields. Editing the record the server gave us is
+    /// the only safe way to change one; see [`crate::storage_record`]. Creating a
+    /// record where none exists cannot clobber anything, which is what makes this
+    /// narrow use sound.
+    ///
+    /// The name is deliberately not split back apart. `given_name` takes the whole
+    /// string rather than guessing where a family name starts, since Signal itself
+    /// treats a one-part name as given-only and a wrong split is worse than none.
+    pub fn to_new_storage_record(&self) -> libsignal_service::proto::ContactRecord {
+        libsignal_service::proto::ContactRecord {
+            aci_binary: self.uuid.as_bytes().to_vec(),
+            pni_binary: self.pni.map(|p| p.as_bytes().to_vec()).unwrap_or_default(),
+            e164: self
+                .phone_number
+                .as_ref()
+                .map(|p| {
+                    p.format()
+                        .mode(libsignal_service::prelude::phonenumber::Mode::E164)
+                        .to_string()
+                })
+                .unwrap_or_default(),
+            profile_key: self.profile_key.clone(),
+            given_name: self.name.clone(),
+            username: self.username.clone().unwrap_or_default(),
+            blocked: self.blocked,
+            whitelisted: self.whitelisted,
+            archived: self.archived,
+            marked_unread: self.marked_unread,
+            muted_until_timestamp: self.muted_until_timestamp,
+            hide_story: self.hide_story,
+            hidden: self.hidden,
+            unregistered_at_timestamp: self.unregistered_at_timestamp,
+            pni_signature_verified: self.pni_signature_verified,
+            system_given_name: self.system_given_name.clone(),
+            system_family_name: self.system_family_name.clone(),
+            system_nickname: self.system_nickname.clone(),
+            note: self.note.clone(),
+            ..Default::default()
+        }
+    }
+}

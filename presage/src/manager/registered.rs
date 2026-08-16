@@ -71,7 +71,9 @@ use crate::backup::{
 use crate::model::calls::{extract_call_event, CallPeer};
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
-use crate::storage_record::StorageRecordEditError;
+// Imported by name because `storage_record` in this module already refers to
+// the protobuf module of the same name.
+use crate::storage_record::{contact_blocked, set_contact_blocked, StorageRecordEditError};
 use crate::store::{
     ContactStorageIdentity, ContentsStore, Sticker, StickerPack, StickerPackManifest,
     StorageRecordKey, StorageSyncCursor, Store, Thread,
@@ -587,8 +589,14 @@ impl<S: Store> Manager<S, Registered> {
                 ..Default::default()
             })),
         };
+        // Encoding here is lossless: the record was just built, so it has no
+        // unknown fields for prost to drop. An *edit* of a record read from the
+        // server must never do this — see [`crate::storage_record`].
         if let Err(e) = self
-            .append_storage_record(manifest_record::identifier::Type::Groupv2, storage_record)
+            .append_storage_record(
+                manifest_record::identifier::Type::Groupv2,
+                storage_record.encode_to_vec(),
+            )
             .await
         {
             warn!(%e, "group created but adding it to the storage manifest failed");
@@ -665,8 +673,8 @@ impl<S: Store> Manager<S, Registered> {
     async fn append_storage_record(
         &mut self,
         item_type: manifest_record::identifier::Type,
-        record: StorageRecord,
-    ) -> Result<(), Error<S::Error>> {
+        record: Vec<u8>,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
         /// The phone writes to this manifest too, so a conflict is routine rather than
         /// exceptional; retry a few times before giving up.
         const MAX_ATTEMPTS: usize = 3;
@@ -706,7 +714,7 @@ impl<S: Store> Manager<S, Registered> {
                 // [`crate::storage_record`].
                 .write_items(
                     new_manifest,
-                    vec![(raw_id, record.encode_to_vec())],
+                    vec![(raw_id.clone(), record.clone())],
                     Vec::new(),
                 )
                 .await
@@ -716,7 +724,7 @@ impl<S: Store> Manager<S, Registered> {
                     debug!(version, "storage manifest: appended record");
 
                     self.notify_storage_manifest_written().await;
-                    return Ok(());
+                    return Ok(raw_id);
                 }
                 // A conflict means another device wrote in between; the next iteration
                 // re-reads the manifest and rebuilds on top of it.
@@ -974,6 +982,123 @@ impl<S: Store> Manager<S, Registered> {
         // operation is expected to flush it.
         warn!("storage manifest: gave up publishing contact record after conflicts");
         Err(Error::StorageManifestConflict)
+    }
+
+    /// Publish every contact whose local state has not reached the storage service.
+    ///
+    /// Takes no argument on purpose. The work list is the store — every contact
+    /// flagged by [`set_blocked`](Self::set_blocked) — not something a caller
+    /// passes in, so a coalesced or dropped request costs latency and never data.
+    /// It is safe to call at any time, and doing so after every sync is what gives
+    /// an interrupted or failed publish another chance without a retry timer.
+    ///
+    /// The edit is derived from the local row rather than carried, which is only
+    /// sound because a sync cannot revert a row with a publish outstanding — see
+    /// the `has_pending_publish` guard in `merge_contact_from_snapshot`.
+    ///
+    /// One contact's failure does not stop the rest: its flag stays set and the
+    /// next call tries again.
+    ///
+    /// Callers must hold the storage-service lock.
+    pub async fn push_pending_contact_records(&mut self) -> Result<(), Error<S::Error>> {
+        let pending = self.store.contacts_needing_storage_sync().await?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        debug!(
+            count = pending.len(),
+            "storage manifest: publishing pending contact records"
+        );
+
+        for service_id in pending {
+            if let Err(e) = self.push_contact_record(&service_id).await {
+                warn!(%e, "storage manifest: failed to publish a contact record");
+            }
+        }
+        Ok(())
+    }
+
+    /// Bring one contact's storage-service record in line with the local row.
+    async fn push_contact_record(&mut self, service_id: &ServiceId) -> Result<(), Error<S::Error>> {
+        let Some(contact) = self.store.contact_by_id(service_id).await? else {
+            // Flagged but gone: nothing to publish, and leaving the flag set
+            // would make every future drain retry a contact that cannot exist.
+            warn!("storage manifest: pending contact is no longer in the store");
+            self.store
+                .set_contact_needs_storage_sync(service_id, false)
+                .await?;
+            return Ok(());
+        };
+        let blocked = contact.blocked;
+
+        match self
+            .update_storage_record(&StorageRecordKey::Contact(*service_id), |record| {
+                if contact_blocked(record)? == blocked {
+                    return Ok(None);
+                }
+                set_contact_blocked(record, blocked).map(Some)
+            })
+            .await
+        {
+            // The account holds no record for this contact, so there is nothing to
+            // edit. Creating one cannot clobber anything, which is the only reason
+            // building it from our lossy `Contact` is sound here.
+            Err(Error::StorageRecordUnknown) => {
+                self.append_contact_record(service_id, contact).await?
+            }
+            other => other?,
+        }
+
+        // `blocked` was read before a manifest fetch, a write, and possibly two
+        // backoff sleeps — seconds, in which the user may have toggled again. The
+        // publish path clears the pending flag on success, so without this the
+        // newer value would be left unflagged and never republished: the local row
+        // and the server would disagree permanently. Re-raise the flag instead and
+        // let the next drain carry the newer value.
+        if let Some(current) = self.store.contact_by_id(service_id).await? {
+            if current.blocked != blocked {
+                debug!("storage manifest: contact changed while publishing, re-flagging");
+                self.store
+                    .set_contact_needs_storage_sync(service_id, true)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Add a first storage-service record for a contact the account has never had one for.
+    async fn append_contact_record(
+        &mut self,
+        service_id: &ServiceId,
+        contact: Contact,
+    ) -> Result<(), Error<S::Error>> {
+        debug!("storage manifest: contact has no record yet, appending one");
+
+        let record = StorageRecord {
+            record: Some(storage_record::Record::Contact(
+                contact.to_new_storage_record(),
+            )),
+        };
+        let encoded = record.encode_to_vec();
+        let storage_id = self
+            .append_storage_record(manifest_record::identifier::Type::Contact, encoded.clone())
+            .await?;
+
+        let version = self.store.fetch_storage_manifest_version().await?;
+        self.store
+            .save_contact_storage_identity(
+                service_id,
+                &ContactStorageIdentity {
+                    storage_id,
+                    storage_version: version,
+                    record: encoded,
+                },
+            )
+            .await?;
+        self.store
+            .set_contact_needs_storage_sync(service_id, false)
+            .await?;
+        Ok(())
     }
 
     /// One member's credential, or `None` with a reason logged. Never fails the caller.
@@ -1777,10 +1902,23 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
-    /// Block or unblock a recipient. Persists the flag locally, then syncs the
-    /// full blocked list to our own linked devices via a `Blocked` sync message.
-    /// A recipient not yet in the contact list is stored as a minimal blocked
+    /// Block or unblock a recipient.
+    ///
+    /// Persists the flag locally, marks the contact as owing the storage service
+    /// a write, and tells our own linked devices via a `Blocked` sync message. A
+    /// recipient not yet in the contact list is stored as a minimal blocked
     /// record so the block still takes effect.
+    ///
+    /// Deliberately touches no manifest. Publishing is
+    /// [`push_pending_contact_records`](Self::push_pending_contact_records),
+    /// driven by whoever owns storage-service serialisation, so a block takes
+    /// effect immediately and offline instead of waiting on a network write.
+    ///
+    /// The local write and the mark are one step for the same reason Android
+    /// rotates a recipient's storage id inside the same database write as the
+    /// block: a change and the record that it is owed must not be able to
+    /// disagree. If they did, a sync could revert the flag while nothing said a
+    /// publish was outstanding.
     pub async fn set_blocked(
         &mut self,
         service_id: ServiceId,
@@ -1792,11 +1930,39 @@ impl<S: Store> Manager<S, Registered> {
         };
         contact.blocked = blocked;
         self.store.save_contact(&contact).await?;
+        self.store
+            .set_contact_needs_storage_sync(&service_id, true)
+            .await?;
         self.send_blocked_sync().await
     }
 
     /// Broadcast the current blocked list to our own linked devices.
+    ///
+    /// Skipped when there are none: the message is addressed to our own ACI and
+    /// fans out to every device but this one, so with no others it encrypts and
+    /// sends a full blocked list to nobody. Signal-Desktop guards the same way
+    /// (`doWeHaveOtherDevices()` in `syncMessageRequestResponse`) and treats the
+    /// sync message as an optimisation over the storage service, never as the
+    /// channel that carries the change.
+    ///
+    /// The guard reads *sessions* rather than the account's device list, which
+    /// presage does not track. A linked device we have never established a
+    /// session with would be missed here — it still learns of the block from the
+    /// storage manifest, just without the immediate nudge.
     async fn send_blocked_sync(&mut self) -> Result<(), Error<S::Error>> {
+        use libsignal_service::session_store::SessionStoreExt;
+        let own_aci = self.state.data.service_ids.aci();
+        let other_devices = self
+            .store
+            .aci_protocol_store()
+            .get_sub_device_sessions(&ServiceId::Aci(own_aci))
+            .await
+            .unwrap_or_default();
+        if other_devices.is_empty() {
+            debug!("no linked devices, skipping the blocked-list sync message");
+            return Ok(());
+        }
+
         let blocked = collect_blocked_contacts(&self.store).await;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2542,14 +2708,24 @@ impl<S: Store> Manager<S, Registered> {
                         // knew, so an empty field in it must not wipe a populated row.
                         // Reachable when a contact already exists — a storage sync that
                         // beat the import, or a re-import over a live store.
-                        if let Some(existing) = self
-                            .store
-                            .contact_by_id(&ServiceId::Aci(Aci::from(contact.uuid)))
-                            .await
-                            .ok()
-                            .flatten()
+                        let service_id = ServiceId::Aci(Aci::from(contact.uuid));
+                        if let Some(existing) =
+                            self.store.contact_by_id(&service_id).await.ok().flatten()
                         {
-                            merge_contact_from_snapshot(&mut contact, existing);
+                            // A backup import replaces the whole store, so nothing can
+                            // be waiting to publish — but ask rather than assume, so a
+                            // re-import over a live store behaves like the sync path.
+                            let has_pending_publish = self
+                                .store
+                                .contacts_needing_storage_sync()
+                                .await
+                                .map(|pending| pending.contains(&service_id))
+                                .unwrap_or(false);
+                            merge_contact_from_snapshot(
+                                &mut contact,
+                                existing,
+                                has_pending_publish,
+                            );
                         }
                         if let Err(e) = self.store.save_contact(&contact).await {
                             warn!(%e, "backup import: failed to save contact");
@@ -3235,7 +3411,20 @@ fn merged_expire_timer_version(incoming: Option<u32>, stored: u32) -> u32 {
 /// A *non-empty* remote value still wins. Storage sync is the only channel that delivers a
 /// renamed contact to the app — presage only re-fetches a profile on first sight or a
 /// profile-key rotation — so remote stays authoritative whenever it has something to say.
-fn merge_contact_from_snapshot(contact: &mut Contact, existing: Contact) -> Vec<&'static str> {
+///
+/// `has_pending_publish` is the exception to that. A contact whose local change has not yet
+/// reached the storage service must keep it: the record we are merging *from* is the one we
+/// are about to overwrite, so letting it win would discard the user's action and then
+/// publish the discarded value back. Only `blocked` is protected, because it is the only
+/// field anything publishes — see [`ContentsStore::set_contact_needs_storage_sync`], whose
+/// flag is per contact rather than per field for the same reason. A second publishable
+/// field needs that flag to say *which* change is pending, or this will start preserving
+/// stale values for fields nobody edited.
+fn merge_contact_from_snapshot(
+    contact: &mut Contact,
+    existing: Contact,
+    has_pending_publish: bool,
+) -> Vec<&'static str> {
     // Not carried by either snapshot source at all — always local.
     contact.expire_timer = existing.expire_timer;
     contact.expire_timer_version = existing.expire_timer_version;
@@ -3263,6 +3452,10 @@ fn merge_contact_from_snapshot(contact: &mut Contact, existing: Contact) -> Vec<
     if contact.username.is_none() && existing.username.is_some() {
         contact.username = existing.username;
         preserved.push("username");
+    }
+    if has_pending_publish && contact.blocked != existing.blocked {
+        contact.blocked = existing.blocked;
+        preserved.push("blocked");
     }
     preserved
 }
@@ -3333,6 +3526,23 @@ async fn sync_storage_service<S: Store>(
     let total = all_keys.len();
     debug!(total, "storage sync: fetching storage records in batches");
 
+    // Read once for the whole sync rather than per record. These contacts hold a
+    // local change the server has not taken yet, so the record we are about to
+    // merge is the one we are about to overwrite — letting it win would discard
+    // the user's action and then publish the discarded value back.
+    let pending_publish: std::collections::HashSet<ServiceId> = store
+        .contacts_needing_storage_sync()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if !pending_publish.is_empty() {
+        debug!(
+            count = pending_publish.len(),
+            "storage sync: contacts with an unpublished local change"
+        );
+    }
+
     // If we have a saved cursor that targets this same manifest version,
     // skip the batches already completed in the prior attempt. A cursor
     // for any other version is stale — discard and start fresh.
@@ -3391,7 +3601,11 @@ async fn sync_storage_service<S: Store>(
                     // record field overwrite local data.
                     let service_id = ServiceId::Aci(Aci::from(contact.uuid));
                     if let Some(existing) = store.contact_by_id(&service_id).await.ok().flatten() {
-                        merge_contact_from_snapshot(&mut contact, existing);
+                        merge_contact_from_snapshot(
+                            &mut contact,
+                            existing,
+                            pending_publish.contains(&service_id),
+                        );
                     }
                     if let Err(e) = store.save_contact(&contact).await {
                         warn!(%e, "storage sync: failed to save contact");
@@ -3560,10 +3774,62 @@ mod tests {
         Contact::minimal(Uuid::nil())
     }
 
+    /// The window this exists for: the user blocked someone, the write has not
+    /// reached the server, and a sync arrives carrying the pre-block record. The
+    /// record we are merging is the one we are about to overwrite, so letting it
+    /// win would discard the block — and, because publishing derives the edit
+    /// from this row, then publish the discarded value back as an *unblock*.
+    #[test]
+    fn a_pending_block_survives_the_record_it_is_about_to_replace() {
+        let mut local = stored_contact();
+        local.blocked = true;
+
+        let mut incoming = empty_record_contact();
+        incoming.blocked = false;
+
+        let preserved = merge_contact_from_snapshot(&mut incoming, local, true);
+
+        assert!(incoming.blocked, "the pending block was reverted");
+        assert!(preserved.contains(&"blocked"));
+    }
+
+    /// Without a pending change the remote value is authoritative, so a block or
+    /// unblock made on another device still lands here.
+    #[test]
+    fn a_remote_unblock_wins_when_nothing_is_pending() {
+        let mut local = stored_contact();
+        local.blocked = true;
+
+        let mut incoming = empty_record_contact();
+        incoming.blocked = false;
+
+        let preserved = merge_contact_from_snapshot(&mut incoming, local, false);
+
+        assert!(!incoming.blocked);
+        assert!(!preserved.contains(&"blocked"));
+    }
+
+    /// The guard is about *disagreement*, not about the flag. A pending contact
+    /// whose remote record already agrees needs no protection and should not be
+    /// reported as protected.
+    #[test]
+    fn agreement_is_not_reported_as_preserved() {
+        let mut local = stored_contact();
+        local.blocked = true;
+
+        let mut incoming = empty_record_contact();
+        incoming.blocked = true;
+
+        let preserved = merge_contact_from_snapshot(&mut incoming, local, true);
+
+        assert!(incoming.blocked);
+        assert!(!preserved.contains(&"blocked"));
+    }
+
     #[test]
     fn empty_record_does_not_wipe_local_fields() {
         let mut incoming = empty_record_contact();
-        let preserved = merge_contact_from_snapshot(&mut incoming, stored_contact());
+        let preserved = merge_contact_from_snapshot(&mut incoming, stored_contact(), false);
 
         assert_eq!(incoming.name, "Local Name");
         assert_eq!(incoming.profile_key, vec![7u8; 32]);
@@ -3586,7 +3852,7 @@ mod tests {
         incoming.profile_key = vec![9u8; 32];
         incoming.username = Some("remote.99".into());
 
-        let preserved = merge_contact_from_snapshot(&mut incoming, stored_contact());
+        let preserved = merge_contact_from_snapshot(&mut incoming, stored_contact(), false);
 
         assert_eq!(incoming.name, "Renamed Remotely");
         assert_eq!(incoming.profile_key, vec![9u8; 32]);
@@ -3600,7 +3866,7 @@ mod tests {
         let mut incoming = empty_record_contact();
         incoming.name = "Renamed Remotely".into();
 
-        merge_contact_from_snapshot(&mut incoming, stored_contact());
+        merge_contact_from_snapshot(&mut incoming, stored_contact(), false);
 
         assert_eq!(incoming.expire_timer, 3600);
         assert_eq!(incoming.expire_timer_version, 9);
@@ -3611,7 +3877,7 @@ mod tests {
     #[test]
     fn nothing_is_preserved_when_the_store_is_also_empty() {
         let mut incoming = empty_record_contact();
-        let preserved = merge_contact_from_snapshot(&mut incoming, empty_record_contact());
+        let preserved = merge_contact_from_snapshot(&mut incoming, empty_record_contact(), false);
 
         assert!(preserved.is_empty());
         assert!(incoming.name.is_empty());
