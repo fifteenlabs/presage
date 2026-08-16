@@ -5,6 +5,7 @@ mod errors;
 pub mod manager;
 pub mod model;
 mod serde;
+pub mod storage_record;
 pub mod store;
 
 pub use libsignal_service;
