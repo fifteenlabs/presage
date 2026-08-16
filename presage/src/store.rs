@@ -9,6 +9,7 @@ use libsignal_service::{
     pre_keys::PreKeysStore,
     prelude::{Content, MasterKey, ProfileKey, Uuid},
     proto::{
+        manifest_record,
         sync_message::{self, Sent},
         verified, DataMessage, EditMessage, GroupContextV2, SyncMessage, Verified,
     },
@@ -51,6 +52,53 @@ pub trait StoreError: std::error::Error + Sync + Send {}
 pub struct StorageSyncCursor {
     pub target_version: u64,
     pub next_batch_index: u32,
+}
+
+/// Which storage-service record an update targets.
+///
+/// One variant today, because contacts are the only records anything writes.
+/// Groups and the account record get their own when something needs them — the
+/// point of naming the axis now is that adding a variant becomes a compile error
+/// at every site that has to care, rather than a silently contact-shaped API that
+/// has to be unpicked later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageRecordKey {
+    Contact(ServiceId),
+}
+
+impl StorageRecordKey {
+    /// The manifest identifier type this record is filed under.
+    pub fn item_type(&self) -> manifest_record::identifier::Type {
+        match self {
+            Self::Contact(_) => manifest_record::identifier::Type::Contact,
+        }
+    }
+}
+
+/// Where a contact's storage-service record currently lives, and what it says.
+///
+/// A record is immutable under its identifier: changing one is an insert under a
+/// fresh id plus a delete of the old one. Updating a contact therefore needs the
+/// id its record is filed under, which is only ever learned by reading the
+/// manifest.
+///
+/// `record` is the whole decrypted `StorageRecord`, which is a deliberate
+/// departure from Signal-Desktop — it keeps only the *unknown* fields
+/// (`storageUnknownFields`) and rebuilds the known ones from its conversation
+/// model at upload time. That works because Desktop's model is a faithful
+/// superset of `ContactRecord`. [`Contact`] is not: it drops `identity_key`,
+/// `identity_state` and `avatar_color`, and collapses `given_name`/`family_name`
+/// into one string. Rebuilding from it would quietly erase those fields on every
+/// write, so an update edits these bytes instead of regenerating them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContactStorageIdentity {
+    /// The 16-byte manifest identifier the record is filed under.
+    pub storage_id: Vec<u8>,
+    /// Manifest version this identifier was read at. Diagnostic only — the
+    /// identifier is what addresses the record.
+    pub storage_version: u64,
+    /// Decrypted `StorageRecord` plaintext, exactly as the server holds it.
+    pub record: Vec<u8>,
 }
 
 /// Stores the registered state of the manager
@@ -409,6 +457,50 @@ pub trait ContentsStore: Send + Sync {
         &self,
         id: &ServiceId,
     ) -> impl Future<Output = Result<Option<Contact>, Self::ContentsStoreError>> + Send;
+
+    /// Where this contact's storage-service record lives, if we have ever read it.
+    ///
+    /// The default returns `None`, which reads as "we don't know where it is".
+    /// Callers must treat that as a reason to sync before writing, never as a
+    /// reason to write blind — appending a record the account already holds
+    /// under another id duplicates it on every device.
+    fn contact_storage_identity(
+        &self,
+        _id: &ServiceId,
+    ) -> impl Future<Output = Result<Option<ContactStorageIdentity>, Self::ContentsStoreError>> + Send
+    {
+        async { Ok(None) }
+    }
+
+    /// Record where a contact's storage-service record lives. Called once per
+    /// contact per storage sync, alongside [`save_contact`](Self::save_contact).
+    fn save_contact_storage_identity(
+        &mut self,
+        _id: &ServiceId,
+        _identity: &ContactStorageIdentity,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Mark a contact as having a local change not yet published to the storage
+    /// service, or clear that mark once it has been.
+    ///
+    /// This is the durable half of a publish: the upload itself can fail or be
+    /// interrupted, but the intent survives a restart and can be retried.
+    fn set_contact_needs_storage_sync(
+        &mut self,
+        _id: &ServiceId,
+        _needs_sync: bool,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Every contact with an unpublished local change, for the boot-time flush.
+    fn contacts_needing_storage_sync(
+        &self,
+    ) -> impl Future<Output = Result<Vec<ServiceId>, Self::ContentsStoreError>> + Send {
+        async { Ok(Vec::new()) }
+    }
 
     /// Delete all cached group data
     fn clear_groups(&mut self) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;

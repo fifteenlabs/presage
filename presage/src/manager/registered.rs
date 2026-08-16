@@ -23,7 +23,6 @@ use libsignal_service::{
         GroupsManager, InMemoryCredentialsCache, Timer,
     },
     libsignal_account_keys::AccountEntropyPool,
-    master_key::StorageServiceKey,
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
     prelude::{phonenumber::PhoneNumber, MasterKey, MessageSenderError, ProtobufMessage, Uuid},
     profile_cipher::ProfileCipher,
@@ -31,8 +30,8 @@ use libsignal_service::{
         data_message::Delete,
         manifest_record, storage_record,
         sync_message::{self, sticker_pack_operation, StickerPackOperation},
-        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, GroupV2Record, ManifestRecord,
-        StorageRecord, SyncMessage, Verified,
+        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, GroupV2Record, StorageRecord,
+        SyncMessage, Verified,
     },
     protocol::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
@@ -54,7 +53,7 @@ use libsignal_service::{
         profiles::{ExpiringProfileKeyCredential, ProfileKey},
         GroupMasterKeyBytes, ServerPublicParams,
     },
-    AccountManager, Profile, ProfileCredentialRequest, ServiceIdExt, StorageService,
+    AccountManager, Profile, ProfileCredentialRequest, ServiceIdExt,
 };
 use libsignal_service::{
     libsignal_account_keys::AccountEntropyPool, proto::addressable_message::Author,
@@ -74,9 +73,10 @@ use crate::backup::{
 use crate::model::calls::{extract_call_event, CallPeer};
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
-use crate::store::{
-    ContentsStore, Sticker, StickerPack, StickerPackManifest, StorageSyncCursor, Store, Thread,
-};
+// Imported by name because `storage_record` in this module already refers to
+// the protobuf module of the same name.
+use super::storage::{contact_profile_key, merge_contact_from_snapshot};
+use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
 
 pub use crate::model::messages::Received;
@@ -233,7 +233,7 @@ impl<S: Store> Manager<S, Registered> {
     /// Returns a clone of a cached push service (with credentials).
     ///
     /// If no service is yet cached, it will create and cache one.
-    fn identified_push_service(&self) -> PushService {
+    pub(super) fn identified_push_service(&self) -> PushService {
         self.state.identified_push_service()
     }
 
@@ -363,7 +363,7 @@ impl<S: Store> Manager<S, Registered> {
             .expect("logic error"))
     }
 
-    async fn master_key(&self) -> Result<Option<MasterKey>, Error<S::Error>> {
+    pub(super) async fn master_key(&self) -> Result<Option<MasterKey>, Error<S::Error>> {
         let from_store = self.store().fetch_master_key().await?;
 
         if let Some(key) = from_store {
@@ -589,8 +589,14 @@ impl<S: Store> Manager<S, Registered> {
                 ..Default::default()
             })),
         };
+        // Encoding here is lossless: the record was just built, so it has no
+        // unknown fields for prost to drop. An *edit* of a record read from the
+        // server must never do this — see [`crate::storage_record`].
         if let Err(e) = self
-            .append_storage_record(manifest_record::identifier::Type::Groupv2, storage_record)
+            .append_storage_record(
+                manifest_record::identifier::Type::Groupv2,
+                storage_record.encode_to_vec(),
+            )
             .await
         {
             warn!(%e, "group created but adding it to the storage manifest failed");
@@ -611,105 +617,6 @@ impl<S: Store> Manager<S, Registered> {
         // to this group. `Manager::send_message_to_group` saves it locally as it sends, so
         // that is also what gives the creator its own "created the group" row.
         Ok(master_key_bytes)
-    }
-
-    /// Append one record to the account's storage manifest.
-    ///
-    /// Every existing identifier is copied through **verbatim**, including record types
-    /// presage does not model (account, story distribution lists, call links, chat
-    /// folders, notification profiles). The server treats the manifest as the complete
-    /// index of the account, so anything dropped here would be deleted from every device
-    /// the user owns — which is why this appends rather than regenerating the way
-    /// Signal-Desktop's `generateManifest` does.
-    ///
-    /// Deliberately offers no way to express an update or a delete: those require
-    /// re-encoding records we cannot decode.
-    async fn append_storage_record(
-        &mut self,
-        item_type: manifest_record::identifier::Type,
-        record: StorageRecord,
-    ) -> Result<(), Error<S::Error>> {
-        /// The phone writes to this manifest too, so a conflict is routine rather than
-        /// exceptional; retry a few times before giving up.
-        const MAX_ATTEMPTS: usize = 3;
-
-        let master_key = self
-            .master_key()
-            .await?
-            .ok_or_else(|| Error::MissingKeyError("master_key".into()))?;
-        let storage_service = StorageService::new(
-            self.identified_push_service(),
-            StorageServiceKey::from_master_key(&master_key),
-        )
-        .await?;
-
-        for attempt in 1..=MAX_ATTEMPTS {
-            let current = storage_service.manifest().await?;
-            let version = current.version + 1;
-
-            // Storage IDs are 16 random bytes, and a record is only ever addressed by the
-            // id it was inserted under.
-            let mut raw_id = vec![0u8; 16];
-            StdRng::from_os_rng().fill_bytes(&mut raw_id);
-
-            let mut identifiers = current.identifiers.clone();
-            identifiers.push(manifest_record::Identifier {
-                raw: raw_id.clone(),
-                r#type: item_type.into(),
-            });
-
-            // `record_ikm` must be carried forward unchanged: item keys derive from it, so
-            // dropping it would make every existing item undecryptable. `write_items`
-            // encrypts the record with whatever this manifest declares, so the two cannot
-            // disagree.
-            let new_manifest = ManifestRecord {
-                version,
-                source_device: self.state.device_id().into(),
-                identifiers,
-                record_ikm: current.record_ikm.clone(),
-            };
-
-            match storage_service
-                .write_items(new_manifest, vec![(raw_id, record.clone())], Vec::new())
-                .await
-            {
-                Ok(()) => {
-                    self.store.store_storage_manifest_version(version).await?;
-                    debug!(version, "storage manifest: appended record");
-
-                    // Tell the other devices to sync — the same FetchLatest that appv2
-                    // listens for. Best-effort: the record is already written.
-                    if let Err(e) = self
-                        .new_message_sender()
-                        .await?
-                        .send_sync_message(SyncMessage {
-                            fetch_latest: Some(sync_message::FetchLatest {
-                                r#type: Some(
-                                    sync_message::fetch_latest::Type::StorageManifest.into(),
-                                ),
-                            }),
-                            ..SyncMessage::with_padding(&mut rand::rng())
-                        })
-                        .await
-                    {
-                        warn!(%e, "storage manifest written but notifying other devices failed");
-                    }
-                    return Ok(());
-                }
-                // A conflict means another device wrote in between; the next iteration
-                // re-reads the manifest and rebuilds on top of it.
-                Err(libsignal_service::StorageServiceError::Conflict) => {
-                    debug!(
-                        attempt,
-                        our_version = version,
-                        "storage manifest: version conflict, retrying"
-                    );
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        Err(Error::StorageManifestConflict)
     }
 
     /// One member's credential, or `None` with a reason logged. Never fails the caller.
@@ -1120,10 +1027,14 @@ impl<S: Store> Manager<S, Registered> {
                                                 let mut message_sender =
                                                     state.message_sender.clone();
                                                 tokio::task::spawn_local(async move {
-                                                    let result = message_sender.send_sync_message(SyncMessage {
-                                                    blocked: Some(blocked),
-                                                    ..SyncMessage::with_padding(&mut rand::rng())
-                                                }).await;
+                                                    let result = message_sender
+                                                        .send_sync_message(SyncMessage {
+                                                            blocked: Some(blocked),
+                                                            ..SyncMessage::with_padding(
+                                                                &mut rand::rng(),
+                                                            )
+                                                        })
+                                                        .await;
 
                                                     if let Err(error) = result {
                                                         warn!(%error, "Error sending blocked contacts to other devices");
@@ -1519,10 +1430,23 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
-    /// Block or unblock a recipient. Persists the flag locally, then syncs the
-    /// full blocked list to our own linked devices via a `Blocked` sync message.
-    /// A recipient not yet in the contact list is stored as a minimal blocked
+    /// Block or unblock a recipient.
+    ///
+    /// Persists the flag locally, marks the contact as owing the storage service
+    /// a write, and tells our own linked devices via a `Blocked` sync message. A
+    /// recipient not yet in the contact list is stored as a minimal blocked
     /// record so the block still takes effect.
+    ///
+    /// Deliberately touches no manifest. Publishing is
+    /// [`push_pending_contact_records`](Self::push_pending_contact_records),
+    /// driven by whoever owns storage-service serialisation, so a block takes
+    /// effect immediately and offline instead of waiting on a network write.
+    ///
+    /// The local write and the mark are one step for the same reason Android
+    /// rotates a recipient's storage id inside the same database write as the
+    /// block: a change and the record that it is owed must not be able to
+    /// disagree. If they did, a sync could revert the flag while nothing said a
+    /// publish was outstanding.
     pub async fn set_blocked(
         &mut self,
         service_id: ServiceId,
@@ -1534,11 +1458,39 @@ impl<S: Store> Manager<S, Registered> {
         };
         contact.blocked = blocked;
         self.store.save_contact(&contact).await?;
+        self.store
+            .set_contact_needs_storage_sync(&service_id, true)
+            .await?;
         self.send_blocked_sync().await
     }
 
     /// Broadcast the current blocked list to our own linked devices.
+    ///
+    /// Skipped when there are none: the message is addressed to our own ACI and
+    /// fans out to every device but this one, so with no others it encrypts and
+    /// sends a full blocked list to nobody. Signal-Desktop guards the same way
+    /// (`doWeHaveOtherDevices()` in `syncMessageRequestResponse`) and treats the
+    /// sync message as an optimisation over the storage service, never as the
+    /// channel that carries the change.
+    ///
+    /// The guard reads *sessions* rather than the account's device list, which
+    /// presage does not track. A linked device we have never established a
+    /// session with would be missed here — it still learns of the block from the
+    /// storage manifest, just without the immediate nudge.
     async fn send_blocked_sync(&mut self) -> Result<(), Error<S::Error>> {
+        use libsignal_service::session_store::SessionStoreExt;
+        let own_aci = self.state.data.service_ids.aci();
+        let other_devices = self
+            .store
+            .aci_protocol_store()
+            .get_sub_device_sessions(&ServiceId::Aci(own_aci))
+            .await
+            .unwrap_or_default();
+        if other_devices.is_empty() {
+            debug!("no linked devices, skipping the blocked-list sync message");
+            return Ok(());
+        }
+
         let blocked = collect_blocked_contacts(&self.store).await;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1922,7 +1874,9 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     /// Creates a new message sender.
-    async fn new_message_sender(&self) -> Result<MessageSender<S::AciStore>, Error<S::Error>> {
+    pub(super) async fn new_message_sender(
+        &self,
+    ) -> Result<MessageSender<S::AciStore>, Error<S::Error>> {
         let identified_websocket = self.identified_websocket(false).await?;
         let unidentified_websocket = self.unidentified_websocket().await?;
 
@@ -2069,16 +2023,6 @@ impl<S: Store> Manager<S, Registered> {
         );
 
         Ok(account_manager.linked_devices(&aci_protocol_store).await?)
-    }
-
-    pub async fn sync_storage_service(&mut self) -> Result<(), Error<S::Error>> {
-        let master_key = self
-            .master_key()
-            .await?
-            .ok_or_else(|| Error::MissingKeyError("master_key".into()))?;
-        let storage_key = StorageServiceKey::from_master_key(&master_key);
-        let push_service = self.identified_push_service();
-        sync_storage_service(&mut self.store, &push_service, storage_key).await
     }
 
     pub async fn hydrate_groups(&mut self) -> Result<(), Error<S::Error>> {
@@ -2308,14 +2252,24 @@ impl<S: Store> Manager<S, Registered> {
                         // knew, so an empty field in it must not wipe a populated row.
                         // Reachable when a contact already exists — a storage sync that
                         // beat the import, or a re-import over a live store.
-                        if let Some(existing) = self
-                            .store
-                            .contact_by_id(&ServiceId::Aci(Aci::from(contact.uuid)))
-                            .await
-                            .ok()
-                            .flatten()
+                        let service_id = ServiceId::Aci(Aci::from(contact.uuid));
+                        if let Some(existing) =
+                            self.store.contact_by_id(&service_id).await.ok().flatten()
                         {
-                            merge_contact_from_snapshot(&mut contact, existing);
+                            // A backup import replaces the whole store, so nothing can
+                            // be waiting to publish — but ask rather than assume, so a
+                            // re-import over a live store behaves like the sync path.
+                            let has_pending_publish = self
+                                .store
+                                .contacts_needing_storage_sync()
+                                .await
+                                .map(|pending| pending.contains(&service_id))
+                                .unwrap_or(false);
+                            merge_contact_from_snapshot(
+                                &mut contact,
+                                existing,
+                                has_pending_publish,
+                            );
                         }
                         if let Err(e) = self.store.save_contact(&contact).await {
                             warn!(%e, "backup import: failed to save contact");
@@ -2958,21 +2912,6 @@ async fn register_pre_keys<S: Store>(
     Ok(())
 }
 
-/// Maximum number of storage-service keys to request in a single `ReadOperation`.
-/// Signal Desktop uses 2500; the server's hard limit is ~5120.
-const STORAGE_SERVICE_BATCH_SIZE: usize = 2500;
-
-/// Parse a [`Contact`]'s raw profile-key bytes into a [`ProfileKey`].
-///
-/// The field is a `Vec<u8>` that is legitimately empty — `Contact::minimal` and a
-/// `ContactRecord` carrying no key both produce one — so anything that isn't exactly
-/// 32 bytes is treated as absent.
-fn contact_profile_key(contact: &Contact) -> Option<ProfileKey> {
-    <[u8; 32]>::try_from(contact.profile_key.as_slice())
-        .ok()
-        .map(ProfileKey::create)
-}
-
 /// The `expire_timer_version` to keep after a first-sight profile fetch: the incoming one
 /// when it is newer, otherwise whatever is already stored. Never lower than `stored`.
 ///
@@ -2988,386 +2927,9 @@ fn merged_expire_timer_version(incoming: Option<u32>, stored: u32) -> u32 {
     }
 }
 
-/// Merge the locally-stored contact into one rebuilt from a remote snapshot, and report
-/// which at-risk fields were protected.
-///
-/// Applies to both snapshot sources: a storage-service `ContactRecord` and a backup
-/// `Recipient` frame. Each is a full snapshot, but only of what the *writing* device knew —
-/// and proto3 gives these scalars no presence, so an empty value is indistinguishable from
-/// an unset one and carries no information. Letting one overwrite local data loses the
-/// contact's name, profile key, phone number, PNI or username for nothing. Neither source
-/// carries the locally-derived fields below, so both want them restored verbatim.
-///
-/// A *non-empty* remote value still wins. Storage sync is the only channel that delivers a
-/// renamed contact to the app — presage only re-fetches a profile on first sight or a
-/// profile-key rotation — so remote stays authoritative whenever it has something to say.
-fn merge_contact_from_snapshot(contact: &mut Contact, existing: Contact) -> Vec<&'static str> {
-    // Not carried by either snapshot source at all — always local.
-    contact.expire_timer = existing.expire_timer;
-    contact.expire_timer_version = existing.expire_timer_version;
-    contact.inbox_position = existing.inbox_position;
-    contact.avatar = existing.avatar;
-    contact.verified = existing.verified;
-
-    let mut preserved = Vec::new();
-    if contact.name.is_empty() && !existing.name.is_empty() {
-        contact.name = existing.name;
-        preserved.push("name");
-    }
-    if contact.profile_key.is_empty() && !existing.profile_key.is_empty() {
-        contact.profile_key = existing.profile_key;
-        preserved.push("profile_key");
-    }
-    if contact.phone_number.is_none() && existing.phone_number.is_some() {
-        contact.phone_number = existing.phone_number;
-        preserved.push("phone_number");
-    }
-    if contact.pni.is_none() && existing.pni.is_some() {
-        contact.pni = existing.pni;
-        preserved.push("pni");
-    }
-    if contact.username.is_none() && existing.username.is_some() {
-        contact.username = existing.username;
-        preserved.push("username");
-    }
-    preserved
-}
-
-async fn sync_storage_service<S: Store>(
-    store: &mut S,
-    push_service: &PushService,
-    storage_key: StorageServiceKey,
-) -> Result<(), Error<S::Error>> {
-    use libsignal_service::{
-        proto::manifest_record::identifier::Type as StorageType, StorageService,
-    };
-
-    debug!("storage sync: authenticating with storage service");
-    let storage_service =
-        StorageService::new(push_service.clone(), storage_key).await?;
-
-    let local_version = store.fetch_storage_manifest_version().await?;
-    debug!(local_version, "storage sync: fetching manifest");
-    let Some(manifest_record) = storage_service.manifest_if_changed(local_version).await? else {
-        debug!(
-            local_version,
-            "storage sync: server version unchanged (204), skipping"
-        );
-        // Server reports no change — a leftover cursor would be stale.
-        store.clear_storage_sync_cursor().await.ok();
-        return Ok(());
-    };
-    let manifest_version = manifest_record.version;
-    debug!(
-        version = manifest_version,
-        local_version,
-        identifiers = manifest_record.identifiers.len(),
-        has_record_ikm = !manifest_record.record_ikm.is_empty(),
-        "storage sync: got and decrypted manifest"
-    );
-
-    let record_ikm: Option<Vec<u8>> = if manifest_record.record_ikm.is_empty() {
-        None
-    } else {
-        Some(manifest_record.record_ikm.clone())
-    };
-
-    let mut contact_keys: Vec<Vec<u8>> = Vec::new();
-    let mut group_keys: Vec<Vec<u8>> = Vec::new();
-    for id in &manifest_record.identifiers {
-        match id.r#type() {
-            StorageType::Contact => contact_keys.push(id.raw.clone()),
-            StorageType::Groupv2 => group_keys.push(id.raw.clone()),
-            _ => {}
-        }
-    }
-    debug!(
-        count = contact_keys.len(),
-        "storage sync: contact keys in manifest"
-    );
-    debug!(
-        count = group_keys.len(),
-        "storage sync: group keys in manifest"
-    );
-
-    if contact_keys.is_empty() && group_keys.is_empty() {
-        debug!("storage sync: nothing to sync");
-        return Ok(());
-    }
-
-    let all_keys: Vec<Vec<u8>> = contact_keys.into_iter().chain(group_keys).collect();
-    let total = all_keys.len();
-    debug!(total, "storage sync: fetching storage records in batches");
-
-    // If we have a saved cursor that targets this same manifest version,
-    // skip the batches already completed in the prior attempt. A cursor
-    // for any other version is stale — discard and start fresh.
-    let resume_from = match store.fetch_storage_sync_cursor().await? {
-        Some(cursor) if cursor.target_version == manifest_version => {
-            debug!(
-                target_version = cursor.target_version,
-                next_batch_index = cursor.next_batch_index,
-                "storage sync: resuming from saved cursor"
-            );
-            cursor.next_batch_index as usize
-        }
-        Some(stale) => {
-            debug!(
-                stale_version = stale.target_version,
-                current_version = manifest_version,
-                "storage sync: stale cursor for old manifest version, discarding"
-            );
-            store.clear_storage_sync_cursor().await.ok();
-            0
-        }
-        None => 0,
-    };
-
-    let mut total_processed = 0usize;
-    for (i, batch) in all_keys
-        .chunks(STORAGE_SERVICE_BATCH_SIZE)
-        .enumerate()
-        .skip(resume_from)
-    {
-        debug!(
-            batch = i,
-            size = batch.len(),
-            "storage sync: fetching batch"
-        );
-        let records = storage_service
-            .read_items(batch.to_vec(), record_ikm.as_deref())
-            .await?;
-        debug!(count = records.len(), "storage sync: got storage records");
-        total_processed += records.len();
-
-        for record in records {
-            match record.record {
-                Some(libsignal_service::proto::storage_record::Record::Contact(cr)) => {
-                    debug!(aci = %cr.aci, name = %cr.given_name, "storage sync: saving contact");
-                    let mut contact: Contact = match Contact::try_from(cr) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!("storage sync: skipping contact record: {e}");
-                            continue;
-                        }
-                    };
-
-                    // Merge the stored contact into the one rebuilt from the record:
-                    // restore what the record cannot carry, and refuse to let an empty
-                    // record field overwrite local data.
-                    let service_id = ServiceId::Aci(Aci::from(contact.uuid));
-                    if let Some(existing) = store.contact_by_id(&service_id).await.ok().flatten() {
-                        merge_contact_from_snapshot(&mut contact, existing);
-                    }
-                    if let Err(e) = store.save_contact(&contact).await {
-                        warn!(%e, "storage sync: failed to save contact");
-                    }
-                    // Keep `profile_keys` in step with the contact row — it is the
-                    // table `ContentsStore::profile_key` reads, and until now only the
-                    // first-sight message path wrote to it.
-                    if let Some(profile_key) = contact_profile_key(&contact) {
-                        if let Err(e) = store.upsert_profile_key(&contact.uuid, profile_key).await {
-                            warn!(%e, "storage sync: failed to upsert profile key");
-                        }
-                    }
-                }
-                Some(libsignal_service::proto::storage_record::Record::GroupV2(gr)) => {
-                    let master_key: libsignal_service::zkgroup::GroupMasterKeyBytes =
-                        match gr.master_key.as_slice().try_into() {
-                            Ok(mk) => mk,
-                            Err(_) => {
-                                warn!("storage sync: invalid group master key length, skipping");
-                                continue;
-                            }
-                        };
-                    let group = match store.group(master_key).await {
-                        Ok(Some(mut existing)) => {
-                            // Preserve locally-derived fields; update storage-service-owned fields
-                            existing.blocked = gr.blocked;
-                            existing.whitelisted = gr.whitelisted;
-                            existing.archived = gr.archived;
-                            existing.marked_unread = gr.marked_unread;
-                            existing.muted_until_timestamp = gr.muted_until_timestamp;
-                            existing.dont_notify_for_mentions_if_muted =
-                                gr.dont_notify_for_mentions_if_muted;
-                            existing.hide_story = gr.hide_story;
-                            existing.story_send_mode = gr.story_send_mode.into();
-                            existing
-                        }
-                        _ => {
-                            debug!("storage sync: saving group stub");
-                            Group {
-                                title: None,
-                                avatar: None,
-                                disappearing_messages_timer: None,
-                                access_control: None,
-                                revision: 0,
-                                members: Vec::new(),
-                                pending_members: Vec::new(),
-                                requesting_members: Vec::new(),
-                                invite_link_password: Vec::new(),
-                                description: None,
-                                needs_hydration: true,
-                                blocked: gr.blocked,
-                                whitelisted: gr.whitelisted,
-                                archived: gr.archived,
-                                marked_unread: gr.marked_unread,
-                                muted_until_timestamp: gr.muted_until_timestamp,
-                                dont_notify_for_mentions_if_muted: gr
-                                    .dont_notify_for_mentions_if_muted,
-                                hide_story: gr.hide_story,
-                                story_send_mode: gr.story_send_mode.into(),
-                            }
-                        }
-                    };
-                    if let Err(e) = store.save_group(master_key, group).await {
-                        warn!(%e, "storage sync: failed to save group");
-                    }
-                }
-                Some(other) => {
-                    debug!(?other, "storage sync: skipping non-contact/group record");
-                }
-                None => {
-                    debug!("storage sync: empty record, skipping");
-                }
-            }
-        }
-
-        // Per-batch checkpoint: every record in batches 0..=i has been
-        // attempted (successes are persisted via INSERT OR REPLACE in the
-        // store impls; failures were warn-logged and skipped). If the app
-        // dies after this point, the next sync targeting this same manifest
-        // version will resume at batch i+1.
-        let cursor = StorageSyncCursor {
-            target_version: manifest_version,
-            next_batch_index: (i + 1) as u32,
-        };
-        if let Err(e) = store.store_storage_sync_cursor(&cursor).await {
-            warn!(%e, "storage sync: failed to persist sync cursor, continuing");
-        }
-    }
-
-    store
-        .store_storage_manifest_version(manifest_version)
-        .await?;
-    // Sync completed end-to-end — clear the cursor so it doesn't survive
-    // as a stale entry on the next call.
-    store.clear_storage_sync_cursor().await.ok();
-    info!(
-        count = total_processed,
-        version = manifest_version,
-        "storage service sync complete"
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn contact_with_profile_key(bytes: Vec<u8>) -> Contact {
-        let mut contact = Contact::minimal(Uuid::nil());
-        contact.profile_key = bytes;
-        contact
-    }
-
-    #[test]
-    fn contact_profile_key_accepts_32_bytes() {
-        let bytes = vec![7u8; 32];
-        let key = contact_profile_key(&contact_with_profile_key(bytes.clone()))
-            .expect("32 bytes is a profile key");
-        assert_eq!(key.bytes.as_slice(), bytes.as_slice());
-    }
-
-    #[test]
-    fn contact_profile_key_rejects_empty() {
-        // What `Contact::minimal` and a `ContactRecord` with no key both produce.
-        assert!(contact_profile_key(&Contact::minimal(Uuid::nil())).is_none());
-    }
-
-    #[test]
-    fn contact_profile_key_rejects_wrong_length() {
-        assert!(contact_profile_key(&contact_with_profile_key(vec![7u8; 31])).is_none());
-    }
-
-    /// A contact as the store holds it: everything populated.
-    fn stored_contact() -> Contact {
-        let mut c = Contact::minimal(Uuid::nil());
-        c.name = "Local Name".into();
-        c.profile_key = vec![7u8; 32];
-        c.phone_number = Some(
-            libsignal_service::prelude::phonenumber::parse(None, "+15555550123").expect("valid"),
-        );
-        c.pni = Some(Uuid::from_u128(1));
-        c.username = Some("local.42".into());
-        c.expire_timer = 3600;
-        c.expire_timer_version = 9;
-        c.inbox_position = 5;
-        c
-    }
-
-    /// A contact as rebuilt from a `ContactRecord` that carried nothing but an ACI —
-    /// the "whitelisted-only stub" shape observed in real storage-service data.
-    fn empty_record_contact() -> Contact {
-        Contact::minimal(Uuid::nil())
-    }
-
-    #[test]
-    fn empty_record_does_not_wipe_local_fields() {
-        let mut incoming = empty_record_contact();
-        let preserved = merge_contact_from_snapshot(&mut incoming, stored_contact());
-
-        assert_eq!(incoming.name, "Local Name");
-        assert_eq!(incoming.profile_key, vec![7u8; 32]);
-        assert!(incoming.phone_number.is_some());
-        assert_eq!(incoming.pni, Some(Uuid::from_u128(1)));
-        assert_eq!(incoming.username.as_deref(), Some("local.42"));
-        assert_eq!(
-            preserved,
-            ["name", "profile_key", "phone_number", "pni", "username"]
-        );
-    }
-
-    #[test]
-    fn non_empty_record_still_wins() {
-        // The decision not to follow Signal-Desktop's second condition: storage sync is
-        // the only channel that delivers a rename, so a record with something to say must
-        // overwrite the local value.
-        let mut incoming = empty_record_contact();
-        incoming.name = "Renamed Remotely".into();
-        incoming.profile_key = vec![9u8; 32];
-        incoming.username = Some("remote.99".into());
-
-        let preserved = merge_contact_from_snapshot(&mut incoming, stored_contact());
-
-        assert_eq!(incoming.name, "Renamed Remotely");
-        assert_eq!(incoming.profile_key, vec![9u8; 32]);
-        assert_eq!(incoming.username.as_deref(), Some("remote.99"));
-        // Only the fields the record left empty were protected.
-        assert_eq!(preserved, ["phone_number", "pni"]);
-    }
-
-    #[test]
-    fn fields_absent_from_the_record_are_always_restored() {
-        let mut incoming = empty_record_contact();
-        incoming.name = "Renamed Remotely".into();
-
-        merge_contact_from_snapshot(&mut incoming, stored_contact());
-
-        assert_eq!(incoming.expire_timer, 3600);
-        assert_eq!(incoming.expire_timer_version, 9);
-        assert_eq!(incoming.inbox_position, 5);
-        assert!(incoming.avatar.is_none());
-    }
-
-    #[test]
-    fn nothing_is_preserved_when_the_store_is_also_empty() {
-        let mut incoming = empty_record_contact();
-        let preserved = merge_contact_from_snapshot(&mut incoming, empty_record_contact());
-
-        assert!(preserved.is_empty());
-        assert!(incoming.name.is_empty());
-    }
 
     #[test]
     fn newer_expire_timer_version_wins() {

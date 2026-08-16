@@ -43,6 +43,17 @@ pub enum Error<S: std::error::Error> {
     /// transport failure: the write was well-formed, we just never got a turn.
     #[error("gave up writing the storage manifest after repeated version conflicts")]
     StorageManifestConflict,
+    /// The identifier we believed a record lived under is no longer in the manifest, so the
+    /// copy we hold is stale: another device rewrote that record under a new identifier.
+    /// Recoverable by re-syncing and rebuilding the edit from what comes back.
+    #[error("storage record is no longer at the identifier we hold")]
+    StorageRecordMoved,
+    /// We have never read this contact's storage record, so there is nothing to edit. Not a
+    /// failure on its own — the caller decides between syncing first and writing a new record.
+    #[error("no storage record stored for this contact")]
+    StorageRecordUnknown,
+    #[error("could not edit stored storage record: {0}")]
+    StorageRecordEdit(#[from] crate::storage_record::StorageRecordEditError),
     #[error("libsignal-service sending error: {0}")]
     MessageSenderError(Box<MessageSenderError>),
     #[error("this client is already registered with Signal")]
