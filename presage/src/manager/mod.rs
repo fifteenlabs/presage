@@ -4,6 +4,7 @@ mod confirmation;
 mod linking;
 mod registered;
 mod registration;
+mod storage;
 
 use std::{fmt, sync::Arc};
 
