@@ -2730,6 +2730,9 @@ async fn save_message<S: Store>(
             debug!(?msg, "skipping story message");
             None
         }
+        // Deprecated to construct, not to receive: the server still delivers
+        // these as a side-car, so the arm has to stay.
+        #[allow(deprecated)]
         ContentBody::PniSignatureMessage(msg) => {
             debug!(?msg, "skipping PNI signature message");
             None

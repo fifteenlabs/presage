@@ -569,6 +569,7 @@ async fn print_message<S: Store>(
         ContentBody::StoryMessage(story) => {
             Some(Msg::Received(&thread, format!("new story: {story:?}")))
         }
+        #[allow(deprecated)]
         ContentBody::PniSignatureMessage(_) => {
             Some(Msg::Received(&thread, "got PNI signature message".into()))
         }
