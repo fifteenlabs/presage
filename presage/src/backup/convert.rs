@@ -261,7 +261,7 @@ fn reactions_to_contents(
                 };
                 (
                     ContentBody::SynchronizeMessage(SyncMessage {
-                        sent: Some(sent),
+                        content: Some(sync_message::Content::Sent(sent)),
                         ..Default::default()
                     }),
                     ServiceId::Aci(our_aci),
@@ -282,8 +282,14 @@ fn reactions_to_contents(
                         destination,
                         sender_device: *DEFAULT_DEVICE_ID,
                         server_guid: None,
-                        timestamp: chrono::DateTime::from_timestamp_millis(reaction.sent_timestamp as i64).unwrap_or_default(),
-                        server_timestamp: chrono::DateTime::from_timestamp_millis(reaction.sent_timestamp as i64).unwrap_or_default(),
+                        client_timestamp: chrono::DateTime::from_timestamp_millis(
+                            reaction.sent_timestamp as i64,
+                        )
+                        .unwrap_or_default(),
+                        server_timestamp: chrono::DateTime::from_timestamp_millis(
+                            reaction.sent_timestamp as i64,
+                        )
+                        .unwrap_or_default(),
                         needs_receipt: false,
                         unidentified_sender: false,
                         was_plaintext: false,
@@ -514,7 +520,7 @@ fn wrap_dm_with_reactions(
         };
         (
             ContentBody::SynchronizeMessage(SyncMessage {
-                sent: Some(sent),
+                content: Some(sync_message::Content::Sent(sent)),
                 ..Default::default()
             }),
             ServiceId::Aci(our_aci),
@@ -537,8 +543,10 @@ fn wrap_dm_with_reactions(
             destination,
             sender_device: *DEFAULT_DEVICE_ID,
             server_guid: None,
-            timestamp: chrono::DateTime::from_timestamp_millis(timestamp as i64).unwrap_or_default(),
-            server_timestamp: chrono::DateTime::from_timestamp_millis(timestamp as i64).unwrap_or_default(),
+            client_timestamp: chrono::DateTime::from_timestamp_millis(timestamp as i64)
+                .unwrap_or_default(),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(timestamp as i64)
+                .unwrap_or_default(),
             needs_receipt: false,
             unidentified_sender: false,
             was_plaintext: false,
@@ -619,7 +627,7 @@ fn individual_call_to_contents(
     };
 
     let body = ContentBody::SynchronizeMessage(SyncMessage {
-        call_event: Some(call_event),
+        content: Some(sync_message::Content::CallEvent(call_event)),
         ..Default::default()
     });
 
@@ -629,8 +637,10 @@ fn individual_call_to_contents(
             destination: ServiceId::Aci(our_aci),
             sender_device: *DEFAULT_DEVICE_ID,
             server_guid: None,
-            timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64).unwrap_or_default(),
-            server_timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64).unwrap_or_default(),
+            client_timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64)
+                .unwrap_or_default(),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64)
+                .unwrap_or_default(),
             needs_receipt: false,
             unidentified_sender: false,
             was_plaintext: false,
@@ -674,11 +684,13 @@ fn simple_update_to_contents(
     };
 
     let body = ContentBody::SynchronizeMessage(SyncMessage {
-        message_request_response: Some(MessageRequestResponse {
-            thread_aci_binary: Some(peer.raw_uuid().as_bytes().to_vec()),
-            r#type: Some(mrr_type as i32),
-            ..Default::default()
-        }),
+        content: Some(sync_message::Content::MessageRequestResponse(
+            MessageRequestResponse {
+                thread_aci_binary: Some(peer.raw_uuid().as_bytes().to_vec()),
+                r#type: Some(mrr_type as i32),
+                ..Default::default()
+            },
+        )),
         ..Default::default()
     });
     let ts = chrono::DateTime::from_timestamp_millis(timestamp as i64).unwrap_or_default();
@@ -688,7 +700,7 @@ fn simple_update_to_contents(
             destination: *peer,
             sender_device: *DEFAULT_DEVICE_ID,
             server_guid: None,
-            timestamp: ts,
+            client_timestamp: ts,
             server_timestamp: ts,
             needs_receipt: false,
             unidentified_sender: false,
@@ -788,7 +800,7 @@ fn group_call_to_contents(
     };
 
     let body = ContentBody::SynchronizeMessage(SyncMessage {
-        call_event: Some(call_event),
+        content: Some(sync_message::Content::CallEvent(call_event)),
         ..Default::default()
     });
 
@@ -798,8 +810,10 @@ fn group_call_to_contents(
             destination: ServiceId::Aci(our_aci),
             sender_device: *DEFAULT_DEVICE_ID,
             server_guid: None,
-            timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64).unwrap_or_default(),
-            server_timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64).unwrap_or_default(),
+            client_timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64)
+                .unwrap_or_default(),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64)
+                .unwrap_or_default(),
             needs_receipt: false,
             unidentified_sender: false,
             was_plaintext: false,

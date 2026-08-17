@@ -19,6 +19,7 @@ use presage::libsignal_service::prelude::phonenumber::PhoneNumber;
 use presage::libsignal_service::prelude::ProfileKey;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::proto::data_message::Quote;
+use presage::libsignal_service::proto::sync_message;
 use presage::libsignal_service::proto::sync_message::Sent;
 use presage::libsignal_service::protocol::ServiceId;
 use presage::libsignal_service::sender::AttachmentSpec;
@@ -529,25 +530,25 @@ async fn print_message<S: Store>(
             .map(|body| Msg::Received(&thread, body)),
         ContentBody::EditMessage(EditMessage { .. }) => None,
         ContentBody::SynchronizeMessage(SyncMessage {
-            sent:
-                Some(Sent {
+            content:
+                Some(sync_message::Content::Sent(Sent {
                     message: Some(data_message),
                     ..
-                }),
+                })),
             ..
         }) => format_data_message(&thread, data_message, manager)
             .await
             .map(|body| Msg::Sent(&thread, body)),
         ContentBody::SynchronizeMessage(SyncMessage {
-            sent:
-                Some(Sent {
+            content:
+                Some(sync_message::Content::Sent(Sent {
                     edit_message:
                         Some(EditMessage {
                             data_message: Some(data_message),
                             ..
                         }),
                     ..
-                }),
+                })),
             ..
         }) => format_data_message(&thread, data_message, manager)
             .await

@@ -3,8 +3,8 @@ use std::str::FromStr;
 use presage::{
     backup::TransferArchive,
     libsignal_service::{
-        libsignal_account_keys::AccountEntropyPool, prelude::MasterKey,
-        protocol::SenderCertificate, BackupKey,
+        BackupKey, libsignal_account_keys::AccountEntropyPool, prelude::MasterKey,
+        protocol::SenderCertificate,
     },
     store::{StateStore, Store},
 };

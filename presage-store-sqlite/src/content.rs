@@ -144,7 +144,7 @@ impl ContentsStore for SqliteStore {
             sender,
             destination,
             sender_device,
-            timestamp,
+            client_timestamp,
             needs_receipt,
             unidentified_sender,
             server_guid: _,
@@ -158,7 +158,7 @@ impl ContentsStore for SqliteStore {
         let destination_service_id = destination.service_id_string();
 
         let proto_bytes = prost::Message::encode_to_vec(&body.into_proto());
-        let timestamp = timestamp.timestamp_millis();
+        let timestamp = client_timestamp.timestamp_millis();
 
         query!(
             "INSERT OR REPLACE INTO thread_messages (

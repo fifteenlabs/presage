@@ -76,9 +76,11 @@ impl<S: Store> Manager<S, Registered> {
 
         if let Err(e) = sender
             .send_sync_message(SyncMessage {
-                fetch_latest: Some(sync_message::FetchLatest {
-                    r#type: Some(sync_message::fetch_latest::Type::StorageManifest.into()),
-                }),
+                content: Some(sync_message::Content::FetchLatest(
+                    sync_message::FetchLatest {
+                        r#type: Some(sync_message::fetch_latest::Type::StorageManifest.into()),
+                    },
+                )),
                 ..SyncMessage::with_padding(&mut rand::rng())
             })
             .await

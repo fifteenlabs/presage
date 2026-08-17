@@ -10,6 +10,7 @@
 
 use libsignal_service::content::{Content, ContentBody};
 use libsignal_service::prelude::Uuid;
+use libsignal_service::proto::sync_message;
 use libsignal_service::proto::sync_message::call_event::{Direction, Event, Type};
 use libsignal_service::protocol::{Aci, ServiceId};
 use libsignal_service::zkgroup::GroupMasterKeyBytes;
@@ -273,7 +274,10 @@ pub fn extract_call_event(body: &ContentBody) -> Option<CallEventInfo> {
         ContentBody::SynchronizeMessage(sm) => sm,
         _ => return None,
     };
-    let ce = sm.call_event.as_ref()?;
+    let ce = match sm.content.as_ref()? {
+        sync_message::Content::CallEvent(ce) => ce,
+        _ => return None,
+    };
 
     let call_type = match Type::try_from(ce.r#type.unwrap_or(0)).ok() {
         Some(Type::AudioCall) => CallType::Audio,

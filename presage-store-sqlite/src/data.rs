@@ -303,7 +303,7 @@ impl TryInto<Content> for SqlMessage {
             sender,
             destination,
             sender_device: sender_device_id.try_into()?,
-            timestamp: Utc.timestamp_millis_opt(ts as i64).unwrap(),
+            client_timestamp: Utc.timestamp_millis_opt(ts as i64).unwrap(),
             // Not every message may have a server timestamp stored; fall back to the regular timestamp.
             server_timestamp: Utc
                 .timestamp_millis_opt(server_ts.unwrap_or(ts) as i64)

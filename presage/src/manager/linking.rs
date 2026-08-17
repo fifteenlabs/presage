@@ -125,9 +125,8 @@ impl<S: Store> Manager<S, Linking> {
                 pni_private_key,
                 pni_public_key,
                 profile_key,
-                master_key,
                 account_entropy_pool,
-                backup_key,
+                ephemeral_backup_key,
             }) => {
                 let registration_data = RegistrationData {
                     signal_servers,
@@ -141,7 +140,7 @@ impl<S: Store> Manager<S, Linking> {
                     profile_key,
                 };
 
-                if let Some(ref backup_key) = backup_key {
+                if let Some(ref backup_key) = ephemeral_backup_key {
                     store.store_backup_key(Some(backup_key)).await?;
                 }
 
@@ -158,15 +157,18 @@ impl<S: Store> Manager<S, Linking> {
                     ))
                     .await?;
                 store
+                    .store_account_entropy_pool(account_entropy_pool.as_ref())
+                    .await?;
+                // The provisioning message no longer carries a master key of its
+                // own, so it is derived from the account entropy pool.
+                store
                     .store_master_key(
-                        master_key
-                            .map(|v| MasterKey::from_slice(&v))
+                        account_entropy_pool
+                            .as_ref()
+                            .map(|aep| MasterKey::from_slice(aep.derive_svr_key().as_slice()))
                             .transpose()?
                             .as_ref(),
                     )
-                    .await?;
-                store
-                    .store_account_entropy_pool(account_entropy_pool.as_ref())
                     .await?;
 
                 store.save_registration_data(&registration_data).await?;
