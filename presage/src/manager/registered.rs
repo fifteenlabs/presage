@@ -72,7 +72,7 @@ use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
 // Imported by name because `storage_record` in this module already refers to
 // the protobuf module of the same name.
-use super::storage::{contact_profile_key, merge_contact_from_snapshot};
+use super::storage::{contact_profile_key, merge_contact_from_snapshot, pending_publish_intent};
 use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
 
@@ -1449,16 +1449,51 @@ impl<S: Store> Manager<S, Registered> {
         service_id: ServiceId,
         blocked: bool,
     ) -> Result<(), Error<S::Error>> {
-        let mut contact = match self.store.contact_by_id(&service_id).await? {
+        self.edit_contact_for_publish(&service_id, |contact| contact.blocked = blocked)
+            .await?;
+        self.send_blocked_sync().await
+    }
+
+    /// Set a contact's mute expiry (ms since epoch; `0` unmutes, `i64::MAX` is
+    /// "muted always").
+    ///
+    /// Same shape as [`set_blocked`](Self::set_blocked) — the local write and
+    /// the storage-sync mark are one step, publishing is
+    /// [`push_pending_contact_records`](Self::push_pending_contact_records) —
+    /// minus its sync message: Signal has no mute sync message, the storage
+    /// service is the only cross-device channel, and every successful manifest
+    /// write already nudges the other devices via `FetchLatest`.
+    pub async fn set_muted_until(
+        &mut self,
+        service_id: ServiceId,
+        muted_until_timestamp: u64,
+    ) -> Result<(), Error<S::Error>> {
+        self.edit_contact_for_publish(&service_id, |contact| {
+            contact.muted_until_timestamp = muted_until_timestamp
+        })
+        .await
+    }
+
+    /// Apply one local edit to a contact and mark it as owing the storage
+    /// service a write. A recipient not yet in the contact list is stored as a
+    /// minimal record so the edit still takes effect. The write and the mark
+    /// are one step on purpose — a change and the record it is owed must not
+    /// be able to disagree (see [`set_blocked`](Self::set_blocked)'s doc).
+    async fn edit_contact_for_publish(
+        &mut self,
+        service_id: &ServiceId,
+        edit: impl FnOnce(&mut Contact),
+    ) -> Result<(), Error<S::Error>> {
+        let mut contact = match self.store.contact_by_id(service_id).await? {
             Some(contact) => contact,
             None => Contact::minimal(service_id.raw_uuid()),
         };
-        contact.blocked = blocked;
+        edit(&mut contact);
         self.store.save_contact(&contact).await?;
         self.store
-            .set_contact_needs_storage_sync(&service_id, true)
+            .set_contact_needs_storage_sync(service_id, true)
             .await?;
-        self.send_blocked_sync().await
+        Ok(())
     }
 
     /// Broadcast the current blocked list to our own linked devices.
@@ -2280,11 +2315,14 @@ impl<S: Store> Manager<S, Registered> {
                                 .await
                                 .map(|pending| pending.contains(&service_id))
                                 .unwrap_or(false);
-                            merge_contact_from_snapshot(
-                                &mut contact,
-                                existing,
+                            let pending = pending_publish_intent(
+                                &self.store,
+                                &service_id,
+                                &existing,
                                 has_pending_publish,
-                            );
+                            )
+                            .await;
+                            merge_contact_from_snapshot(&mut contact, existing, pending);
                         }
                         if let Err(e) = self.store.save_contact(&contact).await {
                             warn!(%e, "backup import: failed to save contact");
