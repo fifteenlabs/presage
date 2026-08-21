@@ -32,7 +32,10 @@ use tracing::{debug, info, warn};
 
 use crate::model::contacts::Contact;
 use crate::model::groups::Group;
-use crate::storage_record::{contact_blocked, set_contact_blocked, StorageRecordEditError};
+use crate::storage_record::{
+    contact_blocked, contact_muted_until, set_contact_blocked, set_contact_muted_until,
+    StorageRecordEditError,
+};
 use crate::store::{ContactStorageIdentity, StorageRecordKey, StorageSyncCursor, Store};
 use crate::{Error, Manager};
 
@@ -464,14 +467,29 @@ impl<S: Store> Manager<S, Registered> {
                 .await?;
             return Ok(());
         };
-        let blocked = contact.blocked;
-
         match self
             .update_storage_record(&StorageRecordKey::Contact(*service_id), |record| {
-                if contact_blocked(record)? == blocked {
+                // One closure settles every publishable field — the pending
+                // flag is per contact, so a drain that fixed only one could
+                // clear the flag another still needs. `PendingPublish::diff`
+                // is the shared enumeration of those fields, so this writes
+                // exactly what the merge guard protects.
+                let diff = PendingPublish::diff(record, &contact)?;
+                if !diff.any() {
                     return Ok(None);
                 }
-                set_contact_blocked(record, blocked).map(Some)
+                let mut edited: Option<Vec<u8>> = None;
+                if diff.blocked {
+                    edited = Some(set_contact_blocked(record, contact.blocked)?);
+                }
+                if diff.muted {
+                    let current = edited.as_deref().unwrap_or(record);
+                    edited = Some(set_contact_muted_until(
+                        current,
+                        contact.muted_until_timestamp,
+                    )?);
+                }
+                Ok(edited)
             })
             .await
         {
@@ -479,19 +497,19 @@ impl<S: Store> Manager<S, Registered> {
             // edit. Creating one cannot clobber anything, which is the only reason
             // building it from our lossy `Contact` is sound here.
             Err(Error::StorageRecordUnknown) => {
-                self.append_contact_record(service_id, contact).await?
+                self.append_contact_record(service_id, &contact).await?
             }
             other => other?,
         }
 
-        // `blocked` was read before a manifest fetch, a write, and possibly two
+        // The row was read before a manifest fetch, a write, and possibly two
         // backoff sleeps — seconds, in which the user may have toggled again. The
         // publish path clears the pending flag on success, so without this the
         // newer value would be left unflagged and never republished: the local row
         // and the server would disagree permanently. Re-raise the flag instead and
         // let the next drain carry the newer value.
         if let Some(current) = self.store.contact_by_id(service_id).await? {
-            if current.blocked != blocked {
+            if PendingPublish::between(&current, &contact).any() {
                 debug!("storage manifest: contact changed while publishing, re-flagging");
                 self.store
                     .set_contact_needs_storage_sync(service_id, true)
@@ -505,7 +523,7 @@ impl<S: Store> Manager<S, Registered> {
     async fn append_contact_record(
         &mut self,
         service_id: &ServiceId,
-        contact: Contact,
+        contact: &Contact,
     ) -> Result<(), Error<S::Error>> {
         debug!("storage manifest: contact has no record yet, appending one");
 
@@ -572,18 +590,18 @@ pub(super) fn contact_profile_key(contact: &Contact) -> Option<ProfileKey> {
 /// renamed contact to the app — presage only re-fetches a profile on first sight or a
 /// profile-key rotation — so remote stays authoritative whenever it has something to say.
 ///
-/// `has_pending_publish` is the exception to that. A contact whose local change has not yet
-/// reached the storage service must keep it: the record we are merging *from* is the one we
-/// are about to overwrite, so letting it win would discard the user's action and then
-/// publish the discarded value back. Only `blocked` is protected, because it is the only
-/// field anything publishes — see [`ContentsStore::set_contact_needs_storage_sync`], whose
-/// flag is per contact rather than per field for the same reason. A second publishable
-/// field needs that flag to say *which* change is pending, or this will start preserving
-/// stale values for fields nobody edited.
+/// `pending` is the exception to that. A contact whose local change has not yet reached the
+/// storage service must keep it: the record we are merging *from* is the one we are about
+/// to overwrite, so letting it win would discard the user's action and then publish the
+/// discarded value back. The protection is per field, not per contact — the
+/// [`ContentsStore::set_contact_needs_storage_sync`] flag only says *a* change is owed, and
+/// blanket-preserving every publishable field under it would keep stale local values for
+/// fields nobody edited, which the next publish would then push over a remote change. See
+/// [`pending_publish_intent`] for how the per-field intent is derived.
 pub(super) fn merge_contact_from_snapshot(
     contact: &mut Contact,
     existing: Contact,
-    has_pending_publish: bool,
+    pending: PendingPublish,
 ) -> Vec<&'static str> {
     // Not carried by either snapshot source at all — always local.
     contact.expire_timer = existing.expire_timer;
@@ -613,11 +631,79 @@ pub(super) fn merge_contact_from_snapshot(
         contact.username = existing.username;
         preserved.push("username");
     }
-    if has_pending_publish && contact.blocked != existing.blocked {
+    if pending.blocked && contact.blocked != existing.blocked {
         contact.blocked = existing.blocked;
         preserved.push("blocked");
     }
+    if pending.muted && contact.muted_until_timestamp != existing.muted_until_timestamp {
+        contact.muted_until_timestamp = existing.muted_until_timestamp;
+        preserved.push("muted_until_timestamp");
+    }
     preserved
+}
+
+/// The set of storage-service-publishable contact fields, as a "which ones"
+/// bitmap. Doubles as the pending-publish intent the merge guard consumes.
+///
+/// Derived rather than stored: a field is pending iff the whole-contact
+/// [`ContentsStore::set_contact_needs_storage_sync`] flag is raised *and* the
+/// local row disagrees with the last-published record bytes. [`Self::diff`] is
+/// that comparison, and [`Manager::push_contact_record`] publishes off the same
+/// diff — so the merge protects exactly what the publish will write, and a new
+/// publishable field is one field here plus its arm in `diff`/`between` and in
+/// the publish closure next door.
+#[derive(Clone, Copy, Default)]
+pub(super) struct PendingPublish {
+    pub blocked: bool,
+    pub muted: bool,
+}
+
+impl PendingPublish {
+    /// The publishable fields on which `local` disagrees with the published
+    /// record bytes.
+    fn diff(record: &[u8], local: &Contact) -> Result<Self, StorageRecordEditError> {
+        Ok(Self {
+            blocked: contact_blocked(record)? != local.blocked,
+            muted: contact_muted_until(record)? != local.muted_until_timestamp,
+        })
+    }
+
+    /// The publishable fields on which two contact rows disagree.
+    fn between(a: &Contact, b: &Contact) -> Self {
+        Self {
+            blocked: a.blocked != b.blocked,
+            muted: a.muted_until_timestamp != b.muted_until_timestamp,
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.blocked || self.muted
+    }
+}
+
+/// Compute [`PendingPublish`] for a contact. `flagged` is the contact's
+/// whole-contact needs-sync flag — without it nothing is pending, and folding
+/// the guard in here means no caller can forget it. Call this *before* the
+/// fresh identity from an in-flight sync overwrites the stored bytes. No
+/// record to diff against — never published, unreadable, or malformed — means
+/// everything local is intent.
+pub(super) async fn pending_publish_intent<S: Store>(
+    store: &S,
+    service_id: &ServiceId,
+    local: &Contact,
+    flagged: bool,
+) -> PendingPublish {
+    if !flagged {
+        return PendingPublish::default();
+    }
+    let all = PendingPublish {
+        blocked: true,
+        muted: true,
+    };
+    match store.contact_storage_identity(service_id).await {
+        Ok(Some(identity)) => PendingPublish::diff(&identity.record, local).unwrap_or(all),
+        _ => all,
+    }
 }
 
 async fn sync_storage_service<S: Store>(
@@ -760,11 +846,16 @@ async fn sync_storage_service<S: Store>(
                     // record field overwrite local data.
                     let service_id = ServiceId::Aci(Aci::from(contact.uuid));
                     if let Some(existing) = store.contact_by_id(&service_id).await.ok().flatten() {
-                        merge_contact_from_snapshot(
-                            &mut contact,
-                            existing,
+                        // Derived from the identity we are about to replace, so
+                        // it has to be read before the save below.
+                        let pending = pending_publish_intent(
+                            store,
+                            &service_id,
+                            &existing,
                             pending_publish.contains(&service_id),
-                        );
+                        )
+                        .await;
+                        merge_contact_from_snapshot(&mut contact, existing, pending);
                     }
                     if let Err(e) = store.save_contact(&contact).await {
                         warn!(%e, "storage sync: failed to save contact");
@@ -947,7 +1038,14 @@ mod tests {
         let mut incoming = empty_record_contact();
         incoming.blocked = false;
 
-        let preserved = merge_contact_from_snapshot(&mut incoming, local, true);
+        let preserved = merge_contact_from_snapshot(
+            &mut incoming,
+            local,
+            PendingPublish {
+                blocked: true,
+                muted: false,
+            },
+        );
 
         assert!(incoming.blocked, "the pending block was reverted");
         assert!(preserved.contains(&"blocked"));
@@ -963,7 +1061,8 @@ mod tests {
         let mut incoming = empty_record_contact();
         incoming.blocked = false;
 
-        let preserved = merge_contact_from_snapshot(&mut incoming, local, false);
+        let preserved =
+            merge_contact_from_snapshot(&mut incoming, local, PendingPublish::default());
 
         assert!(!incoming.blocked);
         assert!(!preserved.contains(&"blocked"));
@@ -980,16 +1079,86 @@ mod tests {
         let mut incoming = empty_record_contact();
         incoming.blocked = true;
 
-        let preserved = merge_contact_from_snapshot(&mut incoming, local, true);
+        let preserved = merge_contact_from_snapshot(
+            &mut incoming,
+            local,
+            PendingPublish {
+                blocked: true,
+                muted: false,
+            },
+        );
 
         assert!(incoming.blocked);
+        assert!(!preserved.contains(&"blocked"));
+    }
+
+    /// The point of per-field intent: a pending *block* must not shield the
+    /// mute field, or a mute made on another device would be preserved away
+    /// here and then overwritten by our next publish.
+    #[test]
+    fn a_pending_block_still_takes_a_remote_mute() {
+        let mut local = stored_contact();
+        local.blocked = true;
+        local.muted_until_timestamp = 0;
+
+        let mut incoming = empty_record_contact();
+        incoming.blocked = false;
+        incoming.muted_until_timestamp = 1_700_000_000_000;
+
+        let preserved = merge_contact_from_snapshot(
+            &mut incoming,
+            local,
+            PendingPublish {
+                blocked: true,
+                muted: false,
+            },
+        );
+
+        assert!(incoming.blocked, "the pending block was reverted");
+        assert_eq!(
+            incoming.muted_until_timestamp, 1_700_000_000_000,
+            "the remote mute was preserved away by an unrelated pending block"
+        );
+        assert!(preserved.contains(&"blocked"));
+        assert!(!preserved.contains(&"muted_until_timestamp"));
+    }
+
+    /// And the mirror image: a pending mute survives the pre-mute record,
+    /// while a block made on another device still lands.
+    #[test]
+    fn a_pending_mute_survives_but_takes_a_remote_block() {
+        let mut local = stored_contact();
+        local.blocked = false;
+        local.muted_until_timestamp = i64::MAX as u64;
+
+        let mut incoming = empty_record_contact();
+        incoming.blocked = true;
+        incoming.muted_until_timestamp = 0;
+
+        let preserved = merge_contact_from_snapshot(
+            &mut incoming,
+            local,
+            PendingPublish {
+                blocked: false,
+                muted: true,
+            },
+        );
+
+        assert_eq!(
+            incoming.muted_until_timestamp,
+            i64::MAX as u64,
+            "the pending mute was reverted"
+        );
+        assert!(incoming.blocked, "the remote block was preserved away");
+        assert!(preserved.contains(&"muted_until_timestamp"));
         assert!(!preserved.contains(&"blocked"));
     }
 
     #[test]
     fn empty_record_does_not_wipe_local_fields() {
         let mut incoming = empty_record_contact();
-        let preserved = merge_contact_from_snapshot(&mut incoming, stored_contact(), false);
+        let preserved =
+            merge_contact_from_snapshot(&mut incoming, stored_contact(), PendingPublish::default());
 
         assert_eq!(incoming.name, "Local Name");
         assert_eq!(incoming.profile_key, vec![7u8; 32]);
@@ -1012,7 +1181,8 @@ mod tests {
         incoming.profile_key = vec![9u8; 32];
         incoming.username = Some("remote.99".into());
 
-        let preserved = merge_contact_from_snapshot(&mut incoming, stored_contact(), false);
+        let preserved =
+            merge_contact_from_snapshot(&mut incoming, stored_contact(), PendingPublish::default());
 
         assert_eq!(incoming.name, "Renamed Remotely");
         assert_eq!(incoming.profile_key, vec![9u8; 32]);
@@ -1026,7 +1196,7 @@ mod tests {
         let mut incoming = empty_record_contact();
         incoming.name = "Renamed Remotely".into();
 
-        merge_contact_from_snapshot(&mut incoming, stored_contact(), false);
+        merge_contact_from_snapshot(&mut incoming, stored_contact(), PendingPublish::default());
 
         assert_eq!(incoming.expire_timer, 3600);
         assert_eq!(incoming.expire_timer_version, 9);
@@ -1037,7 +1207,11 @@ mod tests {
     #[test]
     fn nothing_is_preserved_when_the_store_is_also_empty() {
         let mut incoming = empty_record_contact();
-        let preserved = merge_contact_from_snapshot(&mut incoming, empty_record_contact(), false);
+        let preserved = merge_contact_from_snapshot(
+            &mut incoming,
+            empty_record_contact(),
+            PendingPublish::default(),
+        );
 
         assert!(preserved.is_empty());
         assert!(incoming.name.is_empty());

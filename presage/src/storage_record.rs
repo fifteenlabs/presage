@@ -18,6 +18,8 @@ use std::ops::Range;
 const STORAGE_RECORD_CONTACT: u32 = 1;
 /// `ContactRecord.blocked`.
 const CONTACT_RECORD_BLOCKED: u32 = 9;
+/// `ContactRecord.mutedUntilTimestamp`.
+const CONTACT_RECORD_MUTED_UNTIL: u32 = 13;
 
 const WIRE_VARINT: u8 = 0;
 const WIRE_I64: u8 = 1;
@@ -165,10 +167,10 @@ fn encode_tag(number: u32, wire_type: u8, out: &mut Vec<u8>) {
     encode_varint((u64::from(number) << 3) | u64::from(wire_type), out);
 }
 
-fn encode_bool_field(number: u32, value: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2);
+fn encode_varint_field(number: u32, value: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(11);
     encode_tag(number, WIRE_VARINT, &mut out);
-    out.push(u8::from(value));
+    encode_varint(value, &mut out);
     out
 }
 
@@ -191,47 +193,42 @@ fn contact_payload(record: &[u8]) -> Result<Range<usize>, EditError> {
     Ok(first.payload.clone())
 }
 
-/// Read `ContactRecord.blocked` out of an encoded `StorageRecord`.
-pub fn contact_blocked(record: &[u8]) -> Result<bool, EditError> {
+/// The last-wins varint value of field `number` inside the contact payload,
+/// or `0` when the field is absent (proto3 implicit presence).
+fn contact_varint_field(record: &[u8], number: u32) -> Result<u64, EditError> {
     let payload = contact_payload(record)?;
     let contact = &record[payload];
     let spans = scan(contact)?;
 
     // Repeated scalars are last-wins.
-    let Some(span) = spans
-        .iter()
-        .rev()
-        .find(|s| s.number == CONTACT_RECORD_BLOCKED)
-    else {
-        return Ok(false);
+    let Some(span) = spans.iter().rev().find(|s| s.number == number) else {
+        return Ok(0);
     };
 
     if span.wire_type != WIRE_VARINT {
-        // Field numbers are stable, so this is not a newer client's `blocked` —
-        // it is a record we should not be drawing conclusions from.
+        // Field numbers are stable, so this is not a newer client's copy of
+        // the field — it is a record we should not be drawing conclusions
+        // from.
         return Err(EditError::Malformed);
     }
 
     // Decode rather than look for a non-zero byte: `0x80 0x00` is a legal,
     // non-canonical encoding of zero, and its continuation bit would otherwise
-    // read as `true`.
+    // read as a value.
     let mut pos = span.payload.start;
-    Ok(read_varint(contact, &mut pos)? != 0)
+    read_varint(contact, &mut pos)
 }
 
-/// Set `ContactRecord.blocked` on an encoded `StorageRecord`, preserving every
-/// other byte of both messages.
-///
-/// `blocked = false` **removes** the field rather than writing an explicit zero.
-/// `blocked` has proto3 implicit presence, so its default is its absence, and
-/// removal is what Signal-Desktop and Signal-Android emit. An explicit zero is
-/// wire-legal and decodes identically, but no official client produces one.
-pub fn set_contact_blocked(record: &[u8], blocked: bool) -> Result<Vec<u8>, EditError> {
+/// Replace — or, with `None`, remove — one field inside the contact payload,
+/// preserving every other byte of both messages.
+fn set_contact_field(
+    record: &[u8],
+    number: u32,
+    replacement: Option<&[u8]>,
+) -> Result<Vec<u8>, EditError> {
     let payload = contact_payload(record)?;
     let contact = &record[payload];
-
-    let replacement = blocked.then(|| encode_bool_field(CONTACT_RECORD_BLOCKED, true));
-    let new_contact = set_field(contact, CONTACT_RECORD_BLOCKED, replacement.as_deref())?;
+    let new_contact = set_field(contact, number, replacement)?;
 
     // Splice the wrapper rather than rebuilding it. `StorageRecord` is a oneof,
     // so there is nothing else in there today — but reconstructing it would drop
@@ -242,6 +239,42 @@ pub fn set_contact_blocked(record: &[u8], blocked: bool) -> Result<Vec<u8>, Edit
         STORAGE_RECORD_CONTACT,
         Some(&encode_len_delimited(STORAGE_RECORD_CONTACT, &new_contact)),
     )
+}
+
+/// Read `ContactRecord.blocked` out of an encoded `StorageRecord`.
+pub fn contact_blocked(record: &[u8]) -> Result<bool, EditError> {
+    Ok(contact_varint_field(record, CONTACT_RECORD_BLOCKED)? != 0)
+}
+
+/// Set `ContactRecord.blocked` on an encoded `StorageRecord`, preserving every
+/// other byte of both messages.
+///
+/// `blocked = false` **removes** the field rather than writing an explicit zero.
+/// `blocked` has proto3 implicit presence, so its default is its absence, and
+/// removal is what Signal-Desktop and Signal-Android emit. An explicit zero is
+/// wire-legal and decodes identically, but no official client produces one.
+pub fn set_contact_blocked(record: &[u8], blocked: bool) -> Result<Vec<u8>, EditError> {
+    let replacement = blocked.then(|| encode_varint_field(CONTACT_RECORD_BLOCKED, 1));
+    set_contact_field(record, CONTACT_RECORD_BLOCKED, replacement.as_deref())
+}
+
+/// Read `ContactRecord.mutedUntilTimestamp` out of an encoded `StorageRecord`.
+/// Absent means not muted and reads as 0.
+pub fn contact_muted_until(record: &[u8]) -> Result<u64, EditError> {
+    contact_varint_field(record, CONTACT_RECORD_MUTED_UNTIL)
+}
+
+/// Set `ContactRecord.mutedUntilTimestamp` on an encoded `StorageRecord`,
+/// preserving every other byte of both messages.
+///
+/// `0` (not muted) **removes** the field rather than writing an explicit zero —
+/// the same proto3 implicit-presence convention as [`set_contact_blocked`], and
+/// what Signal-Desktop serializes on unmute. "Muted forever" is `i64::MAX`, a
+/// ten-byte varint.
+pub fn set_contact_muted_until(record: &[u8], muted_until: u64) -> Result<Vec<u8>, EditError> {
+    let replacement =
+        (muted_until != 0).then(|| encode_varint_field(CONTACT_RECORD_MUTED_UNTIL, muted_until));
+    set_contact_field(record, CONTACT_RECORD_MUTED_UNTIL, replacement.as_deref())
 }
 
 #[cfg(test)]
@@ -296,7 +329,7 @@ mod tests {
     #[test]
     fn unblocking_removes_the_field_rather_than_zeroing_it() {
         let mut contact = contact_with_unknown_field();
-        contact.extend_from_slice(&encode_bool_field(CONTACT_RECORD_BLOCKED, true));
+        contact.extend_from_slice(&encode_varint_field(CONTACT_RECORD_BLOCKED, 1));
         let record = storage_record(&contact);
 
         let unblocked = set_contact_blocked(&record, false).unwrap();
@@ -313,8 +346,8 @@ mod tests {
     #[test]
     fn duplicate_blocked_fields_collapse_to_one() {
         let mut contact = contact_with_unknown_field();
-        contact.extend_from_slice(&encode_bool_field(CONTACT_RECORD_BLOCKED, false));
-        contact.extend_from_slice(&encode_bool_field(CONTACT_RECORD_BLOCKED, true));
+        contact.extend_from_slice(&encode_varint_field(CONTACT_RECORD_BLOCKED, 0));
+        contact.extend_from_slice(&encode_varint_field(CONTACT_RECORD_BLOCKED, 1));
         let record = storage_record(&contact);
 
         // Last-wins, so the record currently reads as blocked.
@@ -346,6 +379,83 @@ mod tests {
     fn unblocking_an_already_unblocked_record_is_a_no_op() {
         let record = storage_record(&contact_with_unknown_field());
         assert_eq!(set_contact_blocked(&record, false).unwrap(), record);
+    }
+
+    /// "Muted forever" is `i64::MAX` — a ten-byte varint, the encoder's and
+    /// decoder's worst case.
+    #[test]
+    fn mute_round_trips_including_forever() {
+        let record = storage_record(&contact_with_unknown_field());
+        assert_eq!(contact_muted_until(&record).unwrap(), 0);
+
+        let muted = set_contact_muted_until(&record, i64::MAX as u64).unwrap();
+        assert_eq!(contact_muted_until(&muted).unwrap(), i64::MAX as u64);
+
+        let payload = contact_payload(&muted).unwrap();
+        let contact = &muted[payload];
+        assert!(
+            contact.windows(15).any(|w| w == b"from the future"),
+            "unknown field was dropped"
+        );
+    }
+
+    #[test]
+    fn mute_then_unmute_restores_the_original_bytes() {
+        let record = storage_record(&contact_with_unknown_field());
+
+        let muted = set_contact_muted_until(&record, 1_700_000_000_000).unwrap();
+        assert_ne!(muted, record);
+
+        let unmuted = set_contact_muted_until(&muted, 0).unwrap();
+        assert_eq!(
+            unmuted, record,
+            "toggling must not accumulate bytes or reorder fields"
+        );
+    }
+
+    #[test]
+    fn unmuting_removes_the_field_rather_than_zeroing_it() {
+        let mut contact = contact_with_unknown_field();
+        contact.extend_from_slice(&encode_varint_field(
+            CONTACT_RECORD_MUTED_UNTIL,
+            1_700_000_000_000,
+        ));
+        let record = storage_record(&contact);
+
+        let unmuted = set_contact_muted_until(&record, 0).unwrap();
+        let payload = contact_payload(&unmuted).unwrap();
+        let inner = scan(&unmuted[payload]).unwrap();
+
+        assert!(
+            !inner.iter().any(|s| s.number == CONTACT_RECORD_MUTED_UNTIL),
+            "field 13 should be absent, not present-and-zero"
+        );
+        assert_eq!(contact_muted_until(&unmuted).unwrap(), 0);
+    }
+
+    #[test]
+    fn mute_with_the_wrong_wire_type_is_rejected() {
+        let mut contact = contact_with_unknown_field();
+        contact.extend_from_slice(&encode_len_delimited(
+            CONTACT_RECORD_MUTED_UNTIL,
+            b"not a varint",
+        ));
+        let record = storage_record(&contact);
+
+        assert_eq!(contact_muted_until(&record), Err(EditError::Malformed));
+    }
+
+    /// Editing one field must not disturb the other — block and mute share the
+    /// record and the publish path settles both in one write.
+    #[test]
+    fn block_and_mute_edits_compose() {
+        let record = storage_record(&contact_with_unknown_field());
+
+        let blocked = set_contact_blocked(&record, true).unwrap();
+        let both = set_contact_muted_until(&blocked, 42).unwrap();
+
+        assert!(contact_blocked(&both).unwrap());
+        assert_eq!(contact_muted_until(&both).unwrap(), 42);
     }
 
     #[test]
@@ -432,7 +542,7 @@ mod tests {
     #[test]
     fn every_wire_type_round_trips_untouched() {
         let mut contact = Vec::new();
-        contact.extend_from_slice(&encode_bool_field(2, true)); // varint
+        contact.extend_from_slice(&encode_varint_field(2, 1)); // varint
         contact.push(0x11); // field 2, wire type 1 (i64)
         contact.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         contact.extend_from_slice(&encode_len_delimited(6, b"Ada"));
