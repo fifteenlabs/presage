@@ -271,6 +271,23 @@ pub trait ContentsStore: Send + Sync {
         message: Content,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
+    /// Save a message whose arrival time is already known, instead of letting
+    /// the store read the clock. A linked-device backup replays history the
+    /// exporting device received long ago; stamping those rows with the import
+    /// time sorts every imported conversation to the top of the app's list, and
+    /// the real arrival is gone by the time anything notices.
+    ///
+    /// Default impl drops the arrival time and delegates, so stores that don't
+    /// model it still compile.
+    fn save_message_received_at(
+        &self,
+        thread: &Thread,
+        message: Content,
+        _received_at_ms: u64,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> {
+        self.save_message(thread, message)
+    }
+
     /// Delete a single message, identified by its received timestamp from a thread.
     /// Useful when you want to delete a message locally only.
     fn delete_message(
@@ -314,24 +331,21 @@ pub trait ContentsStore: Send + Sync {
         async { Ok(()) }
     }
 
-    /// Restore per-message read / delivery state and arrival time decoded from a
-    /// linked-device backup `ChatItem` (the wire `Content` produced by the
-    /// converter can't carry any of it). `read` is `Some` for incoming (was it
-    /// read on the primary device), `None` for outgoing. `send_states` is the
-    /// per-recipient `(recipient_service_id, status, updated_at_ms)` for
-    /// outgoing (empty for incoming). `date_received` is the backup's
-    /// `dateReceived` — when the exporting device learned of the message —
-    /// which a store that orders history by arrival needs in order to place the
-    /// row where the primary device had it. Called once per ChatItem just after
-    /// `save_message`. Default no-op so stores that don't model this still
-    /// compile; persistent stores override it.
+    /// Restore per-message read / delivery state decoded from a linked-device
+    /// backup `ChatItem` (the wire `Content` produced by the converter can't
+    /// carry either). `read` is `Some` for incoming (was it read on the primary
+    /// device), `None` for outgoing. `send_states` is the per-recipient
+    /// `(recipient_service_id, status, updated_at_ms)` for outgoing (empty for
+    /// incoming). Arrival time is not restored here — it is stamped as the row
+    /// is written, by [`Self::save_message_received_at`]. Called once per
+    /// ChatItem just after the save. Default no-op so stores that don't model
+    /// this still compile; persistent stores override it.
     fn restore_backup_message_state(
         &self,
         _thread: &Thread,
         _ts: u64,
         _read: Option<bool>,
         _send_states: &[(String, BackupSendStatus, u64)],
-        _date_received: Option<u64>,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
         async { Ok(()) }
     }

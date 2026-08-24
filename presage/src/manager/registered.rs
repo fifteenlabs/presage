@@ -2350,8 +2350,11 @@ impl<S: Store> Manager<S, Registered> {
                     }
                 }
                 Some(FrameItem::ChatItem(ci)) => {
-                    for (content, thread) in
-                        convert::chat_item_to_contents(&ci, &recipients, &chats, aci)
+                    for convert::ImportedContent {
+                        content,
+                        thread,
+                        received_at_ms,
+                    } in convert::chat_item_to_contents(&ci, &recipients, &chats, aci)
                     {
                         // Synthesised sync `call_event` rows route through
                         // `ingest_call_event` so the same load + state machine +
@@ -2361,15 +2364,17 @@ impl<S: Store> Manager<S, Registered> {
                         // hand the state machine its `CallEventInfo`.
                         let call_info = extract_call_event(&content.body);
                         let call_peer = CallPeer::from_thread(&thread);
-                        self.store.save_message(&thread, content).await?;
+                        self.store
+                            .save_message_received_at(&thread, content, received_at_ms)
+                            .await?;
                         if let (Some(info), Some(peer)) = (call_info, call_peer) {
                             self.store.ingest_call_event(&info, &peer).await?;
                         }
                     }
-                    // Restore read / delivery state and arrival time — none of
-                    // which the wire `Content` can carry — so linked history
-                    // shows correct unread badges, outgoing ticks, and the same
-                    // ordering the primary device had.
+                    // Restore read / delivery state — neither of which the wire
+                    // `Content` can carry — so linked history shows correct
+                    // unread badges and outgoing ticks. Arrival time came in
+                    // with the row itself, above.
                     if let Some(state) = convert::chat_item_backup_state(&ci, &recipients, &chats) {
                         if let Err(e) = self
                             .store
@@ -2378,7 +2383,6 @@ impl<S: Store> Manager<S, Registered> {
                                 state.ts,
                                 state.read,
                                 &state.send_states,
-                                state.date_received,
                             )
                             .await
                         {

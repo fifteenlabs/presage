@@ -218,7 +218,7 @@ fn reactions_to_contents(
     recipients: &HashMap<u64, RecipientInfo>,
     thread: &Thread,
     our_aci: Aci,
-) -> Vec<(Content, Thread)> {
+) -> Vec<ImportedContent> {
     let parent_author_aci = recipients
         .get(&parent_item.author_id)
         .and_then(|r| r.service_id)
@@ -275,8 +275,8 @@ fn reactions_to_contents(
                 )
             };
 
-            Some((
-                Content {
+            Some(ImportedContent {
+                content: Content {
                     metadata: Metadata {
                         sender,
                         destination,
@@ -297,13 +297,42 @@ fn reactions_to_contents(
                     },
                     body,
                 },
-                thread.clone(),
-            ))
+                thread: thread.clone(),
+                // A backup `Reaction` carries only when it was sent, so that is
+                // the best arrival there is for it.
+                received_at_ms: reaction.sent_timestamp,
+            })
         })
         .collect()
 }
 
-/// Converts a single backup `ChatItem` into zero or more `(Content, Thread)` pairs.
+/// A row the import is about to write, together with the arrival time it must
+/// be stamped with. The importer cannot read the clock for this: a backup
+/// replays history the exporting device received long ago, and stamping it
+/// `now` makes every imported conversation look like it arrived this second.
+pub struct ImportedContent {
+    pub content: Content,
+    pub thread: Thread,
+    /// When the exporting device learned of this row — `dateReceived` for a
+    /// directional message, and the row's own timestamp for everything the
+    /// backup dates but does not address to a direction (reactions, call
+    /// updates, block/unblock rows).
+    pub received_at_ms: u64,
+}
+
+/// When a message reached the exporting device. Only a directional `ChatItem`
+/// records that; a `0` there means the backup left it out, and the send time
+/// stands in, the same substitution migration 17 made for the whole column.
+fn chat_item_arrival_ms(item: &ChatItem) -> u64 {
+    let date_received = match item.directional_details.as_ref() {
+        Some(DirectionalDetails::Incoming(inc)) => Some(inc.date_received),
+        Some(DirectionalDetails::Outgoing(out)) => Some(out.date_received),
+        _ => None,
+    };
+    date_received.filter(|ms| *ms > 0).unwrap_or(item.date_sent)
+}
+
+/// Converts a single backup `ChatItem` into zero or more rows to import.
 ///
 /// Returns the main message first, followed by one entry per reaction (each reconstructed
 /// as its own `DataMessage::reaction` envelope, matching Signal's wire format).
@@ -317,7 +346,7 @@ pub fn chat_item_to_contents(
     recipients: &HashMap<u64, RecipientInfo>,
     chats: &HashMap<u64, Thread>,
     our_aci: Aci,
-) -> Vec<(Content, Thread)> {
+) -> Vec<ImportedContent> {
     let Some(thread) = chats.get(&item.chat_id).cloned() else {
         return vec![];
     };
@@ -347,8 +376,10 @@ pub fn chat_item_to_contents(
 }
 
 /// Restored state for a backup message row that the wire `Content` cannot
-/// carry: read state, per-recipient send status, and when the message reached
-/// the device that made the backup.
+/// carry: read state and per-recipient send status. Arrival time is not among
+/// them — it is stamped at save time from [`ImportedContent`], which also
+/// reaches the rows this hook cannot address: directionless updates, and
+/// reactions, whose row is keyed by their own timestamp rather than the item's.
 pub struct BackupMessageState {
     pub thread: Thread,
     /// The message's sent timestamp — how the row is addressed.
@@ -356,17 +387,12 @@ pub struct BackupMessageState {
     /// `Some` for incoming rows, `None` for outgoing.
     pub read: Option<bool>,
     pub send_states: Vec<(String, BackupSendStatus, u64)>,
-    /// `dateReceived` from the backup: when the exporting device learned of this
-    /// message. Restoring it keeps imported history in the order the primary
-    /// device showed it, rather than re-deriving an order from send timestamps.
-    /// `None` when the backup omitted it.
-    pub date_received: Option<u64>,
 }
 
-/// Extract read / per-recipient send state and arrival time from a backup
-/// `ChatItem` so the store can restore them after the row is saved — the wire
-/// `Content` the converter produces carries none of it. Returns `None` when the
-/// chat is unknown or directional details are absent.
+/// Extract read / per-recipient send state from a backup `ChatItem` so the
+/// store can restore them after the row is saved — the wire `Content` the
+/// converter produces carries neither. Returns `None` when the chat is unknown
+/// or directional details are absent.
 pub fn chat_item_backup_state(
     item: &ChatItem,
     recipients: &HashMap<u64, RecipientInfo>,
@@ -380,7 +406,6 @@ pub fn chat_item_backup_state(
             ts,
             read: Some(inc.read),
             send_states: Vec::new(),
-            date_received: Some(inc.date_received),
         }),
         DirectionalDetails::Outgoing(out) => {
             let send_states = out
@@ -409,7 +434,6 @@ pub fn chat_item_backup_state(
                 ts,
                 read: None,
                 send_states,
-                date_received: Some(out.date_received),
             })
         }
         _ => None, // Directionless
@@ -426,7 +450,7 @@ fn standard_message_to_contents(
     recipients: &HashMap<u64, RecipientInfo>,
     our_aci: Aci,
     timestamp: u64,
-) -> Vec<(Content, Thread)> {
+) -> Vec<ImportedContent> {
     let dm = DataMessage {
         body: sm.text.as_ref().map(|t| t.body.clone()),
         body_ranges: backup_body_ranges_to_wire(sm.text.as_ref()),
@@ -467,7 +491,7 @@ fn sticker_message_to_contents(
     recipients: &HashMap<u64, RecipientInfo>,
     our_aci: Aci,
     timestamp: u64,
-) -> Vec<(Content, Thread)> {
+) -> Vec<ImportedContent> {
     let dm = DataMessage {
         sticker: sm.sticker.as_ref().map(backup_sticker_to_dm_sticker),
         timestamp: Some(timestamp),
@@ -496,7 +520,7 @@ fn wrap_dm_with_reactions(
     recipients: &HashMap<u64, RecipientInfo>,
     our_aci: Aci,
     timestamp: u64,
-) -> Vec<(Content, Thread)> {
+) -> Vec<ImportedContent> {
     let is_outgoing = match item.directional_details.as_ref() {
         Some(DirectionalDetails::Outgoing(_)) => true,
         Some(DirectionalDetails::Incoming(_)) => false,
@@ -555,7 +579,11 @@ fn wrap_dm_with_reactions(
         body,
     };
 
-    let mut results = vec![(main_content, thread.clone())];
+    let mut results = vec![ImportedContent {
+        content: main_content,
+        thread: thread.clone(),
+        received_at_ms: chat_item_arrival_ms(item),
+    }];
     results.extend(reactions_to_contents(
         reactions, item, recipients, thread, our_aci,
     ));
@@ -571,7 +599,7 @@ fn individual_call_to_contents(
     thread: &Thread,
     our_aci: Aci,
     fallback_ts: u64,
-) -> Vec<(Content, Thread)> {
+) -> Vec<ImportedContent> {
     use backup::chat_update_message::Update;
     use backup::individual_call;
     use sync_message::call_event::{Direction as WireDir, Event as WireEvent, Type as WireType};
@@ -649,7 +677,11 @@ fn individual_call_to_contents(
         body,
     };
 
-    vec![(main_content, thread.clone())]
+    vec![ImportedContent {
+        content: main_content,
+        thread: thread.clone(),
+        received_at_ms: call_ts,
+    }]
 }
 
 /// Convert a backup `ChatUpdateMessage` carrying a `SimpleChatUpdate` of type
@@ -663,7 +695,7 @@ fn simple_update_to_contents(
     thread: &Thread,
     our_aci: Aci,
     timestamp: u64,
-) -> Vec<(Content, Thread)> {
+) -> Vec<ImportedContent> {
     use backup::chat_update_message::Update;
     use backup::simple_chat_update::Type as SimpleType;
     use sync_message::message_request_response::Type as MrrType;
@@ -710,7 +742,11 @@ fn simple_update_to_contents(
         body,
     };
 
-    vec![(main_content, thread.clone())]
+    vec![ImportedContent {
+        content: main_content,
+        thread: thread.clone(),
+        received_at_ms: timestamp,
+    }]
 }
 
 /// Convert a backup `ChatUpdateMessage` carrying a `GroupCall` into a synthetic
@@ -725,7 +761,7 @@ fn group_call_to_contents(
     recipients: &HashMap<u64, RecipientInfo>,
     our_aci: Aci,
     fallback_ts: u64,
-) -> Vec<(Content, Thread)> {
+) -> Vec<ImportedContent> {
     use backup::chat_update_message::Update;
     use backup::group_call;
     use libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
@@ -822,7 +858,11 @@ fn group_call_to_contents(
         body,
     };
 
-    vec![(main_content, thread.clone())]
+    vec![ImportedContent {
+        content: main_content,
+        thread: thread.clone(),
+        received_at_ms: call_ts,
+    }]
 }
 
 /// Build a presage `Contact` from a backup `Recipient` whose destination is a
@@ -1025,7 +1065,8 @@ mod tests {
                 start: 0,
                 length: 1,
                 associated_value: Some(backup::body_range::AssociatedValue::MentionAci(vec![
-                    1u8; 16
+                    1u8;
+                    16
                 ])),
             }],
         }
@@ -1058,9 +1099,17 @@ mod tests {
         )])
     }
 
+    fn our_aci() -> Aci {
+        Aci::from(Uuid::from_bytes([7u8; 16]))
+    }
+
+    fn sender_thread() -> Thread {
+        Thread::Contact(ServiceId::Aci(Aci::from(Uuid::from_bytes([9u8; 16]))))
+    }
+
     fn incoming_data_message(sm: &backup::StandardMessage) -> DataMessage {
-        let our_aci = Aci::from(Uuid::from_bytes([7u8; 16]));
-        let thread = Thread::Contact(ServiceId::Aci(Aci::from(Uuid::from_bytes([9u8; 16]))));
+        let our_aci = our_aci();
+        let thread = sender_thread();
         let item = incoming_item();
         let contents = standard_message_to_contents(
             sm,
@@ -1070,7 +1119,13 @@ mod tests {
             our_aci,
             item.date_sent,
         );
-        match contents.into_iter().next().expect("one content").0.body {
+        match contents
+            .into_iter()
+            .next()
+            .expect("one content")
+            .content
+            .body
+        {
             ContentBody::DataMessage(dm) => dm,
             other => panic!("expected a DataMessage, got {other:?}"),
         }
@@ -1155,6 +1210,84 @@ mod tests {
                 backup::body_range::Style::Bold as i32
             ))
         );
+    }
+
+    fn sender_chats() -> HashMap<u64, Thread> {
+        HashMap::from([(10, sender_thread())])
+    }
+
+    fn imported(item: &ChatItem) -> Vec<ImportedContent> {
+        chat_item_to_contents(item, &sender_recipients(), &sender_chats(), our_aci())
+    }
+
+    /// Every row an import writes has to carry the arrival the backup recorded.
+    /// Stamping any of them with the clock at import time sorts the whole
+    /// conversation to the top of the app's chat list, and the reaction and
+    /// call rows are the ones no after-the-fact repair can reach: they are
+    /// keyed by their own timestamp, or carry no direction to repair from.
+    #[test]
+    fn every_imported_row_carries_the_arrival_the_backup_recorded() {
+        let mut item = incoming_item();
+        item.item = Some(Item::StandardMessage(backup::StandardMessage {
+            text: Some(backup::Text {
+                body: "hi".to_string(),
+                body_ranges: Vec::new(),
+            }),
+            reactions: vec![backup::Reaction {
+                emoji: "❤️".to_string(),
+                author_id: 1,
+                sent_timestamp: 1700000500000,
+                sort_order: 0,
+            }],
+            ..Default::default()
+        }));
+
+        let rows = imported(&item);
+        assert_eq!(rows.len(), 2, "expected the message and its reaction");
+        assert_eq!(
+            rows[0].received_at_ms, 1700000000001,
+            "the message lost the dateReceived the backup carried"
+        );
+        assert_eq!(
+            rows[1].received_at_ms, 1700000500000,
+            "the reaction did not keep its own send time — the only time a \
+             backup Reaction records"
+        );
+
+        // A backup that omits dateReceived leaves a 0 behind; falling back to
+        // the send time is what migration 17 did when it seeded the column.
+        let mut undated = item.clone();
+        undated.directional_details = Some(DirectionalDetails::Incoming(
+            backup::chat_item::IncomingMessageDetails {
+                date_received: 0,
+                read: true,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(imported(&undated)[0].received_at_ms, undated.date_sent);
+
+        // A call update has no direction at all, so nothing about it can be
+        // repaired after the save; it arrives when the call happened.
+        let call = ChatItem {
+            chat_id: 10,
+            author_id: 1,
+            date_sent: 1700000000000,
+            directional_details: None,
+            item: Some(Item::UpdateMessage(backup::ChatUpdateMessage {
+                update: Some(backup::chat_update_message::Update::IndividualCall(
+                    backup::IndividualCall {
+                        call_id: Some(77),
+                        state: backup::individual_call::State::Missed as i32,
+                        started_call_timestamp: 1699000000000,
+                        ..Default::default()
+                    },
+                )),
+            })),
+            ..Default::default()
+        };
+        let rows = imported(&call);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].received_at_ms, 1699000000000);
     }
 
     #[test]
