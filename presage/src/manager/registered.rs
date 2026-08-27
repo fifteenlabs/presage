@@ -24,7 +24,10 @@ use libsignal_service::{
     },
     libsignal_account_keys::AccountEntropyPool,
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
-    prelude::{phonenumber::PhoneNumber, MasterKey, MessageSenderError, ProtobufMessage, Uuid},
+    prelude::{
+        phonenumber::PhoneNumber, MasterKey, MessageSenderError, ProtobufMessage, ServiceError,
+        Uuid,
+    },
     profile_cipher::ProfileCipher,
     proto::{
         data_message::Delete,
@@ -55,7 +58,7 @@ use libsignal_service::{
     },
     AccountManager, Profile, ProfileCredentialRequest, ServiceIdExt,
 };
-use rand::{rng, rngs::StdRng, RngCore, SeedableRng};
+use rand::{rng, rngs::StdRng, CryptoRng, Rng, RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::io::AsyncWriteExt;
@@ -74,7 +77,10 @@ use crate::serde::serde_profile_key;
 // the protobuf module of the same name.
 use super::storage::{contact_profile_key, merge_contact_from_snapshot, pending_publish_intent};
 use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
-use crate::{model::groups::Group, AvatarBytes, Error, Manager};
+use crate::{
+    model::groups::{Group, GroupUpdate},
+    AvatarBytes, Error, Manager,
+};
 
 pub use crate::model::messages::Received;
 
@@ -578,12 +584,7 @@ impl<S: Store> Manager<S, Registered> {
         // Read back rather than trusting the write's response body, whose shape differs
         // between endpoint versions. This also makes the local copy canonically the
         // server's, revision included.
-        let group = decrypt_group(
-            &master_key_bytes,
-            groups_manager
-                .fetch_encrypted_group(&mut csprng, &master_key_bytes)
-                .await?,
-        )?;
+        let group = fetch_group(&mut groups_manager, &mut csprng, &master_key_bytes).await?;
         self.store.save_group(master_key_bytes, group).await?;
 
         // Our own linked devices learn about the group from the storage manifest, not from
@@ -626,6 +627,77 @@ impl<S: Store> Manager<S, Registered> {
         // to this group. `Manager::send_message_to_group` saves it locally as it sends, so
         // that is also what gives the creator its own "created the group" row.
         Ok(master_key_bytes)
+    }
+
+    /// Change a group's attributes in one revision.
+    ///
+    /// Everything set on `update` goes into a single change, so the members see one
+    /// revision bump however many fields moved. The change is built against the stored
+    /// revision; when another client got there first the server refuses it, and the
+    /// group is refetched and the change rebuilt against what it became — a few times,
+    /// after which the conflict is returned. The group is then read back and saved, as
+    /// `create_group` does, so the local copy is canonically the server's.
+    ///
+    /// The members are NOT notified here, for the reason `create_group` gives. The
+    /// returned context carries the change as the server signed it: send it to the
+    /// group in a `DataMessage` whose only payload is `group_v2`, and every member
+    /// applies it without fetching, while `send_message_to_group` saves it locally as
+    /// the editor's own "changed the group" row.
+    pub async fn update_group(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        update: GroupUpdate,
+    ) -> Result<GroupContextV2, Error<S::Error>> {
+        if update.is_empty() {
+            return Err(Error::EmptyGroupUpdate);
+        }
+        // Seeded from the OS so the future stays `Send` — see `upsert_group`.
+        let mut csprng = StdRng::from_os_rng();
+        let operations = GroupOperations::new(GroupSecretParams::derive_from_master_key(
+            GroupMasterKey::new(*master_key_bytes),
+        ));
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+
+        let Some(local) = self.store.group(*master_key_bytes).await? else {
+            return Err(Error::UnknownGroup);
+        };
+        let mut revision = local.revision;
+        let mut conflicts = 0;
+        let (signed_change, applied_revision) = loop {
+            let version = revision + 1;
+            let actions = group_update_actions(&operations, &update, version, &mut csprng);
+            match groups_manager
+                .patch_group(&mut csprng, master_key_bytes, actions)
+                .await
+            {
+                Ok(change) => break (change, version),
+                Err(ServiceError::GroupChangeConflict)
+                    if conflicts < GROUP_UPDATE_CONFLICT_RETRIES =>
+                {
+                    conflicts += 1;
+                    let server =
+                        fetch_group(&mut groups_manager, &mut csprng, master_key_bytes).await?;
+                    debug!(
+                        from = revision,
+                        to = server.version,
+                        "the group moved under the update; rebuilding the change"
+                    );
+                    revision = server.version;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+
+        let server = fetch_group(&mut groups_manager, &mut csprng, master_key_bytes).await?;
+        self.store
+            .save_group(*master_key_bytes, Group::from_server(server, Some(&local)))
+            .await?;
+
+        Ok(GroupContextV2 {
+            master_key: Some(master_key_bytes.to_vec()),
+            revision: Some(applied_revision),
+            group_change: Some(signed_change.encode_to_vec()),
+        })
     }
 
     /// One member's credential, or `None` with a reason logged. Never fails the caller.
@@ -2498,22 +2570,72 @@ fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64)
     }
 }
 
+/// How many times `update_group` rebuilds a change the server refused as stale before
+/// handing the conflict to the caller. Signal-Android allows five; a settings edit that
+/// loses three races in a row is contending with something the user should see.
+const GROUP_UPDATE_CONFLICT_RETRIES: u32 = 3;
+
+/// The server's current copy of a group, decrypted.
+async fn fetch_group<E: std::error::Error>(
+    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    csprng: &mut StdRng,
+    master_key_bytes: &[u8],
+) -> Result<libsignal_service::groups_v2::Group, Error<E>> {
+    let encrypted = groups_manager
+        .fetch_encrypted_group(csprng, master_key_bytes)
+        .await?;
+    Ok(decrypt_group(master_key_bytes, encrypted)?)
+}
+
+fn group_update_actions<R: Rng + CryptoRng>(
+    operations: &GroupOperations,
+    update: &GroupUpdate,
+    version: u32,
+    rng: &mut R,
+) -> libsignal_service::proto::group_change::Actions {
+    libsignal_service::proto::group_change::Actions {
+        version,
+        modify_title: update
+            .title
+            .as_deref()
+            .map(|title| operations.build_modify_title_action(title, rng)),
+        modify_description: update
+            .description
+            .as_deref()
+            .map(|description| operations.build_modify_description_action(description, rng)),
+        modify_disappearing_message_timer: update.expire_timer_seconds.map(|duration| {
+            operations.build_modify_disappearing_messages_timer_action(&Timer { duration }, rng)
+        }),
+        modify_attributes_access: update
+            .attributes_access
+            .map(|access| operations.build_modify_attributes_access_action(access.into())),
+        modify_member_access: update
+            .members_access
+            .map(|access| operations.build_modify_members_access_action(access.into())),
+        ..Default::default()
+    }
+}
+
 async fn upsert_group<S: Store>(
     store: &S,
     groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
     master_key_bytes: &[u8],
     revision: &u32,
 ) -> Result<Option<Group>, Error<S::Error>> {
-    let upsert_group = match store.group(master_key_bytes.try_into()?).await {
+    let local = match store.group(master_key_bytes.try_into()?).await {
         Ok(Some(group)) => {
             debug!(group_name =? group.title, "loaded group from local db");
-            group.revision < *revision
+            Some(group)
         }
-        Ok(None) => true,
+        Ok(None) => None,
         Err(error) => {
             warn!(%error, "failed to retrieve group from local db");
-            true
+            None
         }
+    };
+    let upsert_group = match &local {
+        Some(group) => group.revision < *revision,
+        None => true,
     };
 
     if upsert_group {
@@ -2528,7 +2650,10 @@ async fn upsert_group<S: Store>(
             .await
         {
             Ok(encrypted_group) => {
-                let group = decrypt_group(master_key_bytes, encrypted_group)?;
+                let group = Group::from_server(
+                    decrypt_group(master_key_bytes, encrypted_group)?,
+                    local.as_ref(),
+                );
                 if let Err(error) = store.save_group(master_key_bytes.try_into()?, group).await {
                     error!(%error, "failed to save group");
                 }
@@ -2555,8 +2680,11 @@ async fn hydrate_group<S: Store>(
         .await
     {
         Ok(encrypted_group) => {
-            let mut group: Group = decrypt_group(master_key.as_ref(), encrypted_group)?.into();
-            group.needs_hydration = false;
+            let local = store.group(master_key).await.ok().flatten();
+            let group = Group::from_server(
+                decrypt_group(master_key.as_ref(), encrypted_group)?,
+                local.as_ref(),
+            );
             if let Err(e) = store.save_group(master_key, group).await {
                 error!(%e, "hydrate_group: failed to save group");
             }
@@ -3041,6 +3169,34 @@ mod tests {
     };
 
     use futures::io::{AsyncRead, Cursor};
+
+    #[test]
+    fn group_update_actions_carry_only_what_was_set() {
+        let operations = GroupOperations::new(GroupSecretParams::derive_from_master_key(
+            GroupMasterKey::new([7u8; 32]),
+        ));
+        let mut rng = StdRng::from_os_rng();
+        let update = GroupUpdate {
+            title: Some("Renamed".into()),
+            expire_timer_seconds: Some(0),
+            members_access: Some(crate::model::groups::GroupAccess::Administrators),
+            ..Default::default()
+        };
+
+        let actions = group_update_actions(&operations, &update, 9, &mut rng);
+
+        assert_eq!(actions.version, 9);
+        assert!(actions.source_user_id.is_empty());
+        assert!(actions.group_id.is_empty());
+        assert!(actions.modify_title.is_some());
+        assert!(actions.modify_description.is_none());
+        assert!(actions.modify_disappearing_message_timer.is_some());
+        assert!(actions.modify_attributes_access.is_none());
+        assert_eq!(
+            actions.modify_member_access.map(|a| a.members_access),
+            Some(i32::from(AccessRequired::Administrator))
+        );
+    }
 
     #[test]
     fn newer_expire_timer_version_wins() {
