@@ -584,12 +584,7 @@ impl<S: Store> Manager<S, Registered> {
         // Read back rather than trusting the write's response body, whose shape differs
         // between endpoint versions. This also makes the local copy canonically the
         // server's, revision included.
-        let group = decrypt_group(
-            &master_key_bytes,
-            groups_manager
-                .fetch_encrypted_group(&mut csprng, &master_key_bytes)
-                .await?,
-        )?;
+        let group = fetch_group(&mut groups_manager, &mut csprng, &master_key_bytes).await?;
         self.store.save_group(master_key_bytes, group).await?;
 
         // Our own linked devices learn about the group from the storage manifest, not from
@@ -643,12 +638,11 @@ impl<S: Store> Manager<S, Registered> {
     /// after which the conflict is returned. The group is then read back and saved, as
     /// `create_group` does, so the local copy is canonically the server's.
     ///
-    /// The members are NOT notified here, for the reason `create_group` gives: that is
-    /// a plain message send and belongs on the caller's durable queue. The returned
-    /// context carries the change as the server signed it. Send it to the group in a
-    /// `DataMessage` whose only payload is `group_v2`, and every member applies it
-    /// without fetching; `send_message_to_group` also saves it locally, which is what
-    /// gives the editor their own "changed the group" row.
+    /// The members are NOT notified here, for the reason `create_group` gives. The
+    /// returned context carries the change as the server signed it: send it to the
+    /// group in a `DataMessage` whose only payload is `group_v2`, and every member
+    /// applies it without fetching, while `send_message_to_group` saves it locally as
+    /// the editor's own "changed the group" row.
     pub async fn update_group(
         &mut self,
         master_key_bytes: &GroupMasterKeyBytes,
@@ -681,12 +675,8 @@ impl<S: Store> Manager<S, Registered> {
                     if conflicts < GROUP_UPDATE_CONFLICT_RETRIES =>
                 {
                     conflicts += 1;
-                    let server = decrypt_group(
-                        master_key_bytes,
-                        groups_manager
-                            .fetch_encrypted_group(&mut csprng, master_key_bytes)
-                            .await?,
-                    )?;
+                    let server =
+                        fetch_group(&mut groups_manager, &mut csprng, master_key_bytes).await?;
                     debug!(
                         from = revision,
                         to = server.version,
@@ -698,12 +688,7 @@ impl<S: Store> Manager<S, Registered> {
             }
         };
 
-        let server = decrypt_group(
-            master_key_bytes,
-            groups_manager
-                .fetch_encrypted_group(&mut csprng, master_key_bytes)
-                .await?,
-        )?;
+        let server = fetch_group(&mut groups_manager, &mut csprng, master_key_bytes).await?;
         self.store
             .save_group(*master_key_bytes, Group::from_server(server, Some(&local)))
             .await?;
@@ -2589,6 +2574,18 @@ fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64)
 /// handing the conflict to the caller. Signal-Android allows five; a settings edit that
 /// loses three races in a row is contending with something the user should see.
 const GROUP_UPDATE_CONFLICT_RETRIES: u32 = 3;
+
+/// The server's current copy of a group, decrypted.
+async fn fetch_group<E: std::error::Error>(
+    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    csprng: &mut StdRng,
+    master_key_bytes: &[u8],
+) -> Result<libsignal_service::groups_v2::Group, Error<E>> {
+    let encrypted = groups_manager
+        .fetch_encrypted_group(csprng, master_key_bytes)
+        .await?;
+    Ok(decrypt_group(master_key_bytes, encrypted)?)
+}
 
 fn group_update_actions<R: Rng + CryptoRng>(
     operations: &GroupOperations,
