@@ -22,6 +22,44 @@ fn default_access_required() -> AccessRequired {
     AccessRequired::Member
 }
 
+/// Who a group lets do something: any member, or only its administrators.
+///
+/// The narrow form of [`AccessRequired`] for the attribute and membership rules; the
+/// other variants belong to the invite-link rule, and the server rejects them here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupAccess {
+    Members,
+    Administrators,
+}
+
+impl From<GroupAccess> for AccessRequired {
+    fn from(access: GroupAccess) -> Self {
+        match access {
+            GroupAccess::Members => AccessRequired::Member,
+            GroupAccess::Administrators => AccessRequired::Administrator,
+        }
+    }
+}
+
+/// The attributes a group change can carry, for [`Manager::update_group`](crate::Manager::update_group).
+///
+/// `None` leaves a field as it is. An empty description clears it; a zero timer turns
+/// disappearing messages off.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupUpdate {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub expire_timer_seconds: Option<u32>,
+    pub attributes_access: Option<GroupAccess>,
+    pub members_access: Option<GroupAccess>,
+}
+
+impl GroupUpdate {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Group {
     pub title: Option<String>,
@@ -85,6 +123,29 @@ pub struct RequestingMember {
     #[debug(ignore)]
     pub profile_key: ProfileKey,
     pub timestamp: u64,
+}
+
+impl Group {
+    /// The server's copy of a group, keeping what only this device knows.
+    ///
+    /// The storage-service flags — blocked, muted, archived and the rest — never come
+    /// from the group server, so `From<libsignal_service::groups_v2::Group>` has to zero
+    /// them. Saving that over a stored group would silently un-mute or un-block it;
+    /// this carries them across from `local` instead.
+    pub fn from_server(server: libsignal_service::groups_v2::Group, local: Option<&Group>) -> Self {
+        let mut group: Group = server.into();
+        if let Some(local) = local {
+            group.blocked = local.blocked;
+            group.whitelisted = local.whitelisted;
+            group.archived = local.archived;
+            group.marked_unread = local.marked_unread;
+            group.muted_until_timestamp = local.muted_until_timestamp;
+            group.dont_notify_for_mentions_if_muted = local.dont_notify_for_mentions_if_muted;
+            group.hide_story = local.hide_story;
+            group.story_send_mode = local.story_send_mode;
+        }
+        group
+    }
 }
 
 impl From<libsignal_service::groups_v2::Group> for Group {
@@ -168,5 +229,63 @@ impl From<libsignal_service::groups_v2::AccessControl> for AccessControl {
             add_from_invite_link: val.add_from_invite_link,
             member_label: val.member_label,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server_group(version: u32) -> libsignal_service::groups_v2::Group {
+        libsignal_service::groups_v2::Group {
+            title: "Renamed".into(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            version,
+            members: vec![],
+            members_pending_profile_key: vec![],
+            members_pending_admin_approval: vec![],
+            invite_link_password: vec![],
+            description_text: None,
+            announcements_only: false,
+            members_banned: vec![],
+            terminated: false,
+        }
+    }
+
+    #[test]
+    fn from_server_keeps_the_flags_only_this_device_knows() {
+        let mut local: Group = server_group(3).into();
+        local.needs_hydration = true;
+        local.blocked = true;
+        local.archived = true;
+        local.muted_until_timestamp = 1_700_000_000_000;
+
+        let merged = Group::from_server(server_group(4), Some(&local));
+
+        assert_eq!(merged.revision, 4);
+        assert_eq!(merged.title.as_deref(), Some("Renamed"));
+        assert!(!merged.needs_hydration);
+        assert!(merged.blocked);
+        assert!(merged.archived);
+        assert_eq!(merged.muted_until_timestamp, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn from_server_without_a_local_copy_is_the_plain_conversion() {
+        let merged = Group::from_server(server_group(1), None);
+        assert!(!merged.blocked);
+        assert_eq!(merged.muted_until_timestamp, 0);
+    }
+
+    #[test]
+    fn an_update_with_nothing_set_is_empty() {
+        assert!(GroupUpdate::default().is_empty());
+        assert!(!GroupUpdate {
+            expire_timer_seconds: Some(0),
+            ..Default::default()
+        }
+        .is_empty());
     }
 }

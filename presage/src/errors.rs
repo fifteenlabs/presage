@@ -80,6 +80,8 @@ pub enum Error<S: std::error::Error> {
     AttachmentCipherError(#[from] libsignal_service::attachment_cipher::AttachmentCipherError),
     #[error("unknown group")]
     UnknownGroup,
+    #[error("group update carries no change")]
+    EmptyGroupUpdate,
     #[error("unknown recipient")]
     UnknownRecipient,
     #[error("timeout: {0}")]
