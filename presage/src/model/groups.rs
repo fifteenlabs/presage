@@ -173,6 +173,21 @@ impl Group {
         self.is_member(self_aci) || self.is_pending(ServiceId::from(self_aci))
     }
 
+    /// What the stored copy becomes once this account has left at `revision`,
+    /// with `promoted` made administrators on the way out — the server will not
+    /// tell this account any more, so the change is applied by hand.
+    pub(crate) fn mark_left(&mut self, self_aci: Aci, promoted: &[Aci], revision: u32) {
+        self.members.retain(|m| m.aci != self_aci);
+        self.pending_members
+            .retain(|p| p.service_id() != ServiceId::from(self_aci));
+        for member in &mut self.members {
+            if promoted.contains(&member.aci) {
+                member.role = Role::Administrator;
+            }
+        }
+        self.revision = revision;
+    }
+
     /// The server's copy of a group, keeping what only this device knows.
     ///
     /// The storage-service flags — blocked, muted, archived and the rest — never come
