@@ -1,7 +1,7 @@
 use libsignal_service::{
     groups_v2::{AccessRequired, Role},
     prelude::{ProfileKey, Timer, Uuid},
-    protocol::Aci,
+    protocol::{Aci, Pni, ServiceId},
 };
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +55,28 @@ pub struct GroupUpdate {
 }
 
 impl GroupUpdate {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The membership changes one group change can carry, for
+/// [`Manager::update_group_members`](crate::Manager::update_group_members).
+///
+/// `add` takes any service id: someone whose profile key this account holds joins
+/// outright, anyone else — a PNI-only contact included — is invited and joins when
+/// they accept. `remove` and the role changes are for full members; an invitation
+/// is withdrawn with `remove_pending`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupMembersUpdate {
+    pub add: Vec<ServiceId>,
+    pub remove: Vec<Aci>,
+    pub remove_pending: Vec<ServiceId>,
+    pub promote: Vec<Aci>,
+    pub demote: Vec<Aci>,
+}
+
+impl GroupMembersUpdate {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
@@ -116,6 +138,15 @@ pub struct PendingMember {
     pub timestamp: u64,
 }
 
+impl PendingMember {
+    pub fn service_id(&self) -> ServiceId {
+        match self.service_id_type {
+            ServiceIdType::AccountIdentity => ServiceId::from(Aci::from(self.uuid)),
+            ServiceIdType::PhoneNumberIdentity => ServiceId::from(Pni::from(self.uuid)),
+        }
+    }
+}
+
 #[derive(derive_more::Debug, Clone, Deserialize, Serialize)]
 pub struct RequestingMember {
     #[serde(alias = "uuid", with = "serde_aci")]
@@ -126,6 +157,22 @@ pub struct RequestingMember {
 }
 
 impl Group {
+    pub fn is_member(&self, aci: Aci) -> bool {
+        self.members.iter().any(|m| m.aci == aci)
+    }
+
+    pub fn is_pending(&self, service_id: ServiceId) -> bool {
+        self.pending_members
+            .iter()
+            .any(|p| p.service_id() == service_id)
+    }
+
+    /// Whether this account is still in the group, as a member or an invitee.
+    /// Leaving, or being removed, is what makes this false — there is no flag.
+    pub fn is_active(&self, self_aci: Aci) -> bool {
+        self.is_member(self_aci) || self.is_pending(ServiceId::from(self_aci))
+    }
+
     /// The server's copy of a group, keeping what only this device knows.
     ///
     /// The storage-service flags — blocked, muted, archived and the rest — never come
@@ -277,6 +324,56 @@ mod tests {
         let merged = Group::from_server(server_group(1), None);
         assert!(!merged.blocked);
         assert_eq!(merged.muted_until_timestamp, 0);
+    }
+
+    #[test]
+    fn a_pending_member_addresses_by_its_identity_kind() {
+        let uuid = Uuid::from_u128(7);
+        let aci_pending = PendingMember {
+            uuid,
+            service_id_type: ServiceIdType::AccountIdentity,
+            role: Role::Default,
+            added_by_aci: Aci::from(Uuid::from_u128(1)),
+            timestamp: 0,
+        };
+        let pni_pending = PendingMember {
+            service_id_type: ServiceIdType::PhoneNumberIdentity,
+            ..PendingMember {
+                uuid,
+                service_id_type: ServiceIdType::AccountIdentity,
+                role: Role::Default,
+                added_by_aci: Aci::from(Uuid::from_u128(1)),
+                timestamp: 0,
+            }
+        };
+        assert_eq!(aci_pending.service_id(), ServiceId::from(Aci::from(uuid)));
+        assert_eq!(pni_pending.service_id(), ServiceId::from(Pni::from(uuid)));
+    }
+
+    #[test]
+    fn active_means_member_or_invitee() {
+        let me = Aci::from(Uuid::from_u128(9));
+        let mut group: Group = server_group(1).into();
+        assert!(!group.is_active(me));
+        group.pending_members.push(PendingMember {
+            uuid: me.into(),
+            service_id_type: ServiceIdType::AccountIdentity,
+            role: Role::Default,
+            added_by_aci: Aci::from(Uuid::from_u128(1)),
+            timestamp: 0,
+        });
+        assert!(group.is_active(me));
+        assert!(!group.is_member(me));
+    }
+
+    #[test]
+    fn a_members_update_with_nothing_set_is_empty() {
+        assert!(GroupMembersUpdate::default().is_empty());
+        assert!(!GroupMembersUpdate {
+            remove: vec![Aci::from(Uuid::from_u128(2))],
+            ..Default::default()
+        }
+        .is_empty());
     }
 
     #[test]

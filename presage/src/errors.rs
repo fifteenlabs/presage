@@ -82,6 +82,12 @@ pub enum Error<S: std::error::Error> {
     UnknownGroup,
     #[error("group update carries no change")]
     EmptyGroupUpdate,
+    #[error("group membership update carries no change")]
+    EmptyGroupMembersUpdate,
+    #[error("this account is not in the group")]
+    NotAGroupMember,
+    #[error("leaving would leave the group without an administrator; promote someone first")]
+    LastAdminMustPromote,
     #[error("unknown recipient")]
     UnknownRecipient,
     #[error("timeout: {0}")]
