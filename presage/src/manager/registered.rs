@@ -775,9 +775,6 @@ impl<S: Store> Manager<S, Registered> {
             left.revision = revision;
         }
         self.store.save_group(*master_key_bytes, left).await?;
-        warn!(
-            "left the group; its storage-service record stays in the manifest, which the other devices tolerate"
-        );
         Ok(context)
     }
 
@@ -1897,7 +1894,7 @@ impl<S: Store> Manager<S, Registered> {
                 // An invitee we could not reach still has the invitation on the
                 // group server; the members' delivery is what the caller is owed.
                 Err(error) if invitees.contains(&service_id) => {
-                    warn!(%error, service_id = %service_id.service_id_string(), "could not deliver the group change to an invitee");
+                    debug!(%error, service_id = %service_id.service_id_string(), "could not deliver to an invitee");
                     None
                 }
                 Err(error) => Some(error),
