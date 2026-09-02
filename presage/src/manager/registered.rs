@@ -1750,6 +1750,35 @@ impl<S: Store> Manager<S, Registered> {
         .await
     }
 
+    /// Set a group's mute expiry (ms since epoch; `0` unmutes, `i64::MAX` is
+    /// "muted always").
+    ///
+    /// The group twin of [`set_muted_until`](Self::set_muted_until): the local
+    /// write and the storage-sync mark are one step, publishing is
+    /// [`push_pending_group_records`](Self::push_pending_group_records), and
+    /// there is no sync message because Signal has none for mute.
+    ///
+    /// Unlike the contact path there is no `Group::minimal` to fall back on — a
+    /// group has a title, members and a revision that cannot be invented — so a
+    /// group we have never seen is [`Error::UnknownGroup`] rather than a stub.
+    pub async fn set_group_muted_until(
+        &mut self,
+        master_key: GroupMasterKeyBytes,
+        muted_until_timestamp: u64,
+    ) -> Result<(), Error<S::Error>> {
+        let mut group = self
+            .store
+            .group(master_key)
+            .await?
+            .ok_or(Error::UnknownGroup)?;
+        group.muted_until_timestamp = muted_until_timestamp;
+        self.store.save_group(master_key, group).await?;
+        self.store
+            .set_group_needs_storage_sync(master_key, true)
+            .await?;
+        Ok(())
+    }
+
     /// Apply one local edit to a contact and mark it as owing the storage
     /// service a write. A recipient not yet in the contact list is stored as a
     /// minimal record so the edit still takes effect. The write and the mark

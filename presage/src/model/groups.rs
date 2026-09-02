@@ -2,6 +2,7 @@ use libsignal_service::{
     groups_v2::{AccessRequired, Role},
     prelude::{ProfileKey, Timer, Uuid},
     protocol::{Aci, Pni, ServiceId},
+    zkgroup::GroupMasterKeyBytes,
 };
 use serde::{Deserialize, Serialize};
 
@@ -207,6 +208,33 @@ impl Group {
             group.story_send_mode = local.story_send_mode;
         }
         group
+    }
+
+    /// Build a `GroupV2Record` for a group the account has no storage-service
+    /// record for yet.
+    ///
+    /// Lossy, and only sound because of where it is used. `Group` carries no
+    /// `avatar_color` and no `verified_name_hash`, so both come out unset — and
+    /// `avatarColor` has explicit presence, meaning "unset" is a value another
+    /// client can tell apart from the default. Appending a record where none
+    /// exists cannot clobber anything, which is what makes this narrow use safe;
+    /// an *edit* must go through [`crate::storage_record`] instead.
+    pub fn to_new_storage_record(
+        &self,
+        master_key: GroupMasterKeyBytes,
+    ) -> libsignal_service::proto::GroupV2Record {
+        libsignal_service::proto::GroupV2Record {
+            master_key: master_key.to_vec(),
+            blocked: self.blocked,
+            whitelisted: self.whitelisted,
+            archived: self.archived,
+            marked_unread: self.marked_unread,
+            muted_until_timestamp: self.muted_until_timestamp,
+            dont_notify_for_mentions_if_muted: self.dont_notify_for_mentions_if_muted,
+            hide_story: self.hide_story,
+            story_send_mode: self.story_send_mode as i32,
+            ..Default::default()
+        }
     }
 }
 

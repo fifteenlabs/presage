@@ -16,10 +16,14 @@ use std::ops::Range;
 
 /// `StorageRecord.contact`, from `StorageService.proto`.
 const STORAGE_RECORD_CONTACT: u32 = 1;
+/// `StorageRecord.groupV2`, from `StorageService.proto`.
+const STORAGE_RECORD_GROUP_V2: u32 = 3;
 /// `ContactRecord.blocked`.
 const CONTACT_RECORD_BLOCKED: u32 = 9;
 /// `ContactRecord.mutedUntilTimestamp`.
 const CONTACT_RECORD_MUTED_UNTIL: u32 = 13;
+/// `GroupV2Record.mutedUntilTimestamp`.
+const GROUP_V2_RECORD_MUTED_UNTIL: u32 = 6;
 
 const WIRE_VARINT: u8 = 0;
 const WIRE_I64: u8 = 1;
@@ -30,12 +34,12 @@ const WIRE_I32: u8 = 5;
 pub enum StorageRecordEditError {
     #[error("malformed protobuf in stored storage record")]
     Malformed,
-    #[error("stored storage record does not hold a contact")]
-    NotAContact,
+    #[error("stored storage record does not hold the expected record type")]
+    WrongRecordType,
     /// Signal never emits a record with the same submessage twice, and picking
     /// one would silently discard the other, so refuse rather than guess.
-    #[error("stored storage record holds more than one contact")]
-    AmbiguousContact,
+    #[error("stored storage record holds more than one record of a type")]
+    AmbiguousRecord,
 }
 
 use StorageRecordEditError as EditError;
@@ -182,23 +186,25 @@ fn encode_len_delimited(number: u32, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The single `StorageRecord.contact` payload, or an error saying why not.
-fn contact_payload(record: &[u8]) -> Result<Range<usize>, EditError> {
+/// The single payload of `StorageRecord` field `record_field`, or an error
+/// saying why not. `record_field` picks the arm of the oneof: contact, group,
+/// account.
+fn record_payload(record: &[u8], record_field: u32) -> Result<Range<usize>, EditError> {
     let spans = scan(record)?;
-    let mut found = spans.iter().filter(|s| s.number == STORAGE_RECORD_CONTACT);
-    let first = found.next().ok_or(EditError::NotAContact)?;
+    let mut found = spans.iter().filter(|s| s.number == record_field);
+    let first = found.next().ok_or(EditError::WrongRecordType)?;
     if found.next().is_some() {
-        return Err(EditError::AmbiguousContact);
+        return Err(EditError::AmbiguousRecord);
     }
     Ok(first.payload.clone())
 }
 
-/// The last-wins varint value of field `number` inside the contact payload,
-/// or `0` when the field is absent (proto3 implicit presence).
-fn contact_varint_field(record: &[u8], number: u32) -> Result<u64, EditError> {
-    let payload = contact_payload(record)?;
-    let contact = &record[payload];
-    let spans = scan(contact)?;
+/// The last-wins varint value of field `number` inside the `record_field`
+/// payload, or `0` when the field is absent (proto3 implicit presence).
+fn record_varint_field(record: &[u8], record_field: u32, number: u32) -> Result<u64, EditError> {
+    let payload = record_payload(record, record_field)?;
+    let inner = &record[payload];
+    let spans = scan(inner)?;
 
     // Repeated scalars are last-wins.
     let Some(span) = spans.iter().rev().find(|s| s.number == number) else {
@@ -216,19 +222,20 @@ fn contact_varint_field(record: &[u8], number: u32) -> Result<u64, EditError> {
     // non-canonical encoding of zero, and its continuation bit would otherwise
     // read as a value.
     let mut pos = span.payload.start;
-    read_varint(contact, &mut pos)
+    read_varint(inner, &mut pos)
 }
 
-/// Replace — or, with `None`, remove — one field inside the contact payload,
-/// preserving every other byte of both messages.
-fn set_contact_field(
+/// Replace — or, with `None`, remove — one field inside the `record_field`
+/// payload, preserving every other byte of both messages.
+fn set_record_field(
     record: &[u8],
+    record_field: u32,
     number: u32,
     replacement: Option<&[u8]>,
 ) -> Result<Vec<u8>, EditError> {
-    let payload = contact_payload(record)?;
-    let contact = &record[payload];
-    let new_contact = set_field(contact, number, replacement)?;
+    let payload = record_payload(record, record_field)?;
+    let inner = &record[payload];
+    let new_inner = set_field(inner, number, replacement)?;
 
     // Splice the wrapper rather than rebuilding it. `StorageRecord` is a oneof,
     // so there is nothing else in there today — but reconstructing it would drop
@@ -236,14 +243,14 @@ fn set_contact_field(
     // exists to prevent.
     set_field(
         record,
-        STORAGE_RECORD_CONTACT,
-        Some(&encode_len_delimited(STORAGE_RECORD_CONTACT, &new_contact)),
+        record_field,
+        Some(&encode_len_delimited(record_field, &new_inner)),
     )
 }
 
 /// Read `ContactRecord.blocked` out of an encoded `StorageRecord`.
 pub fn contact_blocked(record: &[u8]) -> Result<bool, EditError> {
-    Ok(contact_varint_field(record, CONTACT_RECORD_BLOCKED)? != 0)
+    Ok(record_varint_field(record, STORAGE_RECORD_CONTACT, CONTACT_RECORD_BLOCKED)? != 0)
 }
 
 /// Set `ContactRecord.blocked` on an encoded `StorageRecord`, preserving every
@@ -255,26 +262,62 @@ pub fn contact_blocked(record: &[u8]) -> Result<bool, EditError> {
 /// wire-legal and decodes identically, but no official client produces one.
 pub fn set_contact_blocked(record: &[u8], blocked: bool) -> Result<Vec<u8>, EditError> {
     let replacement = blocked.then(|| encode_varint_field(CONTACT_RECORD_BLOCKED, 1));
-    set_contact_field(record, CONTACT_RECORD_BLOCKED, replacement.as_deref())
+    set_record_field(
+        record,
+        STORAGE_RECORD_CONTACT,
+        CONTACT_RECORD_BLOCKED,
+        replacement.as_deref(),
+    )
 }
 
 /// Read `ContactRecord.mutedUntilTimestamp` out of an encoded `StorageRecord`.
 /// Absent means not muted and reads as 0.
 pub fn contact_muted_until(record: &[u8]) -> Result<u64, EditError> {
-    contact_varint_field(record, CONTACT_RECORD_MUTED_UNTIL)
+    record_varint_field(record, STORAGE_RECORD_CONTACT, CONTACT_RECORD_MUTED_UNTIL)
 }
 
 /// Set `ContactRecord.mutedUntilTimestamp` on an encoded `StorageRecord`,
 /// preserving every other byte of both messages.
 ///
 /// `0` (not muted) **removes** the field rather than writing an explicit zero —
-/// the same proto3 implicit-presence convention as [`set_contact_blocked`], and
-/// what Signal-Desktop serializes on unmute. "Muted forever" is `i64::MAX`, a
-/// ten-byte varint.
+/// the same proto3 implicit-presence convention as [`set_contact_blocked`].
+/// Signal-Desktop, -Android and -iOS all write an explicit `0` here; under
+/// proto3 implicit presence the two are indistinguishable on decode, so this is
+/// equivalent rather than identical. "Muted forever" is `i64::MAX`, a ten-byte
+/// varint.
 pub fn set_contact_muted_until(record: &[u8], muted_until: u64) -> Result<Vec<u8>, EditError> {
     let replacement =
         (muted_until != 0).then(|| encode_varint_field(CONTACT_RECORD_MUTED_UNTIL, muted_until));
-    set_contact_field(record, CONTACT_RECORD_MUTED_UNTIL, replacement.as_deref())
+    set_record_field(
+        record,
+        STORAGE_RECORD_CONTACT,
+        CONTACT_RECORD_MUTED_UNTIL,
+        replacement.as_deref(),
+    )
+}
+
+/// Read `GroupV2Record.mutedUntilTimestamp` out of an encoded `StorageRecord`.
+/// Absent means not muted and reads as 0.
+pub fn group_muted_until(record: &[u8]) -> Result<u64, EditError> {
+    record_varint_field(record, STORAGE_RECORD_GROUP_V2, GROUP_V2_RECORD_MUTED_UNTIL)
+}
+
+/// Set `GroupV2Record.mutedUntilTimestamp` on an encoded `StorageRecord`,
+/// preserving every other byte of both messages — `dontNotifyForMentionsIfMuted`
+/// and `avatarColor` included, neither of which presage models, and the latter
+/// of which has explicit presence so a re-encode could not restore it.
+///
+/// `0` (not muted) **removes** the field, the same convention as
+/// [`set_contact_muted_until`]. "Muted forever" is `i64::MAX`.
+pub fn set_group_muted_until(record: &[u8], muted_until: u64) -> Result<Vec<u8>, EditError> {
+    let replacement =
+        (muted_until != 0).then(|| encode_varint_field(GROUP_V2_RECORD_MUTED_UNTIL, muted_until));
+    set_record_field(
+        record,
+        STORAGE_RECORD_GROUP_V2,
+        GROUP_V2_RECORD_MUTED_UNTIL,
+        replacement.as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -295,6 +338,23 @@ mod tests {
         encode_len_delimited(STORAGE_RECORD_CONTACT, contact)
     }
 
+    /// A `GroupV2Record` with a master key (field 1), `whitelisted` (field 3),
+    /// `dontNotifyForMentionsIfMuted` (field 7) — which presage models but never
+    /// writes — and a field number no version of the proto we compile against
+    /// defines.
+    fn group_with_unknown_field() -> Vec<u8> {
+        let mut group = Vec::new();
+        group.extend_from_slice(&encode_len_delimited(1, &[7u8; 32]));
+        group.extend_from_slice(&encode_varint_field(3, 1));
+        group.extend_from_slice(&encode_varint_field(7, 1));
+        group.extend_from_slice(&encode_len_delimited(251, b"from the future"));
+        group
+    }
+
+    fn group_record(group: &[u8]) -> Vec<u8> {
+        encode_len_delimited(STORAGE_RECORD_GROUP_V2, group)
+    }
+
     #[test]
     fn blocking_preserves_every_other_field() {
         let record = storage_record(&contact_with_unknown_field());
@@ -302,7 +362,7 @@ mod tests {
 
         assert!(contact_blocked(&blocked).unwrap());
 
-        let payload = contact_payload(&blocked).unwrap();
+        let payload = record_payload(&blocked, STORAGE_RECORD_CONTACT).unwrap();
         let contact = &blocked[payload];
         assert!(
             contact.windows(15).any(|w| w == b"from the future"),
@@ -333,7 +393,7 @@ mod tests {
         let record = storage_record(&contact);
 
         let unblocked = set_contact_blocked(&record, false).unwrap();
-        let payload = contact_payload(&unblocked).unwrap();
+        let payload = record_payload(&unblocked, STORAGE_RECORD_CONTACT).unwrap();
         let inner = scan(&unblocked[payload]).unwrap();
 
         assert!(
@@ -354,7 +414,7 @@ mod tests {
         assert!(contact_blocked(&record).unwrap());
 
         let blocked = set_contact_blocked(&record, true).unwrap();
-        let payload = contact_payload(&blocked).unwrap();
+        let payload = record_payload(&blocked, STORAGE_RECORD_CONTACT).unwrap();
         let inner = scan(&blocked[payload]).unwrap();
         assert_eq!(
             inner
@@ -391,7 +451,7 @@ mod tests {
         let muted = set_contact_muted_until(&record, i64::MAX as u64).unwrap();
         assert_eq!(contact_muted_until(&muted).unwrap(), i64::MAX as u64);
 
-        let payload = contact_payload(&muted).unwrap();
+        let payload = record_payload(&muted, STORAGE_RECORD_CONTACT).unwrap();
         let contact = &muted[payload];
         assert!(
             contact.windows(15).any(|w| w == b"from the future"),
@@ -423,7 +483,7 @@ mod tests {
         let record = storage_record(&contact);
 
         let unmuted = set_contact_muted_until(&record, 0).unwrap();
-        let payload = contact_payload(&unmuted).unwrap();
+        let payload = record_payload(&unmuted, STORAGE_RECORD_CONTACT).unwrap();
         let inner = scan(&unmuted[payload]).unwrap();
 
         assert!(
@@ -505,13 +565,115 @@ mod tests {
         assert_eq!(contact_blocked(&record), Err(EditError::Malformed));
     }
 
+    /// The group half of the mute wire tests. `GroupV2Record.mutedUntilTimestamp`
+    /// is field 6 inside `StorageRecord` field 3 — a different pair of numbers
+    /// from the contact case, and the reason these are not one parametrised test.
     #[test]
-    fn a_non_contact_record_is_rejected() {
-        // `StorageRecord.groupV2` is field 3.
-        let record = encode_len_delimited(3, b"group");
+    fn group_mute_round_trips_including_forever() {
+        let record = group_record(&group_with_unknown_field());
+        assert_eq!(group_muted_until(&record).unwrap(), 0);
+
+        let muted = set_group_muted_until(&record, i64::MAX as u64).unwrap();
+        assert_eq!(group_muted_until(&muted).unwrap(), i64::MAX as u64);
+
+        let payload = record_payload(&muted, STORAGE_RECORD_GROUP_V2).unwrap();
+        let group = &muted[payload];
+        assert!(
+            group.windows(15).any(|w| w == b"from the future"),
+            "unknown field was dropped"
+        );
+    }
+
+    #[test]
+    fn group_mute_then_unmute_restores_the_original_bytes() {
+        let record = group_record(&group_with_unknown_field());
+
+        let muted = set_group_muted_until(&record, 1_700_000_000_000).unwrap();
+        assert_ne!(muted, record);
+
+        let unmuted = set_group_muted_until(&muted, 0).unwrap();
         assert_eq!(
-            set_contact_blocked(&record, true),
-            Err(EditError::NotAContact)
+            unmuted, record,
+            "toggling must not accumulate bytes or reorder fields"
+        );
+    }
+
+    #[test]
+    fn unmuting_a_group_removes_the_field_rather_than_zeroing_it() {
+        let mut group = group_with_unknown_field();
+        group.extend_from_slice(&encode_varint_field(
+            GROUP_V2_RECORD_MUTED_UNTIL,
+            1_700_000_000_000,
+        ));
+        let record = group_record(&group);
+
+        let unmuted = set_group_muted_until(&record, 0).unwrap();
+        let payload = record_payload(&unmuted, STORAGE_RECORD_GROUP_V2).unwrap();
+        let inner = scan(&unmuted[payload]).unwrap();
+
+        assert!(
+            !inner
+                .iter()
+                .any(|s| s.number == GROUP_V2_RECORD_MUTED_UNTIL),
+            "field 6 should be absent, not present-and-zero"
+        );
+        assert_eq!(group_muted_until(&unmuted).unwrap(), 0);
+    }
+
+    #[test]
+    fn group_mute_with_the_wrong_wire_type_is_rejected() {
+        let mut group = group_with_unknown_field();
+        group.extend_from_slice(&encode_len_delimited(
+            GROUP_V2_RECORD_MUTED_UNTIL,
+            b"not a varint",
+        ));
+        let record = group_record(&group);
+
+        assert_eq!(group_muted_until(&record), Err(EditError::Malformed));
+    }
+
+    /// `0x80 0x00` is a legal, non-canonical encoding of zero. Reading it as a
+    /// byte pattern rather than decoding it would see the continuation bit and
+    /// call the group muted.
+    #[test]
+    fn a_non_canonical_zero_group_mute_reads_as_unmuted() {
+        let mut group = group_with_unknown_field();
+        group.extend_from_slice(&[(GROUP_V2_RECORD_MUTED_UNTIL << 3) as u8, 0x80, 0x00]);
+        let record = group_record(&group);
+
+        assert_eq!(group_muted_until(&record).unwrap(), 0);
+    }
+
+    /// Field 7 is `dontNotifyForMentionsIfMuted`. No official client couples it
+    /// to a mute change, and presage never writes it — so a mute edit must carry
+    /// whatever the account already had.
+    #[test]
+    fn muting_a_group_preserves_dont_notify_for_mentions() {
+        let record = group_record(&group_with_unknown_field());
+        let muted = set_group_muted_until(&record, 1_700_000_000_000).unwrap();
+
+        let payload = record_payload(&muted, STORAGE_RECORD_GROUP_V2).unwrap();
+        let inner = scan(&muted[payload]).unwrap();
+        let mentions = inner
+            .iter()
+            .find(|s| s.number == 7)
+            .expect("dontNotifyForMentionsIfMuted was dropped");
+
+        assert_eq!(mentions.wire_type, WIRE_VARINT);
+    }
+
+    #[test]
+    fn a_record_of_another_type_is_rejected() {
+        let group = group_record(&group_with_unknown_field());
+        assert_eq!(
+            set_contact_blocked(&group, true),
+            Err(EditError::WrongRecordType)
+        );
+
+        let contact = storage_record(&contact_with_unknown_field());
+        assert_eq!(
+            set_group_muted_until(&contact, 42),
+            Err(EditError::WrongRecordType)
         );
     }
 
@@ -521,7 +683,17 @@ mod tests {
         record.extend_from_slice(&storage_record(&contact_with_unknown_field()));
         assert_eq!(
             set_contact_blocked(&record, true),
-            Err(EditError::AmbiguousContact)
+            Err(EditError::AmbiguousRecord)
+        );
+    }
+
+    #[test]
+    fn two_groups_are_rejected_rather_than_guessed() {
+        let mut record = group_record(&group_with_unknown_field());
+        record.extend_from_slice(&group_record(&group_with_unknown_field()));
+        assert_eq!(
+            set_group_muted_until(&record, 42),
+            Err(EditError::AmbiguousRecord)
         );
     }
 
