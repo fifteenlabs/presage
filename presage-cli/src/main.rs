@@ -569,10 +569,6 @@ async fn print_message<S: Store>(
         ContentBody::StoryMessage(story) => {
             Some(Msg::Received(&thread, format!("new story: {story:?}")))
         }
-        #[allow(deprecated)]
-        ContentBody::PniSignatureMessage(_) => {
-            Some(Msg::Received(&thread, "got PNI signature message".into()))
-        }
         ContentBody::DecryptionErrorMessage(_) => Some(Msg::Received(
             &thread,
             "failed to decrypt a messagee".into(),
@@ -644,8 +640,11 @@ async fn receive<S: Store>(
                 )
                 .await
             }
-            Received::DecryptionError(c) => {
-                println!("failed to receive a message from a contact: {c:?}")
+            Received::DecryptionError { sender, .. } => {
+                println!("failed to receive a message from a contact: {sender:?}")
+            }
+            Received::PeerDecryptionError { sender } => {
+                println!("a contact could not decrypt a message we sent: {sender:?}")
             }
             Received::Disconnected(reason) => {
                 println!("disconnected: {reason:?}");
@@ -1029,8 +1028,11 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                             return true;
                         }
                         Received::Content(_) => print!("."),
-                        Received::DecryptionError(_) => {
+                        Received::DecryptionError { .. } => {
                             println!("failed to receive a message from a contact")
+                        }
+                        Received::PeerDecryptionError { .. } => {
+                            println!("a contact could not decrypt a message we sent")
                         }
                         Received::Disconnected(_) => {
                             // Ignore transient disconnects; keep waiting for contacts.

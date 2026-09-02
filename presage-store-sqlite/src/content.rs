@@ -147,6 +147,7 @@ impl ContentsStore for SqliteStore {
             client_timestamp,
             needs_receipt,
             unidentified_sender,
+            pni_verified: _,
             server_guid: _,
             was_plaintext,
             server_timestamp: _,

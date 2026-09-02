@@ -37,7 +37,8 @@ use libsignal_service::{
         StorageRecord, SyncMessage, Verified,
     },
     protocol::{
-        Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
+        Aci, CiphertextMessageType, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId,
+        ServiceIdKind, Username,
     },
     provisioning::{ProvisioningError, ProvisioningSecrets},
     push_service::linking::{TransferArchiveError, TransferArchiveResult},
@@ -1129,13 +1130,14 @@ impl<S: Store> Manager<S, Registered> {
                 loop {
                     match state.encrypted_messages.next().await {
                         Some(Ok(Incoming::Envelope(envelope))) => {
-                            let envelope = {
+                            let failed_timestamp = envelope.client_timestamp();
+                            let opened = {
                                 // the permit is released at the end of the block (impl Drop)
                                 match envelope.parse_destination_service_id() {
                                     None | Some(ServiceId::Aci(_)) => {
                                         state
                                             .service_cipher_aci
-                                            .open_envelope(envelope, &mut rand::rng())
+                                            .open_envelope(&envelope, &mut rand::rng())
                                             .await
                                     }
                                     Some(ServiceId::Pni(pni)) => {
@@ -1147,20 +1149,22 @@ impl<S: Store> Manager<S, Registered> {
                                         }
                                         state
                                             .service_cipher_pni
-                                            .open_envelope(envelope, &mut rng())
+                                            .open_envelope(&envelope, &mut rng())
                                             .await
                                     }
                                 }
                             };
-                            match envelope {
+                            match opened {
                                 Ok(Some(content)) => {
                                     if let ContentBody::DecryptionErrorMessage(e) = &content.body {
                                         error!(
                                             error = ?e,
-                                            "got error decrypting a message"
+                                            "a peer could not decrypt a message we sent"
                                         );
                                         return Some((
-                                            Received::DecryptionError(content.metadata.sender),
+                                            Received::PeerDecryptionError {
+                                                sender: content.metadata.sender,
+                                            },
                                             state,
                                         ));
                                     }
@@ -1466,10 +1470,29 @@ impl<S: Store> Manager<S, Registered> {
                                 }
                                 Err(error) => {
                                     error!(%error, "error opening envelope, message will be skipped!");
-                                    if let libsignal_service::prelude::ServiceError::SealedSenderDecryptionError(libsignal_service::cipher::SealedSenderDecryptionError { sender: Some(sender), .. }) = &error {
-                                        if let Some(sender) = ServiceId::parse_from_service_id_string(sender.name()) {
-                                            return Some((Received::DecryptionError(sender), state));
-                                        }
+
+                                    let retry = match error {
+                                        libsignal_service::prelude::ServiceError::SealedSenderDecryptionError(
+                                            libsignal_service::cipher::SealedSenderDecryptionError {
+                                                sender: Some(address),
+                                                original,
+                                                ..
+                                            },
+                                        ) => ServiceId::parse_from_service_id_string(address.name())
+                                            .map(|sender| (sender, address.device_id(), original)),
+                                        _ => session_retry_context(&envelope),
+                                    };
+
+                                    if let Some((sender, sender_device, original)) = retry {
+                                        return Some((
+                                            Received::DecryptionError {
+                                                sender,
+                                                sender_device,
+                                                timestamp: failed_timestamp,
+                                                original,
+                                            },
+                                            state,
+                                        ));
                                     }
                                 }
                             }
@@ -1561,6 +1584,37 @@ impl<S: Store> Manager<S, Registered> {
         Ok(resolved_username)
     }
 
+    /// Ask a peer to repair what broke and resend a message we could not decrypt.
+    ///
+    /// One call for both failures: `original_type` tells libsignal whether to
+    /// attach a ratchet key (1:1, so the peer archives that session) or not
+    /// (sender key, so the peer redistributes it). Goes out as an unencrypted
+    /// `PlaintextContent` envelope, which is both a necessity for the 1:1 case
+    /// and a compatibility requirement for the sender-key one — see
+    /// [`MessageSender::send_decryption_error_message`].
+    pub async fn send_retry_receipt(
+        &mut self,
+        recipient: ServiceId,
+        original_type: CiphertextMessageType,
+        original_ciphertext: &[u8],
+        failed_timestamp: u64,
+        failed_device: DeviceId,
+    ) -> Result<(), Error<S::Error>> {
+        let mut sender = self.new_message_sender().await?;
+
+        sender
+            .send_decryption_error_message(
+                &recipient,
+                original_type,
+                original_ciphertext,
+                failed_timestamp,
+                failed_device,
+            )
+            .await?;
+
+        Ok(())
+    }
+
     /// Sends a messages to the provided [ServiceId].
     /// The timestamp should be set to now and is used by Signal mobile apps
     /// to order messages later, and apply reactions.
@@ -1632,6 +1686,7 @@ impl<S: Store> Manager<S, Registered> {
                 unidentified_sender: false,
                 was_plaintext: false,
                 report_spam_token: None,
+                pni_verified: None,
             },
             body: content_body,
         };
@@ -1893,6 +1948,7 @@ impl<S: Store> Manager<S, Registered> {
                 unidentified_sender: false,
                 was_plaintext: false,
                 report_spam_token: None,
+                pni_verified: None,
             },
             body: content_body,
         };
@@ -2626,6 +2682,44 @@ impl<S: Store> Manager<S, Registered> {
     }
 }
 
+/// What a 1:1 retry receipt needs about an envelope we could not open.
+///
+/// Returns the sender, the sending device, and the ciphertext we failed to
+/// decrypt together with its type, from which
+/// [`Received::DecryptionError`] is built.  The ciphertext is what makes
+/// the receipt useful: the ratchet key is read back out of it, and the peer
+/// only resets the session when the receipt names a ratchet key it recognises.
+///
+/// `None` for every envelope that is not an unsealed 1:1 message.  A sealed
+/// sender envelope hides its inner ciphertext behind a layer we did not open
+/// either, and is reported as a sender-key failure instead; every other type is
+/// not a 1:1 message at all.
+fn session_retry_context(
+    envelope: &libsignal_service::proto::Envelope,
+) -> Option<(
+    ServiceId,
+    DeviceId,
+    Option<(CiphertextMessageType, Vec<u8>)>,
+)> {
+    use libsignal_service::proto::envelope::Type;
+
+    let original_type = match envelope.r#type() {
+        Type::PrekeyMessage => CiphertextMessageType::PreKey,
+        Type::DoubleRatchet => CiphertextMessageType::Whisper,
+        _ => return None,
+    };
+
+    let sender = envelope.parse_source_service_id()?;
+    let sender_device = DeviceId::try_from(envelope.source_device_id()).ok()?;
+    let original_ciphertext = envelope.content.clone()?;
+
+    Some((
+        sender,
+        sender_device,
+        Some((original_type, original_ciphertext)),
+    ))
+}
+
 /// Build the `Blocked` sync payload from locally-stored blocked contacts.
 ///
 /// Group blocking is deferred (this covers 1:1 contacts), so `group_ids` is
@@ -3223,13 +3317,6 @@ async fn save_message<S: Store>(
         }
         ContentBody::StoryMessage(msg) => {
             debug!(?msg, "skipping story message");
-            None
-        }
-        // Deprecated to construct, not to receive: the server still delivers
-        // these as a side-car, so the arm has to stay.
-        #[allow(deprecated)]
-        ContentBody::PniSignatureMessage(msg) => {
-            debug!(?msg, "skipping PNI signature message");
             None
         }
         ContentBody::EditMessage(msg) => {

@@ -294,6 +294,7 @@ fn reactions_to_contents(
                         unidentified_sender: false,
                         was_plaintext: false,
                         report_spam_token: None,
+                        pni_verified: None,
                     },
                     body,
                 },
@@ -575,6 +576,7 @@ fn wrap_dm_with_reactions(
             unidentified_sender: false,
             was_plaintext: false,
             report_spam_token: None,
+            pni_verified: None,
         },
         body,
     };
@@ -673,6 +675,7 @@ fn individual_call_to_contents(
             unidentified_sender: false,
             was_plaintext: false,
             report_spam_token: None,
+            pni_verified: None,
         },
         body,
     };
@@ -738,6 +741,7 @@ fn simple_update_to_contents(
             unidentified_sender: false,
             was_plaintext: false,
             report_spam_token: None,
+            pni_verified: None,
         },
         body,
     };
@@ -854,6 +858,7 @@ fn group_call_to_contents(
             unidentified_sender: false,
             was_plaintext: false,
             report_spam_token: None,
+            pni_verified: None,
         },
         body,
     };

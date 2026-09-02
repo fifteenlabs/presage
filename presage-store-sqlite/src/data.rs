@@ -313,6 +313,7 @@ impl TryInto<Content> for SqlMessage {
             server_guid: None,
             was_plaintext,
             report_spam_token: None,
+            pni_verified: None,
         };
         Content::from_proto(body, metadata).map_err(|_| SqliteStoreError::InvalidFormat)
     }
