@@ -83,7 +83,7 @@ impl GroupMembersUpdate {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Group {
     pub title: Option<String>,
     pub avatar: Option<String>,

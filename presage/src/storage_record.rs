@@ -277,22 +277,14 @@ pub fn contact_muted_until(record: &[u8]) -> Result<u64, EditError> {
 }
 
 /// Set `ContactRecord.mutedUntilTimestamp` on an encoded `StorageRecord`,
-/// preserving every other byte of both messages.
-///
-/// `0` (not muted) **removes** the field rather than writing an explicit zero —
-/// the same proto3 implicit-presence convention as [`set_contact_blocked`].
-/// Signal-Desktop, -Android and -iOS all write an explicit `0` here; under
-/// proto3 implicit presence the two are indistinguishable on decode, so this is
-/// equivalent rather than identical. "Muted forever" is `i64::MAX`, a ten-byte
-/// varint.
+/// preserving every other byte of both messages. See
+/// [`set_muted_until_field`] for the unmute convention.
 pub fn set_contact_muted_until(record: &[u8], muted_until: u64) -> Result<Vec<u8>, EditError> {
-    let replacement =
-        (muted_until != 0).then(|| encode_varint_field(CONTACT_RECORD_MUTED_UNTIL, muted_until));
-    set_record_field(
+    set_muted_until_field(
         record,
         STORAGE_RECORD_CONTACT,
         CONTACT_RECORD_MUTED_UNTIL,
-        replacement.as_deref(),
+        muted_until,
     )
 }
 
@@ -305,19 +297,32 @@ pub fn group_muted_until(record: &[u8]) -> Result<u64, EditError> {
 /// Set `GroupV2Record.mutedUntilTimestamp` on an encoded `StorageRecord`,
 /// preserving every other byte of both messages — `dontNotifyForMentionsIfMuted`
 /// and `avatarColor` included, neither of which presage models, and the latter
-/// of which has explicit presence so a re-encode could not restore it.
-///
-/// `0` (not muted) **removes** the field, the same convention as
-/// [`set_contact_muted_until`]. "Muted forever" is `i64::MAX`.
+/// of which has explicit presence so a re-encode could not restore it. See
+/// [`set_muted_until_field`] for the unmute convention.
 pub fn set_group_muted_until(record: &[u8], muted_until: u64) -> Result<Vec<u8>, EditError> {
-    let replacement =
-        (muted_until != 0).then(|| encode_varint_field(GROUP_V2_RECORD_MUTED_UNTIL, muted_until));
-    set_record_field(
+    set_muted_until_field(
         record,
         STORAGE_RECORD_GROUP_V2,
         GROUP_V2_RECORD_MUTED_UNTIL,
-        replacement.as_deref(),
+        muted_until,
     )
+}
+
+/// Write a mute expiry into whichever record holds one.
+///
+/// `0` (not muted) **removes** the field rather than writing an explicit zero.
+/// Signal-Desktop, -Android and -iOS all write an explicit `0`; under proto3
+/// implicit presence the two are indistinguishable on decode, so this is
+/// equivalent rather than identical. "Muted forever" is `i64::MAX`, a ten-byte
+/// varint.
+fn set_muted_until_field(
+    record: &[u8],
+    record_field: u32,
+    number: u32,
+    muted_until: u64,
+) -> Result<Vec<u8>, EditError> {
+    let replacement = (muted_until != 0).then(|| encode_varint_field(number, muted_until));
+    set_record_field(record, record_field, number, replacement.as_deref())
 }
 
 #[cfg(test)]

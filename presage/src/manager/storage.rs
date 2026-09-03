@@ -585,26 +585,8 @@ impl<S: Store> Manager<S, Registered> {
                 contact.to_new_storage_record(),
             )),
         };
-        let encoded = record.encode_to_vec();
-        let storage_id = self
-            .append_storage_record(manifest_record::identifier::Type::Contact, encoded.clone())
-            .await?;
-
-        let version = self.store.fetch_storage_manifest_version().await?;
-        self.store
-            .save_contact_storage_identity(
-                service_id,
-                &StorageRecordIdentity {
-                    storage_id,
-                    storage_version: version,
-                    record: encoded,
-                },
-            )
-            .await?;
-        self.store
-            .set_contact_needs_storage_sync(service_id, false)
-            .await?;
-        Ok(())
+        self.append_record(&StorageRecordKey::Contact(*service_id), record)
+            .await
     }
 
     /// Publish every group whose local state has not reached the storage service.
@@ -655,14 +637,13 @@ impl<S: Store> Manager<S, Registered> {
                 // a drain that fixed only one could clear a flag another still
                 // needs.
                 let diff = GroupPendingPublish::diff(record, &group)?;
-                if !diff.any() {
+                if !diff.muted {
                     return Ok(None);
                 }
-                let mut edited: Option<Vec<u8>> = None;
-                if diff.muted {
-                    edited = Some(set_group_muted_until(record, group.muted_until_timestamp)?);
-                }
-                Ok(edited)
+                Ok(Some(set_group_muted_until(
+                    record,
+                    group.muted_until_timestamp,
+                )?))
             })
             .await
         {
@@ -708,25 +689,38 @@ impl<S: Store> Manager<S, Registered> {
                 group.to_new_storage_record(master_key),
             )),
         };
+        self.append_record(&StorageRecordKey::GroupV2(master_key), record)
+            .await
+    }
+
+    /// Insert a freshly-built record under a new identifier and record where it
+    /// landed.
+    ///
+    /// Routed through the same three key helpers as
+    /// [`update_storage_record`](Self::update_storage_record), so the promise
+    /// they carry — that a new [`StorageRecordKey`] variant is a compile error
+    /// in one place — holds for the append paths too.
+    async fn append_record(
+        &mut self,
+        key: &StorageRecordKey,
+        record: StorageRecord,
+    ) -> Result<(), Error<S::Error>> {
         let encoded = record.encode_to_vec();
         let storage_id = self
-            .append_storage_record(manifest_record::identifier::Type::Groupv2, encoded.clone())
+            .append_storage_record(key.item_type(), encoded.clone())
             .await?;
 
         let version = self.store.fetch_storage_manifest_version().await?;
-        self.store
-            .save_group_storage_identity(
-                master_key,
-                &StorageRecordIdentity {
-                    storage_id,
-                    storage_version: version,
-                    record: encoded,
-                },
-            )
-            .await?;
-        self.store
-            .set_group_needs_storage_sync(master_key, false)
-            .await?;
+        self.save_storage_identity(
+            key,
+            &StorageRecordIdentity {
+                storage_id,
+                storage_version: version,
+                record: encoded,
+            },
+        )
+        .await?;
+        self.set_needs_storage_sync(key, false).await?;
         Ok(())
     }
 
@@ -1037,28 +1031,23 @@ async fn sync_storage_service<S: Store>(
     // local change the server has not taken yet, so the record we are about to
     // merge is the one we are about to overwrite — letting it win would discard
     // the user's action and then publish the discarded value back.
-    let pending_publish: std::collections::HashSet<ServiceId> = store
+    let contact_pending: std::collections::HashSet<ServiceId> = store
         .contacts_needing_storage_sync()
         .await
         .unwrap_or_default()
         .into_iter()
         .collect();
-    if !pending_publish.is_empty() {
-        debug!(
-            count = pending_publish.len(),
-            "storage sync: contacts with an unpublished local change"
-        );
-    }
     let group_pending: std::collections::HashSet<GroupMasterKeyBytes> = store
         .groups_needing_storage_sync()
         .await
         .unwrap_or_default()
         .into_iter()
         .collect();
-    if !group_pending.is_empty() {
+    if !contact_pending.is_empty() || !group_pending.is_empty() {
         debug!(
-            count = group_pending.len(),
-            "storage sync: groups with an unpublished local change"
+            contacts = contact_pending.len(),
+            groups = group_pending.len(),
+            "storage sync: subjects with an unpublished local change"
         );
     }
 
@@ -1126,7 +1115,7 @@ async fn sync_storage_service<S: Store>(
                             store,
                             &service_id,
                             &existing,
-                            pending_publish.contains(&service_id),
+                            contact_pending.contains(&service_id),
                         )
                         .await;
                         merge_contact_from_snapshot(&mut contact, existing, pending);
@@ -1158,14 +1147,14 @@ async fn sync_storage_service<S: Store>(
                     }
                 }
                 Some(libsignal_service::proto::storage_record::Record::GroupV2(gr)) => {
-                    let master_key: GroupMasterKeyBytes =
-                        match gr.master_key.as_slice().try_into() {
-                            Ok(mk) => mk,
-                            Err(_) => {
-                                warn!("storage sync: invalid group master key length, skipping");
-                                continue;
-                            }
-                        };
+                    let master_key: GroupMasterKeyBytes = match gr.master_key.as_slice().try_into()
+                    {
+                        Ok(mk) => mk,
+                        Err(_) => {
+                            warn!("storage sync: invalid group master key length, skipping");
+                            continue;
+                        }
+                    };
                     let group = match store.group(master_key).await {
                         Ok(Some(mut existing)) => {
                             // Derived from the identity we are about to replace, so
@@ -1182,28 +1171,16 @@ async fn sync_storage_service<S: Store>(
                         }
                         _ => {
                             debug!("storage sync: saving group stub");
-                            Group {
-                                title: None,
-                                avatar: None,
-                                disappearing_messages_timer: None,
-                                access_control: None,
-                                revision: 0,
-                                members: Vec::new(),
-                                pending_members: Vec::new(),
-                                requesting_members: Vec::new(),
-                                invite_link_password: Vec::new(),
-                                description: None,
+                            let mut stub = Group {
                                 needs_hydration: true,
-                                blocked: gr.blocked,
-                                whitelisted: gr.whitelisted,
-                                archived: gr.archived,
-                                marked_unread: gr.marked_unread,
-                                muted_until_timestamp: gr.muted_until_timestamp,
-                                dont_notify_for_mentions_if_muted: gr
-                                    .dont_notify_for_mentions_if_muted,
-                                hide_story: gr.hide_story,
-                                story_send_mode: gr.story_send_mode.into(),
-                            }
+                                ..Default::default()
+                            };
+                            merge_group_from_snapshot(
+                                &mut stub,
+                                &gr,
+                                GroupPendingPublish::default(),
+                            );
+                            stub
                         }
                     };
                     if let Err(e) = store.save_group(master_key, group).await {
@@ -1412,27 +1389,12 @@ mod tests {
         assert!(!preserved.contains(&"muted_until_timestamp"));
     }
 
-    fn stored_group() -> Group {
+    fn local_group() -> Group {
         Group {
             title: Some("Book club".into()),
-            avatar: None,
-            disappearing_messages_timer: None,
-            access_control: None,
             revision: 7,
-            members: Vec::new(),
-            pending_members: Vec::new(),
-            requesting_members: Vec::new(),
-            invite_link_password: Vec::new(),
-            description: None,
-            needs_hydration: false,
-            blocked: false,
             whitelisted: true,
-            archived: false,
-            marked_unread: false,
-            muted_until_timestamp: 0,
-            dont_notify_for_mentions_if_muted: false,
-            hide_story: false,
-            story_send_mode: 0,
+            ..Default::default()
         }
     }
 
@@ -1443,29 +1405,11 @@ mod tests {
         }
     }
 
-    /// The guard exists because `update_storage_record` syncs when it finds
-    /// itself behind — so the publish path triggers the sync that would revert
-    /// the mute it is publishing.
-    #[test]
-    fn a_pending_group_mute_survives_a_disagreeing_sync() {
-        let mut local = stored_group();
-        local.muted_until_timestamp = i64::MAX as u64;
-
-        let remote = empty_group_record();
-        merge_group_from_snapshot(&mut local, &remote, GroupPendingPublish { muted: true });
-
-        assert_eq!(
-            local.muted_until_timestamp,
-            i64::MAX as u64,
-            "the pending group mute was reverted by the record it is replacing"
-        );
-    }
-
     /// With nothing pending, remote wins — the same rule every official client
     /// applies, and the reason a mute made on the phone reaches us at all.
     #[test]
     fn a_group_with_nothing_pending_takes_the_remote_mute() {
-        let mut local = stored_group();
+        let mut local = local_group();
         local.muted_until_timestamp = i64::MAX as u64;
 
         let mut remote = empty_group_record();
@@ -1475,12 +1419,14 @@ mod tests {
         assert_eq!(local.muted_until_timestamp, 0);
     }
 
-    /// The guard is per field, not per group: a pending mute must not shield
-    /// anything else, or a change made on another device would be preserved away
-    /// here and then overwritten by our next publish.
+    /// The guard exists because `update_storage_record` syncs when it finds
+    /// itself behind, so the publish path triggers the sync that would revert
+    /// the mute it is publishing. It is per field, not per group: a pending mute
+    /// must not shield anything else, or a change made on another device would
+    /// be preserved away here and then overwritten by our next publish.
     #[test]
     fn a_pending_group_mute_shields_only_the_mute() {
-        let mut local = stored_group();
+        let mut local = local_group();
         local.muted_until_timestamp = i64::MAX as u64;
         local.blocked = false;
         local.archived = false;
@@ -1499,7 +1445,7 @@ mod tests {
     /// leave them alone rather than zeroing them.
     #[test]
     fn merging_a_group_record_leaves_local_fields_alone() {
-        let mut local = stored_group();
+        let mut local = local_group();
         merge_group_from_snapshot(
             &mut local,
             &empty_group_record(),
@@ -1513,9 +1459,11 @@ mod tests {
 
     /// The intent is derived, not stored: without the flag nothing is pending,
     /// however far the local row has drifted.
+    /// The intent is derived from the published bytes, not stored: a row that
+    /// disagrees with its record is what makes the field pending.
     #[test]
-    fn group_publish_intent_is_empty_without_the_flag() {
-        let mut local = stored_group();
+    fn group_publish_intent_diffs_against_the_record() {
+        let mut local = local_group();
         local.muted_until_timestamp = i64::MAX as u64;
 
         let record = StorageRecord {
@@ -1523,11 +1471,10 @@ mod tests {
         }
         .encode_to_vec();
 
-        assert!(!GroupPendingPublish::default().any());
-        assert!(
-            GroupPendingPublish::diff(&record, &local).unwrap().muted,
-            "a flagged group that disagrees with its record is pending"
-        );
+        assert!(GroupPendingPublish::diff(&record, &local).unwrap().muted);
+
+        local.muted_until_timestamp = 0;
+        assert!(!GroupPendingPublish::diff(&record, &local).unwrap().muted);
     }
 
     /// And the mirror image: a pending mute survives the pre-mute record,

@@ -1766,11 +1766,7 @@ impl<S: Store> Manager<S, Registered> {
         master_key: GroupMasterKeyBytes,
         muted_until_timestamp: u64,
     ) -> Result<(), Error<S::Error>> {
-        let mut group = self
-            .store
-            .group(master_key)
-            .await?
-            .ok_or(Error::UnknownGroup)?;
+        let mut group = self.stored_group(&master_key).await?;
         group.muted_until_timestamp = muted_until_timestamp;
         self.store.save_group(master_key, group).await?;
         self.store
