@@ -56,14 +56,12 @@ pub struct StorageSyncCursor {
 
 /// Which storage-service record an update targets.
 ///
-/// One variant today, because contacts are the only records anything writes.
-/// Groups and the account record get their own when something needs them — the
-/// point of naming the axis now is that adding a variant becomes a compile error
-/// at every site that has to care, rather than a silently contact-shaped API that
-/// has to be unpicked later.
+/// The account record gets its own variant when something needs it. Adding one
+/// is a compile error at every site that has to care, which is the point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageRecordKey {
     Contact(ServiceId),
+    GroupV2(GroupMasterKeyBytes),
 }
 
 impl StorageRecordKey {
@@ -71,27 +69,30 @@ impl StorageRecordKey {
     pub fn item_type(&self) -> manifest_record::identifier::Type {
         match self {
             Self::Contact(_) => manifest_record::identifier::Type::Contact,
+            Self::GroupV2(_) => manifest_record::identifier::Type::Groupv2,
         }
     }
 }
 
-/// Where a contact's storage-service record currently lives, and what it says.
+/// Where a storage-service record currently lives, and what it says.
 ///
 /// A record is immutable under its identifier: changing one is an insert under a
-/// fresh id plus a delete of the old one. Updating a contact therefore needs the
-/// id its record is filed under, which is only ever learned by reading the
-/// manifest.
+/// fresh id plus a delete of the old one. Updating one therefore needs the id it
+/// is filed under, which is only ever learned by reading the manifest.
 ///
 /// `record` is the whole decrypted `StorageRecord`, which is a deliberate
 /// departure from Signal-Desktop — it keeps only the *unknown* fields
 /// (`storageUnknownFields`) and rebuilds the known ones from its conversation
 /// model at upload time. That works because Desktop's model is a faithful
-/// superset of `ContactRecord`. [`Contact`] is not: it drops `identity_key`,
-/// `identity_state` and `avatar_color`, and collapses `given_name`/`family_name`
-/// into one string. Rebuilding from it would quietly erase those fields on every
-/// write, so an update edits these bytes instead of regenerating them.
+/// superset of every record it writes. presage's is not. [`Contact`] drops
+/// `identity_key`, `identity_state` and `avatar_color`, and collapses
+/// `given_name`/`family_name` into one string; [`Group`] is lossier still, with
+/// no `avatar_color` and no `verified_name_hash`, and `avatarColor` has explicit
+/// presence so a re-encode could not even restore its absence. Rebuilding from
+/// either would quietly erase those fields on every write, so an update edits
+/// these bytes instead of regenerating them.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ContactStorageIdentity {
+pub struct StorageRecordIdentity {
     /// The 16-byte manifest identifier the record is filed under.
     pub storage_id: Vec<u8>,
     /// Manifest version this identifier was read at. Diagnostic only — the
@@ -481,7 +482,7 @@ pub trait ContentsStore: Send + Sync {
     fn contact_storage_identity(
         &self,
         _id: &ServiceId,
-    ) -> impl Future<Output = Result<Option<ContactStorageIdentity>, Self::ContentsStoreError>> + Send
+    ) -> impl Future<Output = Result<Option<StorageRecordIdentity>, Self::ContentsStoreError>> + Send
     {
         async { Ok(None) }
     }
@@ -491,7 +492,7 @@ pub trait ContentsStore: Send + Sync {
     fn save_contact_storage_identity(
         &mut self,
         _id: &ServiceId,
-        _identity: &ContactStorageIdentity,
+        _identity: &StorageRecordIdentity,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
         async { Ok(()) }
     }
@@ -513,6 +514,51 @@ pub trait ContentsStore: Send + Sync {
     fn contacts_needing_storage_sync(
         &self,
     ) -> impl Future<Output = Result<Vec<ServiceId>, Self::ContentsStoreError>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Where this group's storage-service record lives, if we have ever read it.
+    ///
+    /// The default returns `None`, which reads as "we don't know where it is".
+    /// Callers must treat that as a reason to sync before writing, never as a
+    /// reason to write blind — appending a record the account already holds
+    /// under another id duplicates it on every device.
+    fn group_storage_identity(
+        &self,
+        _master_key: GroupMasterKeyBytes,
+    ) -> impl Future<Output = Result<Option<StorageRecordIdentity>, Self::ContentsStoreError>> + Send
+    {
+        async { Ok(None) }
+    }
+
+    /// Record where a group's storage-service record lives. Called once per
+    /// group per storage sync, alongside [`save_group`](Self::save_group).
+    fn save_group_storage_identity(
+        &mut self,
+        _master_key: GroupMasterKeyBytes,
+        _identity: &StorageRecordIdentity,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Mark a group as having a local change not yet published to the storage
+    /// service, or clear that mark once it has been.
+    ///
+    /// The durable half of a publish, exactly as for contacts: the upload can
+    /// fail or be interrupted, but the intent survives a restart.
+    fn set_group_needs_storage_sync(
+        &mut self,
+        _master_key: GroupMasterKeyBytes,
+        _needs_sync: bool,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Every group with an unpublished local change, for the boot-time flush.
+    fn groups_needing_storage_sync(
+        &self,
+    ) -> impl Future<Output = Result<Vec<GroupMasterKeyBytes>, Self::ContentsStoreError>> + Send
+    {
         async { Ok(Vec::new()) }
     }
 
