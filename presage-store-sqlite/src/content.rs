@@ -583,8 +583,9 @@ impl ContentsStore for SqliteStore {
                 members, pending_members, requesting_members,
                 needs_hydration, blocked, whitelisted, archived, marked_unread,
                 muted_until_timestamp, dont_notify_for_mentions_if_muted,
-                hide_story, story_send_mode, disappearing_messages_timer
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                hide_story, story_send_mode, disappearing_messages_timer,
+                announcements_only
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             master_key,
             group_id_slice,
             g.title,
@@ -606,6 +607,7 @@ impl ContentsStore for SqliteStore {
             g.hide_story,
             g.story_send_mode,
             g.disappearing_messages_timer,
+            g.announcements_only,
         )
         .execute(&self.db)
         .await?;
@@ -632,7 +634,8 @@ impl ContentsStore for SqliteStore {
                 dont_notify_for_mentions_if_muted,
                 hide_story,
                 story_send_mode,
-                disappearing_messages_timer
+                disappearing_messages_timer,
+                announcements_only
             FROM groups"#,
         )
         .fetch_all(&self.db)
@@ -664,7 +667,8 @@ impl ContentsStore for SqliteStore {
                 dont_notify_for_mentions_if_muted,
                 hide_story,
                 story_send_mode,
-                disappearing_messages_timer
+                disappearing_messages_timer,
+                announcements_only
             FROM groups
             WHERE master_key = ?
             LIMIT 1"#,

@@ -176,6 +176,7 @@ pub(crate) struct SqlGroup<'a> {
     pub(crate) hide_story: bool,
     pub(crate) story_send_mode: i64,
     pub(crate) disappearing_messages_timer: Option<i64>,
+    pub(crate) announcements_only: bool,
 }
 
 impl SqlGroup<'_> {
@@ -204,6 +205,7 @@ impl SqlGroup<'_> {
             disappearing_messages_timer: group
                 .disappearing_messages_timer
                 .map(|t| t.duration as i64),
+            announcements_only: group.announcements_only,
         }
     }
 
@@ -230,6 +232,7 @@ impl SqlGroup<'_> {
             hide_story,
             story_send_mode,
             disappearing_messages_timer,
+            announcements_only,
         } = self;
         let master_key = master_key
             .as_ref()
@@ -257,6 +260,7 @@ impl SqlGroup<'_> {
             dont_notify_for_mentions_if_muted,
             hide_story,
             story_send_mode,
+            announcements_only,
         };
         Ok((master_key, group))
     }
