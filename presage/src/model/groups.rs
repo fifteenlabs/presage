@@ -45,7 +45,12 @@ impl From<GroupAccess> for AccessRequired {
 /// The attributes a group change can carry, for [`Manager::update_group`](crate::Manager::update_group).
 ///
 /// `None` leaves a field as it is. An empty description clears it; a zero timer turns
-/// disappearing messages off.
+/// disappearing messages off. `announcements_only` is the membership rule for sending:
+/// set, only administrators may send to the group.
+///
+/// Setting `member_label_access` to [`GroupAccess::Administrators`] is not only a
+/// rule change: it also clears the labels that rule takes away, in the same change —
+/// see [`Group::members_losing_labels`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupUpdate {
     pub title: Option<String>,
@@ -53,6 +58,8 @@ pub struct GroupUpdate {
     pub expire_timer_seconds: Option<u32>,
     pub attributes_access: Option<GroupAccess>,
     pub members_access: Option<GroupAccess>,
+    pub member_label_access: Option<GroupAccess>,
+    pub announcements_only: Option<bool>,
 }
 
 impl GroupUpdate {
@@ -95,6 +102,8 @@ pub struct Group {
     pub requesting_members: Vec<RequestingMember>,
     pub invite_link_password: Vec<u8>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub announcements_only: bool,
     #[serde(default)]
     pub needs_hydration: bool,
     // storage service fields
@@ -172,6 +181,29 @@ impl Group {
     /// Leaving, or being removed, is what makes this false — there is no flag.
     pub fn is_active(&self, self_aci: Aci) -> bool {
         self.is_member(self_aci) || self.is_pending(ServiceId::from(self_aci))
+    }
+
+    /// The members whose labels handing member labels to administrators takes
+    /// away. Signal-Desktop's `buildAccessControlMemberLabelChange` and
+    /// Signal-Android's `updateMemberLabelRights` clear these in the same change;
+    /// a label a member may no longer set would otherwise stay on the group forever.
+    ///
+    /// Empty unless the rule is actually tightening — loosening it, or restating a
+    /// restriction already in force, takes nothing away.
+    pub fn members_losing_labels(&self, new_access: GroupAccess) -> Vec<Aci> {
+        let already_restricted = self
+            .access_control
+            .as_ref()
+            .is_some_and(|ac| ac.member_label == AccessRequired::Administrator);
+        if new_access != GroupAccess::Administrators || already_restricted {
+            return Vec::new();
+        }
+        self.members
+            .iter()
+            .filter(|m| m.role != Role::Administrator)
+            .filter(|m| m.label.is_some() || m.label_emoji.is_some())
+            .map(|m| m.aci)
+            .collect()
     }
 
     /// What the stored copy becomes once this account has left at `revision`,
@@ -263,6 +295,7 @@ impl From<libsignal_service::groups_v2::Group> for Group {
                 .collect(),
             invite_link_password: val.invite_link_password,
             description: val.description_text,
+            announcements_only: val.announcements_only,
             needs_hydration: false,
             blocked: false,
             whitelisted: false,

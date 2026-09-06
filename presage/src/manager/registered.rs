@@ -653,12 +653,16 @@ impl<S: Store> Manager<S, Registered> {
             return Err(Error::EmptyGroupUpdate);
         }
         let local = self.stored_group(master_key_bytes).await?;
+        let clearing = update
+            .member_label_access
+            .map(|access| local.members_losing_labels(access))
+            .unwrap_or_default();
         let context = self
             .apply_group_change(
                 master_key_bytes,
                 local.revision,
                 |operations, version, rng| {
-                    Ok(group_update_actions(operations, &update, version, rng))
+                    group_update_actions(operations, &clearing, &update, version, rng)
                 },
             )
             .await?;
@@ -2863,13 +2867,14 @@ async fn fetch_group<E: std::error::Error>(
     Ok(decrypt_group(master_key_bytes, encrypted)?)
 }
 
-fn group_update_actions<R: Rng + CryptoRng>(
+fn group_update_actions<R: Rng + CryptoRng, E: std::error::Error>(
     operations: &GroupOperations,
+    clearing_labels: &[Aci],
     update: &GroupUpdate,
     version: u32,
     rng: &mut R,
-) -> group_change::Actions {
-    group_change::Actions {
+) -> Result<group_change::Actions, Error<E>> {
+    Ok(group_change::Actions {
         version,
         modify_title: update
             .title
@@ -2888,8 +2893,18 @@ fn group_update_actions<R: Rng + CryptoRng>(
         modify_member_access: update
             .members_access
             .map(|access| operations.build_modify_members_access_action(access.into())),
+        modify_member_label_access: update
+            .member_label_access
+            .map(|access| operations.build_modify_member_label_access_action(access.into())),
+        modify_member_labels: clearing_labels
+            .iter()
+            .map(|aci| Ok(operations.build_modify_member_label_action(*aci, None, None, rng)?))
+            .collect::<Result<_, Error<E>>>()?,
+        modify_announcements_only: update
+            .announcements_only
+            .map(|only| operations.build_modify_announcements_only_action(only)),
         ..Default::default()
-    }
+    })
 }
 
 fn group_members_actions<E: std::error::Error>(
@@ -3533,6 +3548,8 @@ mod tests {
 
     use futures::io::{AsyncRead, Cursor};
 
+    use crate::model::groups::GroupAccess;
+
     fn member(aci: Aci, role: Role) -> crate::model::groups::Member {
         crate::model::groups::Member {
             aci,
@@ -3541,6 +3558,13 @@ mod tests {
             joined_at_revision: 0,
             label: None,
             label_emoji: None,
+        }
+    }
+
+    fn labelled(aci: Aci, role: Role) -> crate::model::groups::Member {
+        crate::model::groups::Member {
+            label: Some("Treasurer".into()),
+            ..member(aci, role)
         }
     }
 
@@ -3556,6 +3580,7 @@ mod tests {
             requesting_members: vec![],
             invite_link_password: vec![],
             description: None,
+            announcements_only: false,
             needs_hydration: false,
             blocked: false,
             whitelisted: false,
@@ -3566,6 +3591,42 @@ mod tests {
             hide_story: false,
             story_send_mode: 0,
         }
+    }
+
+    fn group_with_member_label_access(
+        access: AccessRequired,
+        members: Vec<crate::model::groups::Member>,
+    ) -> Group {
+        Group {
+            access_control: Some(crate::model::groups::AccessControl {
+                attributes: AccessRequired::Member,
+                members: AccessRequired::Member,
+                add_from_invite_link: AccessRequired::Unsatisfiable,
+                member_label: access,
+            }),
+            ..group_with(members)
+        }
+    }
+
+    fn operations() -> GroupOperations {
+        GroupOperations::new(GroupSecretParams::derive_from_master_key(
+            GroupMasterKey::new([7u8; 32]),
+        ))
+    }
+
+    fn update_actions(
+        clearing_labels: &[Aci],
+        update: &GroupUpdate,
+        version: u32,
+    ) -> group_change::Actions {
+        group_update_actions::<_, io::Error>(
+            &operations(),
+            clearing_labels,
+            update,
+            version,
+            &mut StdRng::from_os_rng(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3650,18 +3711,14 @@ mod tests {
 
     #[test]
     fn group_update_actions_carry_only_what_was_set() {
-        let operations = GroupOperations::new(GroupSecretParams::derive_from_master_key(
-            GroupMasterKey::new([7u8; 32]),
-        ));
-        let mut rng = StdRng::from_os_rng();
         let update = GroupUpdate {
             title: Some("Renamed".into()),
             expire_timer_seconds: Some(0),
-            members_access: Some(crate::model::groups::GroupAccess::Administrators),
+            members_access: Some(GroupAccess::Administrators),
             ..Default::default()
         };
 
-        let actions = group_update_actions(&operations, &update, 9, &mut rng);
+        let actions = update_actions(&[], &update, 9);
 
         assert_eq!(actions.version, 9);
         assert!(actions.source_user_id.is_empty());
@@ -3670,10 +3727,90 @@ mod tests {
         assert!(actions.modify_description.is_none());
         assert!(actions.modify_disappearing_message_timer.is_some());
         assert!(actions.modify_attributes_access.is_none());
+        assert!(actions.modify_announcements_only.is_none());
+        assert!(actions.modify_member_label_access.is_none());
         assert_eq!(
             actions.modify_member_access.map(|a| a.members_access),
             Some(i32::from(AccessRequired::Administrator))
         );
+    }
+
+    #[test]
+    fn only_admins_may_send_is_a_flag_not_an_access_rule() {
+        let update = GroupUpdate {
+            announcements_only: Some(true),
+            ..Default::default()
+        };
+
+        let actions = update_actions(&[], &update, 2);
+
+        assert_eq!(
+            actions
+                .modify_announcements_only
+                .map(|a| a.announcements_only),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn restricting_member_labels_takes_away_only_the_labels_it_has_to() {
+        let losing = Aci::from(Uuid::from_u128(2));
+        let group = group_with_member_label_access(
+            AccessRequired::Member,
+            vec![
+                labelled(Aci::from(Uuid::from_u128(1)), Role::Administrator),
+                labelled(losing, Role::Default),
+                member(Aci::from(Uuid::from_u128(3)), Role::Default),
+            ],
+        );
+
+        // The administrator keeps their label, and the member without one has
+        // nothing to take away.
+        assert_eq!(
+            group.members_losing_labels(GroupAccess::Administrators),
+            vec![losing]
+        );
+    }
+
+    #[test]
+    fn member_labels_are_left_alone_when_the_rule_does_not_tighten() {
+        let members = vec![labelled(Aci::from(Uuid::from_u128(2)), Role::Default)];
+        let restricted =
+            group_with_member_label_access(AccessRequired::Administrator, members.clone());
+
+        assert!(restricted
+            .members_losing_labels(GroupAccess::Members)
+            .is_empty());
+        assert!(restricted
+            .members_losing_labels(GroupAccess::Administrators)
+            .is_empty());
+        assert!(
+            group_with_member_label_access(AccessRequired::Member, members)
+                .members_losing_labels(GroupAccess::Members)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_labels_a_tightening_takes_away_are_cleared_in_the_same_change() {
+        let losing = Aci::from(Uuid::from_u128(2));
+        let update = GroupUpdate {
+            member_label_access: Some(GroupAccess::Administrators),
+            ..Default::default()
+        };
+
+        let actions = update_actions(&[losing], &update, 2);
+
+        assert_eq!(
+            actions
+                .modify_member_label_access
+                .map(|a| a.member_label_access),
+            Some(i32::from(AccessRequired::Administrator))
+        );
+        assert_eq!(actions.modify_member_labels.len(), 1);
+        let cleared = &actions.modify_member_labels[0];
+        assert!(cleared.label_string.is_empty());
+        assert!(cleared.label_emoji.is_empty());
     }
 
     #[test]

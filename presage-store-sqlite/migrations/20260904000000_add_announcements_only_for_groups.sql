@@ -1,0 +1,1 @@
+ALTER TABLE groups ADD COLUMN announcements_only BOOLEAN NOT NULL DEFAULT 0;

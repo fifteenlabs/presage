@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO groups (\n                master_key, group_id, title, revision, invite_link_password,\n                access_control, avatar, description,\n                members, pending_members, requesting_members,\n                needs_hydration, blocked, whitelisted, archived, marked_unread,\n                muted_until_timestamp, dont_notify_for_mentions_if_muted,\n                hide_story, story_send_mode, disappearing_messages_timer,\n                announcements_only\n            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 22
+    },
+    "nullable": []
+  },
+  "hash": "ec1651d01e9e0254fe3cd750af0176801537e4416f3caf6241b208cda76b40d3"
+}

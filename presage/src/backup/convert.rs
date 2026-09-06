@@ -996,6 +996,7 @@ pub fn recipient_to_group(
         requesting_members: Vec::new(),
         invite_link_password: Vec::new(),
         description: None,
+        announcements_only: false,
         needs_hydration: true,
         blocked: g.blocked,
         whitelisted: g.whitelisted,
