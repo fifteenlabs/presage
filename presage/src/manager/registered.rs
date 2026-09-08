@@ -2403,10 +2403,28 @@ impl<S: Store> Manager<S, Registered> {
             .collect();
 
         info!(count = stubs.len(), "hydrating groups");
+        let Some(first) = stubs.first().copied() else {
+            return Ok(());
+        };
+        let self_aci = self.state.data.service_ids.aci();
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
 
+        // Fetch the day's auth credential once, before any group. A refused
+        // credential is this account being unauthorised, not a group refusing it,
+        // and has to abort the pass rather than let every group below be
+        // recorded as left — 401 and 403 both arrive as `ServiceError::Unauthorized`.
+        let mut csprng = StdRng::from_os_rng();
+        groups_manager
+            .get_authorization_for_today(
+                &mut csprng,
+                GroupSecretParams::derive_from_master_key(GroupMasterKey::new(first)),
+            )
+            .await?;
+
         for master_key in stubs {
-            if let Err(e) = hydrate_group(&mut self.store, &mut groups_manager, master_key).await {
+            if let Err(e) =
+                hydrate_group(&mut self.store, &mut groups_manager, master_key, self_aci).await
+            {
                 warn!(%e, "failed to hydrate group, continuing");
             }
         }
@@ -3001,6 +3019,19 @@ fn leave_orphans_the_group(group: &Group, self_aci: Aci, promote_to_admin: &[Aci
         && !others.any(|m| m.role == Role::Administrator || promote_to_admin.contains(&m.aci))
 }
 
+/// What the stored group becomes once the group server refuses to show it to this
+/// account: the group as last known, minus this account, and no longer waiting for a
+/// hydration the server will never grant. Signal-Desktop does the same on a 403 or
+/// 404 from the state endpoint (`generateLeftGroupChanges`). The revision stays as it
+/// was — the server will not say what the current one is.
+fn group_denied(local: Option<Group>, self_aci: Aci) -> Group {
+    let mut group = local.unwrap_or_default();
+    let revision = group.revision;
+    group.mark_left(self_aci, &[], revision);
+    group.needs_hydration = false;
+    group
+}
+
 async fn upsert_group<S: Store>(
     store: &S,
     groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
@@ -3056,6 +3087,7 @@ async fn hydrate_group<S: Store>(
     store: &mut S,
     groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
     master_key: libsignal_service::zkgroup::GroupMasterKeyBytes,
+    self_aci: Aci,
 ) -> Result<(), Error<S::Error>> {
     // Seeded from the OS rather than `rand::rng()` so the future stays `Send`
     // — see the note in `upsert_group`.
@@ -3072,6 +3104,16 @@ async fn hydrate_group<S: Store>(
             );
             if let Err(e) = store.save_group(master_key, group).await {
                 error!(%e, "hydrate_group: failed to save group");
+            }
+        }
+        Err(ServiceError::Unauthorized | ServiceError::NotFoundError) => {
+            info!("hydrate_group: the server refused the group; recording it as left");
+            let local = store.group(master_key).await.ok().flatten();
+            if let Err(e) = store
+                .save_group(master_key, group_denied(local, self_aci))
+                .await
+            {
+                error!(%e, "hydrate_group: failed to save the left group");
             }
         }
         Err(e) => {
@@ -3996,5 +4038,54 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_denied_stub_stops_hydrating_and_is_inactive() {
+        let me = Aci::from(Uuid::from_u128(9));
+        let stub = Group {
+            needs_hydration: true,
+            muted_until_timestamp: 42,
+            ..Default::default()
+        };
+
+        let left = group_denied(Some(stub), me);
+
+        assert!(!left.needs_hydration);
+        assert!(!left.is_active(me));
+        assert_eq!(
+            left.muted_until_timestamp, 42,
+            "the storage-service flags are this device's and survive"
+        );
+    }
+
+    #[test]
+    fn a_denied_group_drops_only_this_account() {
+        let me = Aci::from(Uuid::from_u128(9));
+        let other = Aci::from(Uuid::from_u128(1));
+        let mut group = group_with(vec![
+            member(me, Role::Default),
+            member(other, Role::Administrator),
+        ]);
+        group.revision = 7;
+        group.title = Some("Book club".into());
+
+        let left = group_denied(Some(group), me);
+
+        assert!(!left.is_member(me));
+        assert!(left.is_member(other));
+        assert_eq!(left.revision, 7);
+        assert_eq!(left.title.as_deref(), Some("Book club"));
+        assert!(!left.needs_hydration);
+    }
+
+    #[test]
+    fn a_denied_group_with_no_local_row_is_an_inactive_stub() {
+        let me = Aci::from(Uuid::from_u128(9));
+
+        let left = group_denied(None, me);
+
+        assert!(!left.needs_hydration);
+        assert!(!left.is_active(me));
     }
 }
