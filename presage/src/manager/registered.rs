@@ -19,8 +19,8 @@ use libsignal_service::{
     content::{Content, ContentBody, Metadata},
     encrypt_device_name,
     groups_v2::{
-        decrypt_group, AccessControl, AccessRequired, GroupMemberCandidate, GroupOperations,
-        GroupsManager, InMemoryCredentialsCache, Role, Timer,
+        decrypt_group, AccessControl, AccessRequired, CredentialsCache, CredentialsCacheError,
+        GroupMemberCandidate, GroupOperations, GroupsManager, Role, Timer,
     },
     libsignal_account_keys::AccountEntropyPool,
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
@@ -53,6 +53,7 @@ use libsignal_service::{
         SignalWebSocket,
     },
     zkgroup::{
+        auth::AuthCredentialWithPniResponse,
         groups::{GroupMasterKey, GroupSecretParams},
         profiles::{ExpiringProfileKeyCredential, ProfileKey},
         GroupMasterKeyBytes, ServerPublicParams,
@@ -967,6 +968,7 @@ impl<S: Store> Manager<S, Registered> {
             &mut gm,
             context.master_key(),
             &context.revision(),
+            self.state.data.service_ids.aci(),
         )
         .await?
         else {
@@ -1030,18 +1032,22 @@ impl<S: Store> Manager<S, Registered> {
         Ok(Some(avatar))
     }
 
-    async fn groups_manager(
+    async fn groups_manager(&self) -> Result<GroupsManager<GroupCredentials>, Error<S::Error>> {
+        Box::pin(self.groups_manager_with(GroupCredentials::default())).await
+    }
+
+    async fn groups_manager_with<C: CredentialsCache>(
         &self,
-    ) -> Result<GroupsManager<InMemoryCredentialsCache>, Error<S::Error>> {
+        credentials: C,
+    ) -> Result<GroupsManager<C>, Error<S::Error>> {
         let service_configuration = self.state.service_configuration();
         let server_public_params = service_configuration.zkgroup_server_public_params;
 
-        let groups_credentials_cache = InMemoryCredentialsCache::default();
         let groups_manager = GroupsManager::new(
             self.state.data.service_ids.clone(),
             self.identified_push_service(),
             self.unidentified_websocket().await?,
-            groups_credentials_cache,
+            credentials,
             server_public_params,
         );
 
@@ -1065,7 +1071,7 @@ impl<S: Store> Manager<S, Registered> {
             encrypted_messages: Receiver,
             service_cipher_aci: ServiceCipher<AciStore>,
             service_cipher_pni: ServiceCipher<PniStore>,
-            groups_manager: GroupsManager<InMemoryCredentialsCache>,
+            groups_manager: GroupsManager<GroupCredentials>,
             service_ids: ServiceIds,
             device_id: DeviceId,
             message_sender: MessageSender<AciStore>,
@@ -1448,6 +1454,7 @@ impl<S: Store> Manager<S, Registered> {
                                             &mut state.groups_manager,
                                             master_key_bytes,
                                             revision,
+                                            state.service_ids.aci(),
                                         )
                                         .await
                                         {
@@ -1906,14 +1913,21 @@ impl<S: Store> Manager<S, Registered> {
         let mut sender = self.new_message_sender().await?;
 
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
-        let Some(group) =
-            upsert_group(&self.store, &mut groups_manager, &master_key_bytes, &0).await?
+        let self_aci = self.state.data.service_ids.aci();
+        let Some(group) = upsert_group(
+            &self.store,
+            &mut groups_manager,
+            &master_key_bytes,
+            &0,
+            self_aci,
+        )
+        .await?
         else {
             return Err(Error::UnknownGroup);
         };
 
         let sender_certificate = self.sender_certificate().await?;
-        let self_id = ServiceId::from(self.state.data.service_ids.aci());
+        let self_id = ServiceId::from(self_aci);
         // Invitees are addressed too: the group change that invited them is the
         // only way they learn of the invitation, and they read the master key from
         // it. They rarely have a profile key on file, so they get an identified send.
@@ -2406,52 +2420,65 @@ impl<S: Store> Manager<S, Registered> {
             .collect();
 
         info!(count = stubs.len(), "hydrating groups");
+        let Some(&first) = stubs.first() else {
+            return Ok(());
+        };
         let self_aci = self.state.data.service_ids.aci();
+
+        // One credential for the whole pass, fetched before any group is touched:
+        // a refusal here is this account being unauthorised, not a group refusing
+        // it — 401 and 403 both arrive as `ServiceError::Unauthorized` — and ends the
+        // pass with nothing recorded as left.
+        let mut credentials = GroupCredentials::default();
+        {
+            let mut primer = Box::pin(self.groups_manager_with(&mut credentials)).await?;
+            let mut csprng = StdRng::from_os_rng();
+            primer
+                .get_authorization_for_today(
+                    &mut csprng,
+                    GroupSecretParams::derive_from_master_key(GroupMasterKey::new(first)),
+                )
+                .await?;
+        }
+
         let per_chunk = stubs.len().div_ceil(HYDRATION_WORKERS).max(1);
         future::join_all(
             stubs
                 .chunks(per_chunk)
-                .map(|chunk| self.hydrate_chunk(chunk, self_aci)),
+                .map(|chunk| self.hydrate_chunk(chunk, credentials.clone(), self_aci)),
         )
         .await
         .into_iter()
         .collect()
     }
 
-    /// One worker's share of a hydration pass. `GroupsManager` and its credential
-    /// cache are neither `Clone` nor shareable across tasks, so each worker owns
-    /// one and fills its cache before touching a group. A refused credential is
-    /// this account being unauthorised, not a group refusing it — 401 and 403 both
-    /// arrive as `ServiceError::Unauthorized` — and is passed up so the pass reports
-    /// it; any other failure to obtain one leaves the chunk for the next pass.
-    /// Either way no group in the chunk is recorded as left on the strength of it.
+    /// One worker's share of a hydration pass, on its own `GroupsManager` seeded
+    /// with the pass's credential. A group the server refuses is recorded as left
+    /// inside `fetch_and_store_group`; a refused credential — only possible if the
+    /// day rolled over mid-pass — is account-wide and ends the chunk.
     async fn hydrate_chunk(
         &self,
-        chunk: &[libsignal_service::zkgroup::GroupMasterKeyBytes],
+        chunk: &[GroupMasterKeyBytes],
+        credentials: GroupCredentials,
         self_aci: Aci,
     ) -> Result<(), Error<S::Error>> {
-        let mut groups_manager = Box::pin(self.groups_manager()).await?;
-        let mut csprng = StdRng::from_os_rng();
-        match groups_manager
-            .get_authorization_for_today(
-                &mut csprng,
-                GroupSecretParams::derive_from_master_key(GroupMasterKey::new(chunk[0])),
+        let mut groups_manager = Box::pin(self.groups_manager_with(credentials)).await?;
+        for &master_key in chunk {
+            let local = self.store.group(master_key).await.ok().flatten();
+            match fetch_and_store_group(
+                &self.store,
+                &mut groups_manager,
+                master_key,
+                local,
+                self_aci,
             )
             .await
-        {
-            Ok(_) => {}
-            Err(ServiceError::Unauthorized) => return Err(ServiceError::Unauthorized.into()),
-            Err(e) => {
-                warn!(%e, "could not fetch a group credential; leaving this chunk for the next pass");
-                return Ok(());
-            }
-        }
-
-        for &master_key in chunk {
-            if let Err(e) =
-                hydrate_group(&self.store, &mut groups_manager, master_key, self_aci).await
             {
-                warn!(%e, "failed to hydrate group, continuing");
+                Ok(_) => {}
+                Err(Error::ServiceError(ServiceError::Unauthorized)) => {
+                    return Err(ServiceError::Unauthorized.into());
+                }
+                Err(e) => warn!(%e, "failed to hydrate group, continuing"),
             }
         }
         Ok(())
@@ -2900,8 +2927,38 @@ fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64)
 const GROUP_UPDATE_CONFLICT_RETRIES: u32 = 3;
 
 /// The server's current copy of a group, decrypted.
+/// The day's group auth credentials, as libsignal caches them, but ours to keep: a
+/// pass that runs several `GroupsManager`s fills one of these through a manager that
+/// borrows it, then hands each worker a clone, so the credential is fetched once per
+/// pass rather than once per manager. libsignal never clears the cache and writes it
+/// only on a miss for today's key, so a seeded copy is never refetched.
+#[derive(Clone, Default)]
+struct GroupCredentials(HashMap<u64, AuthCredentialWithPniResponse>);
+
+impl CredentialsCache for GroupCredentials {
+    fn clear(&mut self) -> Result<(), CredentialsCacheError> {
+        self.0.clear();
+        Ok(())
+    }
+
+    fn get(
+        &self,
+        key: &u64,
+    ) -> Result<Option<&AuthCredentialWithPniResponse>, CredentialsCacheError> {
+        Ok(self.0.get(key))
+    }
+
+    fn write(
+        &mut self,
+        map: HashMap<u64, AuthCredentialWithPniResponse>,
+    ) -> Result<(), CredentialsCacheError> {
+        self.0 = map;
+        Ok(())
+    }
+}
+
 async fn fetch_group<E: std::error::Error>(
-    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    groups_manager: &mut GroupsManager<GroupCredentials>,
     csprng: &mut StdRng,
     master_key_bytes: &[u8],
 ) -> Result<libsignal_service::groups_v2::Group, Error<E>> {
@@ -3047,11 +3104,13 @@ fn leave_orphans_the_group(group: &Group, self_aci: Aci, promote_to_admin: &[Aci
 
 async fn upsert_group<S: Store>(
     store: &S,
-    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    groups_manager: &mut GroupsManager<GroupCredentials>,
     master_key_bytes: &[u8],
     revision: &u32,
+    self_aci: Aci,
 ) -> Result<Option<Group>, Error<S::Error>> {
-    let local = match store.group(master_key_bytes.try_into()?).await {
+    let master_key: GroupMasterKeyBytes = master_key_bytes.try_into()?;
+    let local = match store.group(master_key).await {
         Ok(Some(group)) => {
             debug!(group_name =? group.title, "loaded group from local db");
             Some(group)
@@ -3062,79 +3121,64 @@ async fn upsert_group<S: Store>(
             None
         }
     };
-    let upsert_group = match &local {
-        Some(group) => group.revision < *revision,
-        None => true,
-    };
-
-    if upsert_group {
-        debug!("fetching and saving group");
-        // `rand::rng()` hands back a `ThreadRng` (`Rc<UnsafeCell<..>>`), and the
-        // temporary lives across the await below — which would make this future,
-        // and everything calling it, `!Send` for no reason. Seed a `StdRng`
-        // instead: same CSPRNG guarantees, and the future stays `Send`.
-        let mut csprng = StdRng::from_os_rng();
-        match groups_manager
-            .fetch_encrypted_group(&mut csprng, master_key_bytes)
-            .await
-        {
-            Ok(encrypted_group) => {
-                let group = Group::from_server(
-                    decrypt_group(master_key_bytes, encrypted_group)?,
-                    local.as_ref(),
-                );
-                if let Err(error) = store.save_group(master_key_bytes.try_into()?, group).await {
-                    error!(%error, "failed to save group");
-                }
-            }
-            Err(error) => {
-                warn!(%error, "failed to fetch encrypted group")
-            }
-        }
+    if local
+        .as_ref()
+        .is_some_and(|group| group.revision >= *revision)
+    {
+        return Ok(local);
     }
 
-    Ok(store.group(master_key_bytes.try_into()?).await?)
+    debug!("fetching and saving group");
+    match fetch_and_store_group(store, groups_manager, master_key, local, self_aci).await {
+        Ok(group) => Ok(group),
+        Err(error) => {
+            warn!(%error, "failed to fetch encrypted group");
+            Ok(store.group(master_key).await?)
+        }
+    }
 }
 
-async fn hydrate_group<S: Store>(
+/// The one way a group reaches the store from the server, shared by boot-time
+/// hydration and the receive path. The credential is checked before the group so
+/// that an unauthorised account surfaces as `Unauthorized` from here rather than as
+/// every group refusing it — 401 and 403 both arrive as that variant. A group the
+/// server refuses (403, or 404 for one that no longer exists) is what Signal-Desktop
+/// records as left: the local copy minus this account, and no longer waiting for a
+/// hydration that will never come.
+async fn fetch_and_store_group<S: Store>(
     store: &S,
-    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
-    master_key: libsignal_service::zkgroup::GroupMasterKeyBytes,
+    groups_manager: &mut GroupsManager<GroupCredentials>,
+    master_key: GroupMasterKeyBytes,
+    local: Option<Group>,
     self_aci: Aci,
-) -> Result<(), Error<S::Error>> {
-    // Seeded from the OS rather than `rand::rng()` so the future stays `Send`
-    // — see the note in `upsert_group`.
+) -> Result<Option<Group>, Error<S::Error>> {
+    // Seeded from the OS rather than `rand::rng()` so the future stays `Send`: a
+    // `ThreadRng` temporary living across the awaits below would make this future,
+    // and everything calling it, `!Send` for no reason.
     let mut csprng = StdRng::from_os_rng();
-    match fetch_group::<S::Error>(groups_manager, &mut csprng, master_key.as_ref()).await {
-        Ok(server) => {
-            let local = store.group(master_key).await.ok().flatten();
-            let group = Group::from_server(server, local.as_ref());
-            if let Err(e) = store.save_group(master_key, group).await {
-                error!(%e, "hydrate_group: failed to save group");
+    groups_manager
+        .get_authorization_for_today(
+            &mut csprng,
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key)),
+        )
+        .await?;
+
+    let group =
+        match fetch_group::<S::Error>(groups_manager, &mut csprng, master_key.as_ref()).await {
+            Ok(server) => Group::from_server(server, local.as_ref()),
+            Err(Error::ServiceError(ServiceError::Unauthorized | ServiceError::NotFoundError)) => {
+                info!("the group server refused the group; recording it as left");
+                let Some(mut denied) = local else {
+                    warn!("the group is no longer stored; nothing to record");
+                    return Ok(None);
+                };
+                denied.mark_denied(self_aci);
+                denied
             }
-        }
-        Err(Error::ServiceError(ServiceError::Unauthorized | ServiceError::NotFoundError)) => {
-            info!("hydrate_group: the server refused the group; recording it as left");
-            match store.group(master_key).await {
-                Ok(Some(mut local)) => {
-                    local.mark_denied(self_aci);
-                    if let Err(e) = store.save_group(master_key, local).await {
-                        error!(%e, "hydrate_group: failed to save the left group");
-                    }
-                }
-                Ok(None) => {
-                    warn!("hydrate_group: the group is no longer stored; nothing to record")
-                }
-                Err(e) => {
-                    error!(%e, "hydrate_group: failed to read the group to record it as left")
-                }
-            }
-        }
-        Err(e) => {
-            warn!(%e, "hydrate_group: failed to fetch from group server, skipping");
-        }
-    }
-    Ok(())
+            Err(e) => return Err(e),
+        };
+    store.save_group(master_key, group).await?;
+    Ok(store.group(master_key).await?)
 }
 
 /// Download and decrypt a sticker manifest
