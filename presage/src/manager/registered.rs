@@ -768,8 +768,7 @@ impl<S: Store> Manager<S, Registered> {
             .await?;
 
         let mut left = local;
-        let revision = context.revision.unwrap_or(left.revision);
-        left.mark_left(self_aci, promote_to_admin, revision);
+        left.mark_left(self_aci, promote_to_admin, context.revision);
         self.store.save_group(*master_key_bytes, left).await?;
         Ok(context)
     }
@@ -2390,6 +2389,8 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     pub async fn hydrate_groups(&mut self) -> Result<(), Error<S::Error>> {
+        // Each worker owns a `GroupsManager` and fetches one credential, so this
+        // bounds both — not the number of groups.
         const HYDRATION_WORKERS: usize = 5;
 
         let stubs: Vec<libsignal_service::zkgroup::GroupMasterKeyBytes> = self
@@ -2406,52 +2407,49 @@ impl<S: Store> Manager<S, Registered> {
 
         info!(count = stubs.len(), "hydrating groups");
         let self_aci = self.state.data.service_ids.aci();
-        let chunks = chunk_for_workers(stubs, HYDRATION_WORKERS);
-        let workers = chunks.len();
-        let outcomes = futures::future::join_all(
-            chunks
-                .into_iter()
+        let per_chunk = stubs.len().div_ceil(HYDRATION_WORKERS).max(1);
+        future::join_all(
+            stubs
+                .chunks(per_chunk)
                 .map(|chunk| self.hydrate_chunk(chunk, self_aci)),
         )
-        .await;
-
-        // A worker that could not obtain a credential hydrated nothing. One such
-        // worker is a blip; all of them is the account being unauthorised, which
-        // the caller wants to hear about.
-        let mut failures = outcomes.into_iter().filter_map(Result::err);
-        match failures.next() {
-            Some(first) if failures.count() + 1 == workers => Err(first),
-            _ => Ok(()),
-        }
+        .await
+        .into_iter()
+        .collect()
     }
 
     /// One worker's share of a hydration pass. `GroupsManager` and its credential
     /// cache are neither `Clone` nor shareable across tasks, so each worker owns
-    /// one and fills its cache before touching a group: a refused credential is
-    /// this account being unauthorised, not a group refusing it, and must skip the
-    /// chunk rather than let every group in it be recorded as left — 401 and 403
-    /// both arrive as `ServiceError::Unauthorized`.
+    /// one and fills its cache before touching a group. A refused credential is
+    /// this account being unauthorised, not a group refusing it — 401 and 403 both
+    /// arrive as `ServiceError::Unauthorized` — and is passed up so the pass reports
+    /// it; any other failure to obtain one leaves the chunk for the next pass.
+    /// Either way no group in the chunk is recorded as left on the strength of it.
     async fn hydrate_chunk(
         &self,
-        chunk: Vec<libsignal_service::zkgroup::GroupMasterKeyBytes>,
+        chunk: &[libsignal_service::zkgroup::GroupMasterKeyBytes],
         self_aci: Aci,
     ) -> Result<(), Error<S::Error>> {
-        let Some(first) = chunk.first().copied() else {
-            return Ok(());
-        };
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
         let mut csprng = StdRng::from_os_rng();
-        groups_manager
+        match groups_manager
             .get_authorization_for_today(
                 &mut csprng,
-                GroupSecretParams::derive_from_master_key(GroupMasterKey::new(first)),
+                GroupSecretParams::derive_from_master_key(GroupMasterKey::new(chunk[0])),
             )
-            .await?;
+            .await
+        {
+            Ok(_) => {}
+            Err(ServiceError::Unauthorized) => return Err(ServiceError::Unauthorized.into()),
+            Err(e) => {
+                warn!(%e, "could not fetch a group credential; leaving this chunk for the next pass");
+                return Ok(());
+            }
+        }
 
-        let mut store = self.store.clone();
-        for master_key in chunk {
+        for &master_key in chunk {
             if let Err(e) =
-                hydrate_group(&mut store, &mut groups_manager, master_key, self_aci).await
+                hydrate_group(&self.store, &mut groups_manager, master_key, self_aci).await
             {
                 warn!(%e, "failed to hydrate group, continuing");
             }
@@ -3047,31 +3045,6 @@ fn leave_orphans_the_group(group: &Group, self_aci: Aci, promote_to_admin: &[Aci
         && !others.any(|m| m.role == Role::Administrator || promote_to_admin.contains(&m.aci))
 }
 
-/// What the stored group becomes once the group server refuses to show it to this
-/// account: the group as last known, minus this account, and no longer waiting for a
-/// hydration the server will never grant. Signal-Desktop does the same on a 403 or
-/// 404 from the state endpoint (`generateLeftGroupChanges`). The revision stays as it
-/// was — the server will not say what the current one is.
-fn group_denied(local: Option<Group>, self_aci: Aci) -> Group {
-    let mut group = local.unwrap_or_default();
-    let revision = group.revision;
-    group.mark_left(self_aci, &[], revision);
-    group.needs_hydration = false;
-    group
-}
-
-/// Splits a hydration pass into at most `workers` contiguous chunks, as evenly as
-/// the count allows. Each chunk costs one `GroupsManager` and one credential
-/// fetch, so the number of chunks — not the number of groups — is what bounds
-/// both.
-fn chunk_for_workers<T: Clone>(items: Vec<T>, workers: usize) -> Vec<Vec<T>> {
-    if items.is_empty() {
-        return Vec::new();
-    }
-    let per_chunk = items.len().div_ceil(workers.max(1));
-    items.chunks(per_chunk).map(<[T]>::to_vec).collect()
-}
-
 async fn upsert_group<S: Store>(
     store: &S,
     groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
@@ -3124,7 +3097,7 @@ async fn upsert_group<S: Store>(
 }
 
 async fn hydrate_group<S: Store>(
-    store: &mut S,
+    store: &S,
     groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
     master_key: libsignal_service::zkgroup::GroupMasterKeyBytes,
     self_aci: Aci,
@@ -3132,35 +3105,30 @@ async fn hydrate_group<S: Store>(
     // Seeded from the OS rather than `rand::rng()` so the future stays `Send`
     // — see the note in `upsert_group`.
     let mut csprng = StdRng::from_os_rng();
-    match groups_manager
-        .fetch_encrypted_group(&mut csprng, master_key.as_ref())
-        .await
-    {
-        Ok(encrypted_group) => {
+    match fetch_group::<S::Error>(groups_manager, &mut csprng, master_key.as_ref()).await {
+        Ok(server) => {
             let local = store.group(master_key).await.ok().flatten();
-            let group = Group::from_server(
-                decrypt_group(master_key.as_ref(), encrypted_group)?,
-                local.as_ref(),
-            );
+            let group = Group::from_server(server, local.as_ref());
             if let Err(e) = store.save_group(master_key, group).await {
                 error!(%e, "hydrate_group: failed to save group");
             }
         }
-        Err(ServiceError::Unauthorized | ServiceError::NotFoundError) => {
+        Err(Error::ServiceError(ServiceError::Unauthorized | ServiceError::NotFoundError)) => {
             info!("hydrate_group: the server refused the group; recording it as left");
-            let local = store.group(master_key).await.ok().flatten();
-            if let Err(e) = store
-                .save_group(master_key, group_denied(local, self_aci))
-                .await
-            {
-                error!(%e, "hydrate_group: failed to save the left group");
+            match store.group(master_key).await {
+                Ok(Some(mut local)) => {
+                    local.mark_denied(self_aci);
+                    if let Err(e) = store.save_group(master_key, local).await {
+                        error!(%e, "hydrate_group: failed to save the left group");
+                    }
+                }
+                Ok(None) => {
+                    warn!("hydrate_group: the group is no longer stored; nothing to record")
+                }
+                Err(e) => {
+                    error!(%e, "hydrate_group: failed to read the group to record it as left")
+                }
             }
-        }
-        Err(ServiceError::RateLimitExceeded { retry_after }) => {
-            warn!(
-                ?retry_after,
-                "hydrate_group: rate limited by the group server; leaving the group for the next pass"
-            );
         }
         Err(e) => {
             warn!(%e, "hydrate_group: failed to fetch from group server, skipping");
@@ -4089,18 +4057,18 @@ mod tests {
     #[test]
     fn a_denied_stub_stops_hydrating_and_is_inactive() {
         let me = Aci::from(Uuid::from_u128(9));
-        let stub = Group {
+        let mut stub = Group {
             needs_hydration: true,
             muted_until_timestamp: 42,
             ..Default::default()
         };
 
-        let left = group_denied(Some(stub), me);
+        stub.mark_denied(me);
 
-        assert!(!left.needs_hydration);
-        assert!(!left.is_active(me));
+        assert!(!stub.needs_hydration);
+        assert!(!stub.is_active(me));
         assert_eq!(
-            left.muted_until_timestamp, 42,
+            stub.muted_until_timestamp, 42,
             "the storage-service flags are this device's and survive"
         );
     }
@@ -4116,43 +4084,11 @@ mod tests {
         group.revision = 7;
         group.title = Some("Book club".into());
 
-        let left = group_denied(Some(group), me);
+        group.mark_denied(me);
 
-        assert!(!left.is_member(me));
-        assert!(left.is_member(other));
-        assert_eq!(left.revision, 7);
-        assert_eq!(left.title.as_deref(), Some("Book club"));
-        assert!(!left.needs_hydration);
-    }
-
-    #[test]
-    fn a_denied_group_with_no_local_row_is_an_inactive_stub() {
-        let me = Aci::from(Uuid::from_u128(9));
-
-        let left = group_denied(None, me);
-
-        assert!(!left.needs_hydration);
-        assert!(!left.is_active(me));
-    }
-
-    #[test]
-    fn a_pass_never_uses_more_workers_than_the_ceiling() {
-        let sizes = |n: usize| -> Vec<usize> {
-            chunk_for_workers((0..n).collect(), 5)
-                .iter()
-                .map(Vec::len)
-                .collect()
-        };
-        assert_eq!(sizes(0), Vec::<usize>::new());
-        assert_eq!(sizes(3), vec![1, 1, 1]);
-        assert_eq!(sizes(5), vec![1, 1, 1, 1, 1]);
-        assert_eq!(sizes(44), vec![9, 9, 9, 9, 8]);
-        assert_eq!(sizes(100), vec![20, 20, 20, 20, 20]);
-    }
-
-    #[test]
-    fn chunking_keeps_every_group_exactly_once_in_order() {
-        let flat: Vec<u32> = chunk_for_workers((0..44).collect(), 5).concat();
-        assert_eq!(flat, (0..44).collect::<Vec<u32>>());
+        assert!(!group.is_member(me));
+        assert!(group.is_member(other));
+        assert_eq!(group.revision, 7);
+        assert_eq!(group.title.as_deref(), Some("Book club"));
     }
 }
