@@ -945,50 +945,66 @@ impl<S: Store> Manager<S, Registered> {
         &mut self,
         context: GroupContextV2,
     ) -> Result<Option<AvatarBytes>, Error<S::Error>> {
-        let master_key_bytes = context
+        let master_key_bytes: GroupMasterKeyBytes = context
             .master_key()
             .try_into()
             .expect("Master key bytes to be of size 32.");
 
-        let mut gm = Box::pin(self.groups_manager()).await?;
-        let Some(group) = upsert_group(
-            &self.store,
-            &mut gm,
-            context.master_key(),
-            &context.revision(),
-            self.state.data.service_ids.aci(),
-        )
-        .await?
-        else {
+        // A groups manager costs a configuration parse and a websocket handle, and
+        // a cached avatar needs neither: build one only for a fetch or a download.
+        let mut gm = None;
+        let local = load_group(&self.store, master_key_bytes).await;
+        let group = if local
+            .as_ref()
+            .is_some_and(|group| group.revision >= context.revision())
+        {
+            local
+        } else {
+            let gm = gm.insert(Box::pin(self.groups_manager()).await?);
+            refresh_group(
+                &self.store,
+                gm,
+                master_key_bytes,
+                local,
+                self.state.data.service_ids.aci(),
+            )
+            .await?
+        };
+        let Some(group) = group else {
             return Ok(None);
         };
 
         // Empty path means no avatar was set.
-        let Some(avatar_path) = group.avatar.as_deref().filter(|s| !s.is_empty()) else {
+        let Some(avatar_url) = group.avatar.as_deref().filter(|s| !s.is_empty()) else {
             return Ok(None);
         };
 
-        // The server path is the avatar's version: cached bytes are current only if
-        // they were downloaded from the path the group carries now. Mirrors the
-        // profile avatar cache, and Signal-Desktop's `avatar.url` comparison.
-        if let Ok(Some((cached_path, cached_bytes))) =
-            self.store.group_avatar(master_key_bytes).await
+        // Signal-Desktop compares `avatar.url`: the URL is the avatar's version.
+        if let Some((_, cached)) = self
+            .store
+            .group_avatar(master_key_bytes)
+            .await
+            .ok()
+            .flatten()
+            .filter(|(url, _)| url.as_deref() == Some(avatar_url))
         {
-            if cached_path.as_deref() == Some(avatar_path) {
-                return Ok(Some(cached_bytes));
-            }
+            return Ok(Some(cached));
         }
 
+        let mut gm = match gm {
+            Some(gm) => gm,
+            None => Box::pin(self.groups_manager()).await?,
+        };
         let avatar = gm
             .retrieve_avatar(
-                avatar_path,
+                avatar_url,
                 GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key_bytes)),
             )
             .await?;
         if let Some(avatar) = &avatar {
             let _ = self
                 .store
-                .save_group_avatar(master_key_bytes, avatar, Some(avatar_path))
+                .save_group_avatar(master_key_bytes, avatar, avatar_url)
                 .await;
         }
         Ok(avatar)
@@ -1029,7 +1045,7 @@ impl<S: Store> Manager<S, Registered> {
         let avatar = cipher.decrypt_avatar(&contents)?;
         let _ = self
             .store
-            .save_profile_avatar(uuid, profile_key, &avatar, Some(avatar_url))
+            .save_profile_avatar(uuid, profile_key, &avatar, avatar_url)
             .await;
         Ok(Some(avatar))
     }
@@ -3112,7 +3128,18 @@ async fn upsert_group<S: Store>(
     self_aci: Aci,
 ) -> Result<Option<Group>, Error<S::Error>> {
     let master_key: GroupMasterKeyBytes = master_key_bytes.try_into()?;
-    let local = match store.group(master_key).await {
+    let local = load_group(store, master_key).await;
+    if local
+        .as_ref()
+        .is_some_and(|group| group.revision >= *revision)
+    {
+        return Ok(local);
+    }
+    refresh_group(store, groups_manager, master_key, local, self_aci).await
+}
+
+async fn load_group<S: Store>(store: &S, master_key: GroupMasterKeyBytes) -> Option<Group> {
+    match store.group(master_key).await {
         Ok(Some(group)) => {
             debug!(group_name =? group.title, "loaded group from local db");
             Some(group)
@@ -3122,14 +3149,18 @@ async fn upsert_group<S: Store>(
             warn!(%error, "failed to retrieve group from local db");
             None
         }
-    };
-    if local
-        .as_ref()
-        .is_some_and(|group| group.revision >= *revision)
-    {
-        return Ok(local);
     }
+}
 
+/// Fetches the group from the server over `local` and stores it; when the fetch
+/// fails the stored copy, if any, is what the caller gets.
+async fn refresh_group<S: Store>(
+    store: &S,
+    groups_manager: &mut GroupsManager<GroupCredentials>,
+    master_key: GroupMasterKeyBytes,
+    local: Option<Group>,
+    self_aci: Aci,
+) -> Result<Option<Group>, Error<S::Error>> {
     debug!("fetching and saving group");
     match fetch_and_store_group(store, groups_manager, master_key, local, self_aci).await {
         Ok(group) => Ok(group),

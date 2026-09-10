@@ -706,14 +706,14 @@ impl ContentsStore for SqliteStore {
         &self,
         master_key: GroupMasterKeyBytes,
         avatar: &AvatarBytes,
-        path: Option<&str>,
+        url: &str,
     ) -> Result<(), Self::ContentsStoreError> {
         let master_key_bytes = master_key.as_slice();
         query!(
             "INSERT OR REPLACE INTO group_avatars(group_master_key, bytes, url) VALUES (?, ?, ?)",
             master_key_bytes,
             avatar,
-            path,
+            url,
         )
         .execute(&self.db)
         .await?;
@@ -825,7 +825,7 @@ impl ContentsStore for SqliteStore {
         uuid: Uuid,
         _key: ProfileKey,
         profile: &AvatarBytes,
-        url: Option<&str>,
+        url: &str,
     ) -> Result<(), Self::ContentsStoreError> {
         query!(
             "INSERT OR REPLACE INTO profile_avatars(uuid, bytes, url) VALUES (?, ?, ?)",
