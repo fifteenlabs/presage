@@ -2390,6 +2390,8 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     pub async fn hydrate_groups(&mut self) -> Result<(), Error<S::Error>> {
+        const HYDRATION_WORKERS: usize = 5;
+
         let stubs: Vec<libsignal_service::zkgroup::GroupMasterKeyBytes> = self
             .store
             .groups()
@@ -2403,16 +2405,41 @@ impl<S: Store> Manager<S, Registered> {
             .collect();
 
         info!(count = stubs.len(), "hydrating groups");
-        let Some(first) = stubs.first().copied() else {
+        let self_aci = self.state.data.service_ids.aci();
+        let chunks = chunk_for_workers(stubs, HYDRATION_WORKERS);
+        let workers = chunks.len();
+        let outcomes = futures::future::join_all(
+            chunks
+                .into_iter()
+                .map(|chunk| self.hydrate_chunk(chunk, self_aci)),
+        )
+        .await;
+
+        // A worker that could not obtain a credential hydrated nothing. One such
+        // worker is a blip; all of them is the account being unauthorised, which
+        // the caller wants to hear about.
+        let mut failures = outcomes.into_iter().filter_map(Result::err);
+        match failures.next() {
+            Some(first) if failures.count() + 1 == workers => Err(first),
+            _ => Ok(()),
+        }
+    }
+
+    /// One worker's share of a hydration pass. `GroupsManager` and its credential
+    /// cache are neither `Clone` nor shareable across tasks, so each worker owns
+    /// one and fills its cache before touching a group: a refused credential is
+    /// this account being unauthorised, not a group refusing it, and must skip the
+    /// chunk rather than let every group in it be recorded as left — 401 and 403
+    /// both arrive as `ServiceError::Unauthorized`.
+    async fn hydrate_chunk(
+        &self,
+        chunk: Vec<libsignal_service::zkgroup::GroupMasterKeyBytes>,
+        self_aci: Aci,
+    ) -> Result<(), Error<S::Error>> {
+        let Some(first) = chunk.first().copied() else {
             return Ok(());
         };
-        let self_aci = self.state.data.service_ids.aci();
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
-
-        // Fetch the day's auth credential once, before any group. A refused
-        // credential is this account being unauthorised, not a group refusing it,
-        // and has to abort the pass rather than let every group below be
-        // recorded as left — 401 and 403 both arrive as `ServiceError::Unauthorized`.
         let mut csprng = StdRng::from_os_rng();
         groups_manager
             .get_authorization_for_today(
@@ -2421,9 +2448,10 @@ impl<S: Store> Manager<S, Registered> {
             )
             .await?;
 
-        for master_key in stubs {
+        let mut store = self.store.clone();
+        for master_key in chunk {
             if let Err(e) =
-                hydrate_group(&mut self.store, &mut groups_manager, master_key, self_aci).await
+                hydrate_group(&mut store, &mut groups_manager, master_key, self_aci).await
             {
                 warn!(%e, "failed to hydrate group, continuing");
             }
@@ -3032,6 +3060,18 @@ fn group_denied(local: Option<Group>, self_aci: Aci) -> Group {
     group
 }
 
+/// Splits a hydration pass into at most `workers` contiguous chunks, as evenly as
+/// the count allows. Each chunk costs one `GroupsManager` and one credential
+/// fetch, so the number of chunks — not the number of groups — is what bounds
+/// both.
+fn chunk_for_workers<T: Clone>(items: Vec<T>, workers: usize) -> Vec<Vec<T>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let per_chunk = items.len().div_ceil(workers.max(1));
+    items.chunks(per_chunk).map(<[T]>::to_vec).collect()
+}
+
 async fn upsert_group<S: Store>(
     store: &S,
     groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
@@ -3115,6 +3155,12 @@ async fn hydrate_group<S: Store>(
             {
                 error!(%e, "hydrate_group: failed to save the left group");
             }
+        }
+        Err(ServiceError::RateLimitExceeded { retry_after }) => {
+            warn!(
+                ?retry_after,
+                "hydrate_group: rate limited by the group server; leaving the group for the next pass"
+            );
         }
         Err(e) => {
             warn!(%e, "hydrate_group: failed to fetch from group server, skipping");
@@ -4087,5 +4133,26 @@ mod tests {
 
         assert!(!left.needs_hydration);
         assert!(!left.is_active(me));
+    }
+
+    #[test]
+    fn a_pass_never_uses_more_workers_than_the_ceiling() {
+        let sizes = |n: usize| -> Vec<usize> {
+            chunk_for_workers((0..n).collect(), 5)
+                .iter()
+                .map(Vec::len)
+                .collect()
+        };
+        assert_eq!(sizes(0), Vec::<usize>::new());
+        assert_eq!(sizes(3), vec![1, 1, 1]);
+        assert_eq!(sizes(5), vec![1, 1, 1, 1, 1]);
+        assert_eq!(sizes(44), vec![9, 9, 9, 9, 8]);
+        assert_eq!(sizes(100), vec![20, 20, 20, 20, 20]);
+    }
+
+    #[test]
+    fn chunking_keeps_every_group_exactly_once_in_order() {
+        let flat: Vec<u32> = chunk_for_workers((0..44).collect(), 5).concat();
+        assert_eq!(flat, (0..44).collect::<Vec<u32>>());
     }
 }
