@@ -706,12 +706,14 @@ impl ContentsStore for SqliteStore {
         &self,
         master_key: GroupMasterKeyBytes,
         avatar: &AvatarBytes,
+        url: &str,
     ) -> Result<(), Self::ContentsStoreError> {
         let master_key_bytes = master_key.as_slice();
         query!(
-            "INSERT OR REPLACE INTO group_avatars(group_master_key, bytes) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO group_avatars(group_master_key, bytes, url) VALUES (?, ?, ?)",
             master_key_bytes,
             avatar,
+            url,
         )
         .execute(&self.db)
         .await?;
@@ -721,15 +723,16 @@ impl ContentsStore for SqliteStore {
     async fn group_avatar(
         &self,
         master_key: GroupMasterKeyBytes,
-    ) -> Result<Option<AvatarBytes>, Self::ContentsStoreError> {
+    ) -> Result<Option<(Option<String>, AvatarBytes)>, Self::ContentsStoreError> {
         let master_key_bytes = master_key.as_slice();
-        query_scalar!(
-            "SELECT bytes FROM group_avatars WHERE group_master_key = ?",
+        query!(
+            "SELECT bytes, url FROM group_avatars WHERE group_master_key = ?",
             master_key_bytes,
         )
         .fetch_optional(&self.db)
         .await
         .map_err(From::from)
+        .map(|opt| opt.map(|r| (r.url, r.bytes)))
     }
 
     async fn upsert_profile_key(
@@ -822,7 +825,7 @@ impl ContentsStore for SqliteStore {
         uuid: Uuid,
         _key: ProfileKey,
         profile: &AvatarBytes,
-        url: Option<&str>,
+        url: &str,
     ) -> Result<(), Self::ContentsStoreError> {
         query!(
             "INSERT OR REPLACE INTO profile_avatars(uuid, bytes, url) VALUES (?, ?, ?)",
