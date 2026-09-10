@@ -950,18 +950,6 @@ impl<S: Store> Manager<S, Registered> {
             .try_into()
             .expect("Master key bytes to be of size 32.");
 
-        // Check if group avatar is cached.
-        // TODO: Is there some way to know if this is outdated?
-        if let Some(avatar) = self
-            .store
-            .group_avatar(master_key_bytes)
-            .await
-            .ok()
-            .flatten()
-        {
-            return Ok(Some(avatar));
-        }
-
         let mut gm = Box::pin(self.groups_manager()).await?;
         let Some(group) = upsert_group(
             &self.store,
@@ -980,6 +968,17 @@ impl<S: Store> Manager<S, Registered> {
             return Ok(None);
         };
 
+        // The server path is the avatar's version: cached bytes are current only if
+        // they were downloaded from the path the group carries now. Mirrors the
+        // profile avatar cache, and Signal-Desktop's `avatar.url` comparison.
+        if let Ok(Some((cached_path, cached_bytes))) =
+            self.store.group_avatar(master_key_bytes).await
+        {
+            if cached_path.as_deref() == Some(avatar_path) {
+                return Ok(Some(cached_bytes));
+            }
+        }
+
         let avatar = gm
             .retrieve_avatar(
                 avatar_path,
@@ -987,7 +986,10 @@ impl<S: Store> Manager<S, Registered> {
             )
             .await?;
         if let Some(avatar) = &avatar {
-            let _ = self.store.save_group_avatar(master_key_bytes, avatar).await;
+            let _ = self
+                .store
+                .save_group_avatar(master_key_bytes, avatar, Some(avatar_path))
+                .await;
         }
         Ok(avatar)
     }

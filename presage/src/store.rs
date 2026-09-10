@@ -608,18 +608,20 @@ pub trait ContentsStore: Send + Sync {
         }
     }
 
-    /// Save a group avatar in the cache
+    /// Save a group avatar in the cache, with the server path it was downloaded from.
     fn save_group_avatar(
         &self,
         master_key: GroupMasterKeyBytes,
         avatar: &AvatarBytes,
+        path: Option<&str>,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
     /// Retrieve a group avatar from the cache.
+    /// Returns `(path, bytes)` where `path` is the server-side avatar path stored at last download.
     fn group_avatar(
         &self,
         master_key: GroupMasterKeyBytes,
-    ) -> impl Future<Output = Result<Option<AvatarBytes>, Self::ContentsStoreError>>;
+    ) -> impl Future<Output = Result<Option<(Option<String>, AvatarBytes)>, Self::ContentsStoreError>>;
 
     // Profiles
 
