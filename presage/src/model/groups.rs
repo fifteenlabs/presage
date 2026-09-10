@@ -206,10 +206,11 @@ impl Group {
             .collect()
     }
 
-    /// What the stored copy becomes once this account has left at `revision`,
-    /// with `promoted` made administrators on the way out — the server will not
-    /// tell this account any more, so the change is applied by hand.
-    pub(crate) fn mark_left(&mut self, self_aci: Aci, promoted: &[Aci], revision: u32) {
+    /// What the stored copy becomes once this account has left, at `revision`
+    /// when the server named one, with `promoted` made administrators on the way
+    /// out — the server will not tell this account any more, so the change is
+    /// applied by hand.
+    pub(crate) fn mark_left(&mut self, self_aci: Aci, promoted: &[Aci], revision: Option<u32>) {
         self.members.retain(|m| m.aci != self_aci);
         self.pending_members
             .retain(|p| p.service_id() != ServiceId::from(self_aci));
@@ -218,7 +219,20 @@ impl Group {
                 member.role = Role::Administrator;
             }
         }
-        self.revision = revision;
+        if let Some(revision) = revision {
+            self.revision = revision;
+        }
+    }
+
+    /// What the stored copy becomes once the group server refuses to show the
+    /// group to this account: as last known, minus this account, and no longer
+    /// waiting for a hydration the server will never grant. Signal-Desktop does
+    /// the same on a 403 or 404 from the state endpoint
+    /// (`generateLeftGroupChanges`). The revision stays as it was — the server
+    /// will not say what the current one is.
+    pub(crate) fn mark_denied(&mut self, self_aci: Aci) {
+        self.mark_left(self_aci, &[], None);
+        self.needs_hydration = false;
     }
 
     /// The server's copy of a group, keeping what only this device knows.
