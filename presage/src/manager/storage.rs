@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use libsignal_service::{
     master_key::StorageServiceKey,
-    prelude::{ProfileKey, ProtobufMessage},
+    prelude::{ProfileKey, ProtobufMessage, Uuid},
     proto::{
         manifest_record, storage_record, sync_message, ManifestRecord, StorageRecord, SyncMessage,
     },
@@ -31,11 +31,13 @@ use libsignal_service::{
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use tracing::{debug, info, warn};
 
+use crate::model::chat_folders::{ChatFolder, ChatFolderType};
 use crate::model::contacts::Contact;
 use crate::model::groups::Group;
 use crate::storage_record::{
-    contact_blocked, contact_muted_until, group_muted_until, set_contact_blocked,
-    set_contact_muted_until, set_group_muted_until, StorageRecordEditError,
+    chat_folder_unknown_fields, contact_blocked, contact_muted_until, encode_chat_folder_record,
+    group_muted_until, set_contact_blocked, set_contact_muted_until, set_group_muted_until,
+    StorageRecordEditError,
 };
 use crate::store::{StorageRecordIdentity, StorageRecordKey, StorageSyncCursor, Store};
 use crate::{Error, Manager};
@@ -45,6 +47,17 @@ use super::Registered;
 /// Maximum number of storage-service keys to request in a single `ReadOperation`.
 /// Signal Desktop uses 2500; the server's hard limit is ~5120.
 const STORAGE_SERVICE_BATCH_SIZE: usize = 2500;
+
+/// How long a chat-folder tombstone stays in the manifest before this device
+/// drops it. Signal-Desktop uses `max(messageQueueTime, 30 days)`; presage has
+/// no remote config, so the floor is the value.
+const CHAT_FOLDER_TOMBSTONE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// A tombstone timestamp that is already past [`CHAT_FOLDER_TOMBSTONE_TTL`].
+/// Given to a row that must leave the manifest on the next publish without
+/// ever being published as a tombstone — a duplicate all-chats folder, which
+/// every client would revive if it saw a tombstone for it.
+const CHAT_FOLDER_EXPIRED_AT_MS: u64 = 1;
 
 /// How many times to attempt a manifest write before giving up.
 ///
@@ -188,75 +201,72 @@ impl<S: Store> Manager<S, Registered> {
         Err(Error::StorageManifestConflict)
     }
 
-    /// Build and write a manifest that replaces one record with another: the new
-    /// bytes go in under a fresh identifier and the old identifier is deleted, in
-    /// a single write.
+    /// One manifest write: put `inserts` in under fresh identifiers and drop
+    /// `delete_ids`. Returns the fresh identifiers in `inserts` order.
     ///
-    /// A record is immutable under its identifier, so this is the only shape an
-    /// update can take. `new_record` is an encoded `StorageRecord` and is written
-    /// byte-for-byte — build it with [`crate::storage_record`], not by re-encoding
-    /// a decoded record.
+    /// A record is immutable under its identifier, so a replace is an insert
+    /// plus a delete, and a reorder of N folders is N of each; this is the one
+    /// shape every edit takes. Every identifier not named in `delete_ids` is
+    /// copied through with its bytes, its type and its position — the server
+    /// treats the manifest as the complete index of the account, so anything
+    /// dropped here is deleted from every device the user owns, record types
+    /// presage cannot model included.
     ///
-    /// `current` must be the manifest as the server holds it *now*, and the caller
-    /// must already be caught up to it. Both are the caller's job because the
-    /// recovery for either being untrue is a sync, which this layer cannot do
-    /// without knowing what it was editing.
-    async fn write_replacing_storage_record(
+    /// Each identifier in `delete_ids` must be present exactly once in
+    /// `current`. Being caught up should guarantee that; it survives as a guard
+    /// against a peer that rewrites records in place, and fails as
+    /// [`Error::StorageRecordMoved`] so the caller re-syncs and rebuilds.
+    ///
+    /// `current` must be the manifest as the server holds it *now*, and the
+    /// caller must already be caught up to it. Both are the caller's job because
+    /// the recovery for either being untrue is a sync, which this layer cannot
+    /// do without knowing what it was editing.
+    async fn write_manifest_edit(
         &self,
         storage_service: &StorageService,
         current: &ManifestRecord,
-        item_type: manifest_record::identifier::Type,
-        old_raw_id: &[u8],
-        new_record: Vec<u8>,
-    ) -> Result<Vec<u8>, Error<S::Error>> {
-        let mut new_raw_id = vec![0u8; 16];
-        StdRng::from_os_rng().fill_bytes(&mut new_raw_id);
-        if new_raw_id == old_raw_id {
-            // 2^-128, but inserting and deleting the same key in one write is
-            // the one shape the server is entitled to interpret either way.
-            warn!("storage manifest: generated identifier collided with the old one");
-            return Err(Error::StorageManifestConflict);
-        }
-
-        // Substitute in place: every other identifier keeps its bytes, its type
-        // and its position. The server treats the manifest as the complete index
-        // of the account, so an identifier dropped here is deleted from every
-        // device the user owns — including the record types presage cannot model.
-        let mut identifiers = Vec::with_capacity(current.identifiers.len());
-        let mut replaced = 0usize;
-        for id in &current.identifiers {
-            if id.raw == old_raw_id {
-                replaced += 1;
-                identifiers.push(manifest_record::Identifier {
-                    raw: new_raw_id.clone(),
-                    r#type: item_type.into(),
-                });
-            } else {
-                if id.raw == new_raw_id {
-                    warn!("storage manifest: generated identifier already in use");
-                    return Err(Error::StorageManifestConflict);
-                }
-                identifiers.push(id.clone());
+        inserts: Vec<(manifest_record::identifier::Type, Vec<u8>)>,
+        delete_ids: Vec<Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>, Error<S::Error>> {
+        let mut identifiers = current.identifiers.clone();
+        for old in &delete_ids {
+            let before = identifiers.len();
+            identifiers.retain(|id| &id.raw != old);
+            if before - identifiers.len() != 1 {
+                debug!(
+                    removed = before - identifiers.len(),
+                    "storage manifest: record is not at the identifier we hold"
+                );
+                return Err(Error::StorageRecordMoved);
             }
         }
 
-        // Being caught up should make this unreachable: our identifier was in the
-        // manifest at the version we synced, and we are still at that version. It
-        // survives as a guard against a peer that rewrites records in place.
-        if replaced != 1 {
-            debug!(
-                replaced,
-                "storage manifest: record is not at the identifier we hold"
-            );
-            return Err(Error::StorageRecordMoved);
+        let mut rng = StdRng::from_os_rng();
+        let mut new_ids = Vec::with_capacity(inserts.len());
+        let mut insert_records = Vec::with_capacity(inserts.len());
+        for (item_type, record) in inserts {
+            let mut raw_id = vec![0u8; 16];
+            rng.fill_bytes(&mut raw_id);
+            if identifiers.iter().any(|id| id.raw == raw_id) {
+                // 2^-128, but inserting and deleting the same key in one write
+                // is the one shape the server is entitled to interpret either way.
+                warn!("storage manifest: generated identifier already in use");
+                return Err(Error::StorageManifestConflict);
+            }
+            identifiers.push(manifest_record::Identifier {
+                raw: raw_id.clone(),
+                r#type: item_type.into(),
+            });
+            insert_records.push((raw_id.clone(), record));
+            new_ids.push(raw_id);
         }
 
-        // A substitution changes no counts. If it did, we would be about to orphan
-        // or duplicate a record on every device the user owns — Signal-Desktop and
-        // Signal-Android both validate the insert/delete sets against the id-set
-        // delta at runtime, so this is checked in release too, not just asserted.
-        if identifiers.len() != current.identifiers.len() {
-            warn!("storage manifest: identifier count changed under a substitution");
+        // Signal-Desktop and Signal-Android both validate the insert/delete
+        // sets against the id-set delta at runtime, so this is checked in
+        // release too, not just asserted.
+        let expected = current.identifiers.len() + new_ids.len() - delete_ids.len();
+        if identifiers.len() != expected {
+            warn!("storage manifest: identifier count does not match the edit");
             return Err(Error::StorageManifestConflict);
         }
 
@@ -268,19 +278,40 @@ impl<S: Store> Manager<S, Registered> {
         };
 
         match storage_service
-            .write_items(
-                new_manifest,
-                vec![(new_raw_id.clone(), new_record)],
-                vec![old_raw_id.to_vec()],
-            )
+            .write_items(new_manifest, insert_records, delete_ids)
             .await
         {
-            Ok(()) => Ok(new_raw_id),
+            Ok(()) => Ok(new_ids),
             Err(libsignal_service::StorageServiceError::Conflict) => {
                 Err(Error::StorageManifestConflict)
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Replace one record with another: the new bytes go in under a fresh
+    /// identifier and the old identifier is deleted, in a single write.
+    /// `new_record` is an encoded `StorageRecord` and is written byte-for-byte —
+    /// build it with [`crate::storage_record`], not by re-encoding a decoded
+    /// record. See [`write_manifest_edit`](Self::write_manifest_edit) for the
+    /// preconditions.
+    async fn write_replacing_storage_record(
+        &self,
+        storage_service: &StorageService,
+        current: &ManifestRecord,
+        item_type: manifest_record::identifier::Type,
+        old_raw_id: &[u8],
+        new_record: Vec<u8>,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
+        let mut ids = self
+            .write_manifest_edit(
+                storage_service,
+                current,
+                vec![(item_type, new_record)],
+                vec![old_raw_id.to_vec()],
+            )
+            .await?;
+        Ok(ids.remove(0))
     }
 
     /// Apply `edit` to a storage-service record and publish the result.
@@ -437,6 +468,11 @@ impl<S: Store> Manager<S, Registered> {
                     .set_group_needs_storage_sync(*master_key, needs_sync)
                     .await?
             }
+            StorageRecordKey::ChatFolder(id) => {
+                self.store
+                    .set_chat_folder_needs_storage_sync(*id, needs_sync)
+                    .await?
+            }
         }
         Ok(())
     }
@@ -452,6 +488,7 @@ impl<S: Store> Manager<S, Registered> {
             StorageRecordKey::GroupV2(master_key) => {
                 self.store.group_storage_identity(*master_key).await?
             }
+            StorageRecordKey::ChatFolder(id) => self.store.chat_folder_storage_identity(*id).await?,
         })
     }
 
@@ -469,6 +506,11 @@ impl<S: Store> Manager<S, Registered> {
             StorageRecordKey::GroupV2(master_key) => {
                 self.store
                     .save_group_storage_identity(*master_key, identity)
+                    .await?
+            }
+            StorageRecordKey::ChatFolder(id) => {
+                self.store
+                    .save_chat_folder_storage_identity(*id, identity)
                     .await?
             }
         }
@@ -669,6 +711,157 @@ impl<S: Store> Manager<S, Registered> {
             }
         }
         Ok(())
+    }
+
+    /// Publish every chat folder with an unpublished local change, and drop
+    /// tombstones older than [`CHAT_FOLDER_TOMBSTONE_TTL`] from the manifest, in
+    /// one write.
+    ///
+    /// Same contract as the contact and group drains: no argument, the work list
+    /// is the store, safe to call at any time, retried on the next drain if it
+    /// fails. It differs in shape because a delete renumbers every live folder,
+    /// so "pending" is usually the whole set — one manifest write for all of
+    /// them rather than one each, which is also what Signal-Desktop does when
+    /// it rotates every folder's key on a reorder.
+    ///
+    /// A folder's record is rebuilt from the row plus the unknown-field bytes of
+    /// the record last read for it, so a field a newer client wrote survives an
+    /// edit made here. A folder with no identity yet is a plain insert.
+    ///
+    /// Callers must hold the storage-service lock.
+    pub async fn push_pending_chat_folder_records(&mut self) -> Result<(), Error<S::Error>> {
+        let expired = self.expired_chat_folder_tombstones().await?;
+        let pending: Vec<Uuid> = self
+            .store
+            .chat_folders_needing_storage_sync()
+            .await?
+            .into_iter()
+            .filter(|id| !expired.contains(id))
+            .collect();
+        if pending.is_empty() && expired.is_empty() {
+            return Ok(());
+        }
+        debug!(
+            pending = pending.len(),
+            expired = expired.len(),
+            "storage manifest: publishing chat folders"
+        );
+
+        const MAX_PASSES: usize = MANIFEST_WRITE_ATTEMPTS * 2;
+        let storage_service = self.storage_service().await?;
+        let mut write_attempts = 0usize;
+
+        for _ in 0..MAX_PASSES {
+            // Only ever write while caught up — see `update_storage_record`.
+            let local_version = self.store.fetch_storage_manifest_version().await?;
+            let current = storage_service.manifest().await?;
+            if current.version != local_version {
+                debug!(
+                    local_version,
+                    remote_version = current.version,
+                    "storage manifest: behind the server, syncing before writing folders"
+                );
+                self.sync_storage_service().await?;
+                continue;
+            }
+
+            let mut inserts = Vec::new();
+            let mut delete_ids = Vec::new();
+            let mut published: Vec<(Uuid, Vec<u8>)> = Vec::new();
+            for id in &pending {
+                let Some(folder) = self.store.chat_folder(*id).await? else {
+                    // Flagged but gone: nothing to publish, and leaving the flag
+                    // set would make every future drain retry it.
+                    warn!("storage manifest: pending chat folder is no longer in the store");
+                    self.store
+                        .set_chat_folder_needs_storage_sync(*id, false)
+                        .await?;
+                    continue;
+                };
+                let identity = self.store.chat_folder_storage_identity(*id).await?;
+                let unknown = identity
+                    .as_ref()
+                    .map(|i| chat_folder_unknown_fields(&i.record))
+                    .transpose()?
+                    .unwrap_or_default();
+                let record = encode_chat_folder_record(&folder, &unknown);
+                if let Some(identity) = identity {
+                    delete_ids.push(identity.storage_id);
+                }
+                inserts.push((manifest_record::identifier::Type::ChatFolder, record.clone()));
+                published.push((*id, record));
+            }
+            for id in &expired {
+                if let Some(identity) = self.store.chat_folder_storage_identity(*id).await? {
+                    delete_ids.push(identity.storage_id);
+                }
+            }
+            if inserts.is_empty() && delete_ids.is_empty() {
+                for id in &expired {
+                    self.store.delete_chat_folder(*id).await?;
+                }
+                return Ok(());
+            }
+
+            match self
+                .write_manifest_edit(&storage_service, &current, inserts, delete_ids)
+                .await
+            {
+                Ok(new_ids) => {
+                    let version = current.version + 1;
+                    self.store.store_storage_manifest_version(version).await?;
+                    for ((id, record), storage_id) in published.into_iter().zip(new_ids) {
+                        self.store
+                            .save_chat_folder_storage_identity(
+                                id,
+                                &StorageRecordIdentity {
+                                    storage_id,
+                                    storage_version: version,
+                                    record,
+                                },
+                            )
+                            .await?;
+                        self.store
+                            .set_chat_folder_needs_storage_sync(id, false)
+                            .await?;
+                    }
+                    for id in &expired {
+                        self.store.delete_chat_folder(*id).await?;
+                    }
+                    debug!(version, "storage manifest: published chat folders");
+                    self.notify_storage_manifest_written().await;
+                    return Ok(());
+                }
+                Err(Error::StorageManifestConflict) | Err(Error::StorageRecordMoved) => {
+                    write_attempts += 1;
+                    let Some(backoff) = MANIFEST_WRITE_BACKOFF.get(write_attempts - 1) else {
+                        break;
+                    };
+                    debug!(
+                        write_attempts,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "storage manifest: conflict publishing folders, backing off"
+                    );
+                    tokio::time::sleep(*backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        warn!("storage manifest: gave up publishing chat folders after conflicts");
+        Err(Error::StorageManifestConflict)
+    }
+
+    async fn expired_chat_folder_tombstones(&self) -> Result<Vec<Uuid>, Error<S::Error>> {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        Ok(self
+            .store
+            .chat_folders()
+            .await?
+            .into_iter()
+            .filter(|f| chat_folder_tombstone_expired(f, now))
+            .map(|f| f.id)
+            .collect())
     }
 
     /// Add a first storage-service record for a group the account has never had one for.
@@ -1002,13 +1195,20 @@ async fn sync_storage_service<S: Store>(
 
     let mut contact_keys: Vec<Vec<u8>> = Vec::new();
     let mut group_keys: Vec<Vec<u8>> = Vec::new();
+    let mut folder_keys: Vec<Vec<u8>> = Vec::new();
     for id in &manifest_record.identifiers {
         match id.r#type() {
             StorageType::Contact => contact_keys.push(id.raw.clone()),
             StorageType::Groupv2 => group_keys.push(id.raw.clone()),
+            StorageType::ChatFolder => folder_keys.push(id.raw.clone()),
             _ => {}
         }
     }
+    let manifest_ids: std::collections::HashSet<Vec<u8>> = manifest_record
+        .identifiers
+        .iter()
+        .map(|id| id.raw.clone())
+        .collect();
     debug!(
         count = contact_keys.len(),
         "storage sync: contact keys in manifest"
@@ -1017,14 +1217,30 @@ async fn sync_storage_service<S: Store>(
         count = group_keys.len(),
         "storage sync: group keys in manifest"
     );
+    debug!(
+        count = folder_keys.len(),
+        "storage sync: chat folder keys in manifest"
+    );
 
-    if contact_keys.is_empty() && group_keys.is_empty() {
+    if contact_keys.is_empty() && group_keys.is_empty() && folder_keys.is_empty() {
         debug!("storage sync: nothing to sync");
+        store
+            .store_storage_manifest_version(manifest_version)
+            .await?;
+        reconcile_chat_folders(store, &manifest_ids).await;
         return Ok(());
     }
 
-    let all_keys: Vec<Vec<u8>> = contact_keys.into_iter().chain(group_keys).collect();
-    let total = all_keys.len();
+    // Folders go in their own batches after every contact and group batch, so
+    // by the time one is merged its recipients are already in the store — the
+    // same ordering Signal-Desktop imposes. Keeping the types in separate
+    // batches is what makes that hold under the per-batch resume cursor.
+    let subject_keys: Vec<Vec<u8>> = contact_keys.into_iter().chain(group_keys).collect();
+    let total = subject_keys.len() + folder_keys.len();
+    let batches: Vec<&[Vec<u8>]> = subject_keys
+        .chunks(STORAGE_SERVICE_BATCH_SIZE)
+        .chain(folder_keys.chunks(STORAGE_SERVICE_BATCH_SIZE))
+        .collect();
     debug!(total, "storage sync: fetching storage records in batches");
 
     // Read once for the whole sync rather than per record. These contacts hold a
@@ -1043,10 +1259,17 @@ async fn sync_storage_service<S: Store>(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    if !contact_pending.is_empty() || !group_pending.is_empty() {
+    let folder_pending: std::collections::HashSet<Uuid> = store
+        .chat_folders_needing_storage_sync()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if !contact_pending.is_empty() || !group_pending.is_empty() || !folder_pending.is_empty() {
         debug!(
             contacts = contact_pending.len(),
             groups = group_pending.len(),
+            folders = folder_pending.len(),
             "storage sync: subjects with an unpublished local change"
         );
     }
@@ -1076,11 +1299,7 @@ async fn sync_storage_service<S: Store>(
     };
 
     let mut total_processed = 0usize;
-    for (i, batch) in all_keys
-        .chunks(STORAGE_SERVICE_BATCH_SIZE)
-        .enumerate()
-        .skip(resume_from)
-    {
+    for (i, batch) in batches.into_iter().enumerate().skip(resume_from) {
         debug!(
             batch = i,
             size = batch.len(),
@@ -1202,8 +1421,37 @@ async fn sync_storage_service<S: Store>(
                         warn!(%e, "storage sync: failed to save group storage identity");
                     }
                 }
+                Some(libsignal_service::proto::storage_record::Record::ChatFolder(fr)) => {
+                    let remote = match ChatFolder::try_from(fr) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            warn!("storage sync: skipping chat folder record: {e}");
+                            continue;
+                        }
+                    };
+                    let id = remote.id;
+                    debug!(%id, name = %remote.name, "storage sync: saving chat folder");
+                    let local = store.chat_folder(id).await.ok().flatten();
+                    if let Some(merged) =
+                        merge_chat_folder_from_snapshot(local, remote, folder_pending.contains(&id))
+                    {
+                        if let Err(e) = store.save_chat_folder(&merged).await {
+                            warn!(%e, "storage sync: failed to save chat folder");
+                        }
+                    }
+                    // Saved even when the merge kept the local row: the next
+                    // publish has to replace the identifier the server holds now.
+                    let identity = StorageRecordIdentity {
+                        storage_id: item.key,
+                        storage_version: manifest_version,
+                        record: item.plaintext,
+                    };
+                    if let Err(e) = store.save_chat_folder_storage_identity(id, &identity).await {
+                        warn!(%e, "storage sync: failed to save chat folder storage identity");
+                    }
+                }
                 Some(other) => {
-                    debug!(?other, "storage sync: skipping non-contact/group record");
+                    debug!(?other, "storage sync: skipping unmodelled record");
                 }
                 None => {
                     debug!("storage sync: empty record, skipping");
@@ -1228,6 +1476,7 @@ async fn sync_storage_service<S: Store>(
     store
         .store_storage_manifest_version(manifest_version)
         .await?;
+    reconcile_chat_folders(store, &manifest_ids).await;
     // Sync completed end-to-end — clear the cursor so it doesn't survive
     // as a stale entry on the next call.
     store.clear_storage_sync_cursor().await.ok();
@@ -1237,6 +1486,223 @@ async fn sync_storage_service<S: Store>(
         "storage service sync complete"
     );
     Ok(())
+}
+
+fn chat_folder_tombstone_expired(folder: &ChatFolder, now_ms: u64) -> bool {
+    let ttl_ms = CHAT_FOLDER_TOMBSTONE_TTL.as_millis() as u64;
+    folder.deleted_at_timestamp_ms != 0 && folder.deleted_at_timestamp_ms + ttl_ms < now_ms
+}
+
+/// Signal-Desktop's `mergeChatFolderRecord`, with presage's rule for the
+/// contact and group twins layered on top: a local row with an unpublished
+/// change is kept as it is, because the record being merged is the one that
+/// change is about to replace.
+///
+/// Returns the row to save, or `None` when nothing should change locally.
+///
+/// - The all-chats folder is structural. Its name and rules are fixed, and a
+///   tombstone for it is ignored — every official client revives it — so the
+///   record only ever contributes its identity.
+/// - A tombstone for a folder this device has never seen is not materialised.
+/// - A delete can never be undone and can only move earlier: the earliest
+///   non-zero `deletedAtTimestampMs` on either side wins.
+/// - Otherwise the remote record replaces the local row wholesale.
+pub(super) fn merge_chat_folder_from_snapshot(
+    local: Option<ChatFolder>,
+    remote: ChatFolder,
+    local_pending: bool,
+) -> Option<ChatFolder> {
+    if local_pending {
+        return None;
+    }
+    if remote.folder_type == ChatFolderType::All {
+        return Some(ChatFolder::all_chats(remote.id));
+    }
+    let local = match local {
+        None if remote.deleted_at_timestamp_ms != 0 => return None,
+        None => return Some(remote),
+        Some(local) => local,
+    };
+    let deleted_at = match (local.deleted_at_timestamp_ms, remote.deleted_at_timestamp_ms) {
+        (0, r) => r,
+        (l, 0) => l,
+        (l, r) => l.min(r),
+    };
+    let mut merged = remote;
+    if deleted_at != 0 {
+        merged.tombstone(deleted_at);
+    }
+    Some(merged)
+}
+
+/// After a sync, Signal-Desktop's post-merge pass: a local folder whose
+/// identifier the manifest no longer lists is re-appended on the next publish;
+/// duplicate all-chats folders are collapsed to the one the server knows best;
+/// an account with no live all-chats folder gets one.
+///
+/// Best-effort throughout: a failure here costs a folder a round trip, never
+/// the sync.
+async fn reconcile_chat_folders<S: Store>(
+    store: &mut S,
+    manifest_ids: &std::collections::HashSet<Vec<u8>>,
+) {
+    let folders = match store.chat_folders().await {
+        Ok(folders) => folders,
+        Err(e) => {
+            warn!(%e, "storage sync: could not read chat folders to reconcile");
+            return;
+        }
+    };
+
+    let mut all_chats: Vec<(Uuid, Option<u64>)> = Vec::new();
+    for folder in &folders {
+        let identity = store
+            .chat_folder_storage_identity(folder.id)
+            .await
+            .ok()
+            .flatten();
+        if let Some(identity) = &identity {
+            if !manifest_ids.contains(&identity.storage_id) {
+                debug!(id = %folder.id, "storage sync: chat folder left the manifest, re-appending");
+                store.clear_chat_folder_storage_identity(folder.id).await.ok();
+                store
+                    .set_chat_folder_needs_storage_sync(folder.id, true)
+                    .await
+                    .ok();
+            }
+        }
+        if folder.is_live() && folder.folder_type == ChatFolderType::All {
+            all_chats.push((folder.id, identity.map(|i| i.storage_version)));
+        }
+    }
+
+    // Keep the all-chats folder the server has held longest; the rest leave.
+    // One that never reached the server is dropped outright; one that did is
+    // given an already-expired tombstone so the next publish deletes it from
+    // the manifest without ever publishing a tombstone other clients would
+    // revive from.
+    all_chats.sort_by_key(|(_, version)| std::cmp::Reverse(*version));
+    for (id, version) in all_chats.iter().skip(1) {
+        debug!(%id, "storage sync: dropping a duplicate all-chats folder");
+        match version {
+            None => store.delete_chat_folder(*id).await.ok(),
+            Some(_) => {
+                if let Ok(Some(mut folder)) = store.chat_folder(*id).await {
+                    folder.tombstone(CHAT_FOLDER_EXPIRED_AT_MS);
+                    store.save_chat_folder(&folder).await.ok();
+                }
+                Some(())
+            }
+        };
+    }
+
+    if all_chats.is_empty() {
+        let mut raw = [0u8; 16];
+        StdRng::from_os_rng().fill_bytes(&mut raw);
+        let all = ChatFolder::all_chats(Uuid::from_bytes(raw));
+        debug!(id = %all.id, "storage sync: account has no all-chats folder, creating one");
+        if store.save_chat_folder(&all).await.is_ok() {
+            store
+                .set_chat_folder_needs_storage_sync(all.id, true)
+                .await
+                .ok();
+        }
+    }
+}
+
+#[cfg(test)]
+mod chat_folder_tests {
+    use super::*;
+    use libsignal_service::prelude::Uuid;
+
+    fn custom(id: u128, name: &str) -> ChatFolder {
+        ChatFolder::custom(Uuid::from_u128(id), name)
+    }
+
+    #[test]
+    fn a_pending_local_change_is_kept() {
+        let local = custom(1, "Mine");
+        let mut remote = custom(1, "Theirs");
+        remote.deleted_at_timestamp_ms = 5;
+        assert_eq!(
+            merge_chat_folder_from_snapshot(Some(local), remote, true),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tombstone_for_an_unknown_folder_is_not_materialised() {
+        let mut remote = custom(1, "Gone");
+        remote.tombstone(5);
+        assert_eq!(merge_chat_folder_from_snapshot(None, remote, false), None);
+    }
+
+    #[test]
+    fn a_new_remote_folder_is_taken_as_is() {
+        let remote = custom(1, "New");
+        assert_eq!(
+            merge_chat_folder_from_snapshot(None, remote.clone(), false),
+            Some(remote)
+        );
+    }
+
+    #[test]
+    fn a_remote_edit_replaces_the_local_row_wholesale() {
+        let mut local = custom(1, "Old");
+        local.show_only_unread = true;
+        let remote = custom(1, "New");
+        assert_eq!(
+            merge_chat_folder_from_snapshot(Some(local), remote.clone(), false),
+            Some(remote)
+        );
+    }
+
+    #[test]
+    fn a_remote_delete_tombstones_a_live_local_folder() {
+        let local = custom(1, "Live");
+        let mut remote = custom(1, "Live");
+        remote.tombstone(7);
+        let merged = merge_chat_folder_from_snapshot(Some(local), remote, false).expect("saved");
+        assert_eq!(merged.deleted_at_timestamp_ms, 7);
+        assert_eq!(merged.position, crate::model::chat_folders::CHAT_FOLDER_DELETED_POSITION);
+    }
+
+    #[test]
+    fn a_delete_cannot_be_undone_and_only_moves_earlier() {
+        let mut local = custom(1, "x");
+        local.tombstone(9);
+        let revived = custom(1, "x");
+        let merged =
+            merge_chat_folder_from_snapshot(Some(local.clone()), revived, false).expect("saved");
+        assert_eq!(merged.deleted_at_timestamp_ms, 9);
+
+        let mut earlier = custom(1, "x");
+        earlier.tombstone(3);
+        let merged = merge_chat_folder_from_snapshot(Some(local), earlier, false).expect("saved");
+        assert_eq!(merged.deleted_at_timestamp_ms, 3);
+    }
+
+    #[test]
+    fn the_all_chats_folder_only_contributes_its_identity() {
+        let mut remote = ChatFolder::all_chats(Uuid::from_u128(1));
+        remote.name = "renamed".into();
+        remote.show_muted_chats = false;
+        remote.deleted_at_timestamp_ms = 4;
+        let merged = merge_chat_folder_from_snapshot(None, remote, false).expect("saved");
+        assert_eq!(merged, ChatFolder::all_chats(Uuid::from_u128(1)));
+    }
+
+    #[test]
+    fn tombstones_expire_after_the_ttl() {
+        let ttl = CHAT_FOLDER_TOMBSTONE_TTL.as_millis() as u64;
+        let mut f = custom(1, "x");
+        assert!(!chat_folder_tombstone_expired(&f, ttl * 2));
+        f.tombstone(10);
+        assert!(!chat_folder_tombstone_expired(&f, 10 + ttl));
+        assert!(chat_folder_tombstone_expired(&f, 11 + ttl));
+        f.tombstone(CHAT_FOLDER_EXPIRED_AT_MS);
+        assert!(chat_folder_tombstone_expired(&f, 2 + ttl));
+    }
 }
 
 #[cfg(test)]

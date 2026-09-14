@@ -18,6 +18,11 @@ use std::ops::Range;
 const STORAGE_RECORD_CONTACT: u32 = 1;
 /// `StorageRecord.groupV2`, from `StorageService.proto`.
 const STORAGE_RECORD_GROUP_V2: u32 = 3;
+/// `StorageRecord.chatFolder`, from `StorageService.proto`.
+const STORAGE_RECORD_CHAT_FOLDER: u32 = 8;
+/// Every `ChatFolderRecord` field presage models, `identifier` through
+/// `deletedAtTimestampMs`. Anything outside is carried through verbatim.
+const CHAT_FOLDER_RECORD_KNOWN_FIELDS: std::ops::RangeInclusive<u32> = 1..=11;
 /// `ContactRecord.blocked`.
 const CONTACT_RECORD_BLOCKED: u32 = 9;
 /// `ContactRecord.mutedUntilTimestamp`.
@@ -306,6 +311,39 @@ pub fn set_group_muted_until(record: &[u8], muted_until: u64) -> Result<Vec<u8>,
         GROUP_V2_RECORD_MUTED_UNTIL,
         muted_until,
     )
+}
+
+/// The raw bytes of every `ChatFolderRecord` field presage does not model,
+/// concatenated in wire order — Signal-Desktop's `storageUnknownFields`.
+///
+/// A folder is the one record presage rebuilds from its model rather than
+/// editing in place: its recipient lists are repeated fields, and the model is
+/// a faithful superset of every known field. What the model cannot carry is
+/// preserved this way and re-appended by [`encode_chat_folder_record`].
+pub fn chat_folder_unknown_fields(record: &[u8]) -> Result<Vec<u8>, EditError> {
+    let payload = record_payload(record, STORAGE_RECORD_CHAT_FOLDER)?;
+    let inner = &record[payload];
+    let mut out = Vec::new();
+    for span in scan(inner)? {
+        if !CHAT_FOLDER_RECORD_KNOWN_FIELDS.contains(&span.number) {
+            out.extend_from_slice(&inner[span.whole]);
+        }
+    }
+    Ok(out)
+}
+
+/// Encode a whole `StorageRecord { chatFolder }` from a model plus the
+/// unknown-field bytes a previous read preserved. Field order inside a message
+/// is not significant on the wire, so appending is sound; a decoder that knows
+/// those fields reads them exactly as it would have from the original.
+pub fn encode_chat_folder_record(
+    folder: &crate::model::chat_folders::ChatFolder,
+    unknown_fields: &[u8],
+) -> Vec<u8> {
+    use libsignal_service::prelude::ProtobufMessage;
+    let mut inner = folder.to_record().encode_to_vec();
+    inner.extend_from_slice(unknown_fields);
+    encode_len_delimited(STORAGE_RECORD_CHAT_FOLDER, &inner)
 }
 
 /// Write a mute expiry into whichever record holds one.
@@ -730,5 +768,65 @@ mod tests {
         let blocked = set_contact_blocked(&record, true).unwrap();
         let unblocked = set_contact_blocked(&blocked, false).unwrap();
         assert_eq!(unblocked, record);
+    }
+}
+
+#[cfg(test)]
+mod chat_folder_tests {
+    use super::*;
+    use crate::model::chat_folders::ChatFolder;
+    use libsignal_service::prelude::{ProtobufMessage, Uuid};
+
+    fn folder() -> ChatFolder {
+        let mut f = ChatFolder::custom(Uuid::from_u128(1), "Work");
+        f.position = 2;
+        f.include_all_group_chats = true;
+        f
+    }
+
+    /// A record as a newer client wrote it: our fields plus one we do not know.
+    fn record_with_unknown_field() -> Vec<u8> {
+        let mut inner = folder().to_record().encode_to_vec();
+        inner.extend_from_slice(&encode_len_delimited(250, b"from the future"));
+        encode_len_delimited(STORAGE_RECORD_CHAT_FOLDER, &inner)
+    }
+
+    #[test]
+    fn unknown_fields_are_what_the_model_does_not_carry() {
+        let unknown = chat_folder_unknown_fields(&record_with_unknown_field()).expect("well-formed");
+        assert_eq!(unknown, encode_len_delimited(250, b"from the future"));
+    }
+
+    #[test]
+    fn a_rebuilt_record_keeps_the_unknown_field_and_the_edit() {
+        let original = record_with_unknown_field();
+        let unknown = chat_folder_unknown_fields(&original).expect("well-formed");
+        let mut edited = folder();
+        edited.name = "Play".into();
+        let rebuilt = encode_chat_folder_record(&edited, &unknown);
+
+        let decoded = libsignal_service::proto::StorageRecord::decode(rebuilt.as_slice())
+            .expect("decodes");
+        let Some(libsignal_service::proto::storage_record::Record::ChatFolder(r)) = decoded.record
+        else {
+            panic!("not a chat folder");
+        };
+        assert_eq!(r.name, "Play");
+        assert_eq!(r.position, 2);
+        assert!(r.include_all_group_chats);
+        assert_eq!(
+            chat_folder_unknown_fields(&rebuilt).expect("well-formed"),
+            unknown,
+            "the unknown field did not survive the rebuild"
+        );
+    }
+
+    #[test]
+    fn a_contact_record_is_not_a_chat_folder() {
+        let record = encode_len_delimited(STORAGE_RECORD_CONTACT, b"");
+        assert_eq!(
+            chat_folder_unknown_fields(&record),
+            Err(EditError::WrongRecordType)
+        );
     }
 }

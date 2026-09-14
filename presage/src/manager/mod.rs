@@ -1,5 +1,6 @@
 //! Signal manager and its states
 
+mod chat_folders;
 mod confirmation;
 mod linking;
 mod registered;
