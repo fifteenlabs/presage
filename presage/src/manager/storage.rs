@@ -1176,6 +1176,10 @@ async fn sync_storage_service<S: Store>(
         );
         // Server reports no change — a leftover cursor would be stale.
         store.clear_storage_sync_cursor().await.ok();
+        // Nothing to merge, but the all-chats invariant still has to hold for
+        // an account that has never had a folder: it gets one here, the same
+        // way Signal-Desktop backfills it on upgrade.
+        reconcile_chat_folders(store, None).await;
         return Ok(());
     };
     let manifest_version = manifest_record.version;
@@ -1227,7 +1231,7 @@ async fn sync_storage_service<S: Store>(
         store
             .store_storage_manifest_version(manifest_version)
             .await?;
-        reconcile_chat_folders(store, &manifest_ids).await;
+        reconcile_chat_folders(store, Some(&manifest_ids)).await;
         return Ok(());
     }
 
@@ -1476,7 +1480,7 @@ async fn sync_storage_service<S: Store>(
     store
         .store_storage_manifest_version(manifest_version)
         .await?;
-    reconcile_chat_folders(store, &manifest_ids).await;
+    reconcile_chat_folders(store, Some(&manifest_ids)).await;
     // Sync completed end-to-end — clear the cursor so it doesn't survive
     // as a stale entry on the next call.
     store.clear_storage_sync_cursor().await.ok();
@@ -1540,11 +1544,15 @@ pub(super) fn merge_chat_folder_from_snapshot(
 /// duplicate all-chats folders are collapsed to the one the server knows best;
 /// an account with no live all-chats folder gets one.
 ///
+/// `manifest_ids` is `None` when the server reported no change and no manifest
+/// was read; the identifier check is skipped then, since everything local is
+/// already what the server holds.
+///
 /// Best-effort throughout: a failure here costs a folder a round trip, never
 /// the sync.
 async fn reconcile_chat_folders<S: Store>(
     store: &mut S,
-    manifest_ids: &std::collections::HashSet<Vec<u8>>,
+    manifest_ids: Option<&std::collections::HashSet<Vec<u8>>>,
 ) {
     let folders = match store.chat_folders().await {
         Ok(folders) => folders,
@@ -1561,7 +1569,7 @@ async fn reconcile_chat_folders<S: Store>(
             .await
             .ok()
             .flatten();
-        if let Some(identity) = &identity {
+        if let (Some(identity), Some(manifest_ids)) = (&identity, manifest_ids) {
             if !manifest_ids.contains(&identity.storage_id) {
                 debug!(id = %folder.id, "storage sync: chat folder left the manifest, re-appending");
                 store.clear_chat_folder_storage_identity(folder.id).await.ok();
