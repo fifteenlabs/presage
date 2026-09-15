@@ -54,6 +54,15 @@ pub enum Error<S: std::error::Error> {
     StorageRecordUnknown,
     #[error("could not edit stored storage record: {0}")]
     StorageRecordEdit(#[from] crate::storage_record::StorageRecordEditError),
+    /// Empty, or longer than Signal's 32-grapheme limit — the same rule every
+    /// official client enforces before a folder reaches the storage service.
+    #[error("chat folder name is empty or longer than 32 graphemes")]
+    ChatFolderInvalidName,
+    #[error("no chat folder with that identifier")]
+    ChatFolderUnknown,
+    /// The "All chats" folder is structural: every client expects exactly one.
+    #[error("the all-chats folder cannot be deleted")]
+    ChatFolderUndeletable,
     #[error("libsignal-service sending error: {0}")]
     MessageSenderError(Box<MessageSenderError>),
     #[error("this client is already registered with Signal")]
