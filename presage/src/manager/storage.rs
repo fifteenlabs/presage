@@ -1613,7 +1613,7 @@ async fn ensure_single_all_chats_folder<S: Store>(store: &mut S, create_missing:
             .map(|i| i.storage_version);
         all_chats.push((folder.id, version));
     }
-    all_chats.sort_by_key(|(_, version)| std::cmp::Reverse(*version));
+    all_chats.sort_by_key(|(id, version)| (std::cmp::Reverse(*version), *id));
 
     for (id, version) in all_chats.iter().skip(1) {
         debug!(%id, "storage sync: dropping a duplicate all-chats folder");
