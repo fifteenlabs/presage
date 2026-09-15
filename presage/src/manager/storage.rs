@@ -1184,10 +1184,10 @@ async fn sync_storage_service<S: Store>(
         );
         // Server reports no change — a leftover cursor would be stale.
         store.clear_storage_sync_cursor().await.ok();
-        // Nothing to merge, but the all-chats invariant still has to hold for
-        // an account that has never had a folder: it gets one here, the same
-        // way Signal-Desktop backfills it on upgrade.
-        ensure_single_all_chats_folder(store).await;
+        // Nothing was read, so nothing can be created: a missing all-chats
+        // folder here may simply be one this build has never read, and
+        // publishing a second would duplicate it on every device.
+        ensure_single_all_chats_folder(store, false).await;
         return Ok(());
     };
     let manifest_version = manifest_record.version;
@@ -1237,7 +1237,7 @@ async fn sync_storage_service<S: Store>(
             .store_storage_manifest_version(manifest_version)
             .await?;
         reappend_chat_folders_missing_from_manifest(store, &manifest_ids).await;
-        ensure_single_all_chats_folder(store).await;
+        ensure_single_all_chats_folder(store, true).await;
         return Ok(());
     }
 
@@ -1487,7 +1487,7 @@ async fn sync_storage_service<S: Store>(
         .store_storage_manifest_version(manifest_version)
         .await?;
     reappend_chat_folders_missing_from_manifest(store, &manifest_ids).await;
-    ensure_single_all_chats_folder(store).await;
+    ensure_single_all_chats_folder(store, true).await;
     // Sync completed end-to-end — clear the cursor so it doesn't survive
     // as a stale entry on the next call.
     store.clear_storage_sync_cursor().await.ok();
@@ -1584,15 +1584,19 @@ async fn reappend_chat_folders_missing_from_manifest<S: Store>(
 }
 
 /// Every client expects exactly one live all-chats folder. Duplicates collapse
-/// to the one the server has held longest; an account with none gets one, the
-/// way Signal-Desktop backfills it on upgrade. Runs after every sync, the
-/// unchanged-manifest path included.
+/// to the one the server has held longest; with `create_missing`, an account
+/// with none gets one, the way Signal-Desktop backfills it on upgrade.
+///
+/// `create_missing` is only true after the whole manifest was read. A store
+/// that has never read the folder records — a database migrated from a build
+/// that skipped them — has no all-chats row either, and creating one on that
+/// evidence is how an account ends up with two.
 ///
 /// A duplicate that never reached the server is dropped outright. One that did
 /// is given an already-expired tombstone, so the next publish deletes it from
 /// the manifest without ever publishing a tombstone other clients would revive
 /// from. Best-effort: a failure costs a round trip, never the sync.
-async fn ensure_single_all_chats_folder<S: Store>(store: &mut S) {
+async fn ensure_single_all_chats_folder<S: Store>(store: &mut S, create_missing: bool) {
     let Ok(folders) = store.chat_folders().await else {
         return;
     };
@@ -1626,7 +1630,7 @@ async fn ensure_single_all_chats_folder<S: Store>(store: &mut S) {
         }
     }
 
-    if all_chats.is_empty() {
+    if all_chats.is_empty() && create_missing {
         let mut raw = [0u8; 16];
         StdRng::from_os_rng().fill_bytes(&mut raw);
         let all = ChatFolder::all_chats(Uuid::from_bytes(raw));
