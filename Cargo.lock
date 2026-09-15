@@ -3589,6 +3589,8 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "unicode-normalization",
+ "unicode-segmentation",
  "url",
 ]
 
