@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO group_avatars(group_master_key, bytes, url) VALUES (?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "27fc0138e8e4d9d7bc18e2fd3eb2eaeb65127ceb2df58f805f2b17551a686ee0"
+}

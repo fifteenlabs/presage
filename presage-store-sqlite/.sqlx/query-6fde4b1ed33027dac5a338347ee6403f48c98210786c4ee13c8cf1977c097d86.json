@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT bytes, url FROM group_avatars WHERE group_master_key = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "bytes",
+        "ordinal": 0,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "group_avatars",
+            "name": "bytes"
+          }
+        }
+      },
+      {
+        "name": "url",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "group_avatars",
+            "name": "url"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "6fde4b1ed33027dac5a338347ee6403f48c98210786c4ee13c8cf1977c097d86"
+}
