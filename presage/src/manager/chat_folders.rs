@@ -34,22 +34,21 @@ impl<S: Store> Manager<S, Registered> {
     /// A new folder takes the next position; an existing one keeps the position
     /// it has, so an edit never reorders the list. The name is normalized the
     /// way Signal-Desktop does before it is validated.
-    pub async fn save_chat_folder(&mut self, mut folder: ChatFolder) -> Result<(), Error<S::Error>> {
+    pub async fn save_chat_folder(
+        &mut self,
+        mut folder: ChatFolder,
+    ) -> Result<(), Error<S::Error>> {
         if folder.folder_type == ChatFolderType::Custom {
             folder.name = ChatFolder::normalized_name(&folder.name);
             if !ChatFolder::is_valid_name(&folder.name) {
                 return Err(Error::ChatFolderInvalidName);
             }
         }
-        match self.store.chat_folder(folder.id).await? {
-            Some(existing) => folder.position = existing.position,
-            None => folder.position = self.chat_folders().await?.len() as u32,
-        }
-        self.store.save_chat_folder(&folder).await?;
-        self.store
-            .set_chat_folder_needs_storage_sync(folder.id, true)
-            .await?;
-        Ok(())
+        folder.position = match self.store.chat_folder(folder.id).await? {
+            Some(existing) => existing.position,
+            None => self.chat_folders().await?.len() as u32,
+        };
+        stage_chat_folder(&mut self.store, &folder).await
     }
 
     /// Signal-Desktop's `deleteChatFolder`: tombstone the record so every other
@@ -66,10 +65,7 @@ impl<S: Store> Manager<S, Registered> {
             return Err(Error::ChatFolderUndeletable);
         }
         folder.tombstone(chrono::Utc::now().timestamp_millis() as u64);
-        self.store.save_chat_folder(&folder).await?;
-        self.store
-            .set_chat_folder_needs_storage_sync(id, true)
-            .await?;
+        stage_chat_folder(&mut self.store, &folder).await?;
         self.renumber_chat_folders().await
     }
 
@@ -79,11 +75,21 @@ impl<S: Store> Manager<S, Registered> {
                 continue;
             }
             folder.position = i as u32;
-            self.store.save_chat_folder(&folder).await?;
-            self.store
-                .set_chat_folder_needs_storage_sync(folder.id, true)
-                .await?;
+            stage_chat_folder(&mut self.store, &folder).await?;
         }
         Ok(())
     }
+}
+
+/// The local write and the storage-sync mark, as one step — the rule the
+/// module doc states, as a function rather than a convention.
+pub(super) async fn stage_chat_folder<S: Store>(
+    store: &mut S,
+    folder: &ChatFolder,
+) -> Result<(), Error<S::Error>> {
+    store.save_chat_folder(folder).await?;
+    store
+        .set_chat_folder_needs_storage_sync(folder.id, true)
+        .await?;
+    Ok(())
 }

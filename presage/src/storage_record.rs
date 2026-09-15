@@ -793,7 +793,8 @@ mod chat_folder_tests {
 
     #[test]
     fn unknown_fields_are_what_the_model_does_not_carry() {
-        let unknown = chat_folder_unknown_fields(&record_with_unknown_field()).expect("well-formed");
+        let unknown =
+            chat_folder_unknown_fields(&record_with_unknown_field()).expect("well-formed");
         assert_eq!(unknown, encode_len_delimited(250, b"from the future"));
     }
 
@@ -805,8 +806,8 @@ mod chat_folder_tests {
         edited.name = "Play".into();
         let rebuilt = encode_chat_folder_record(&edited, &unknown);
 
-        let decoded = libsignal_service::proto::StorageRecord::decode(rebuilt.as_slice())
-            .expect("decodes");
+        let decoded =
+            libsignal_service::proto::StorageRecord::decode(rebuilt.as_slice()).expect("decodes");
         let Some(libsignal_service::proto::storage_record::Record::ChatFolder(r)) = decoded.record
         else {
             panic!("not a chat folder");

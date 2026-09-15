@@ -106,14 +106,10 @@ impl FolderRecipient {
 
     pub fn to_proto(&self) -> proto::Recipient {
         let identifier = match self {
-            Self::Contact { service_id, e164 } => {
-                let parsed = service_id
-                    .as_deref()
-                    .and_then(ServiceId::parse_from_service_id_string);
+            Self::Contact { e164, .. } => {
+                let parsed = self.service_id();
                 recipient::Identifier::Contact(recipient::Contact {
-                    service_id: parsed
-                        .map(|s| s.service_id_string())
-                        .unwrap_or_default(),
+                    service_id: parsed.map(|s| s.service_id_string()).unwrap_or_default(),
                     e164: e164.clone().unwrap_or_default(),
                     service_id_binary: parsed.map(|s| s.service_id_binary()).unwrap_or_default(),
                 })
@@ -243,7 +239,8 @@ impl TryFrom<proto::ChatFolderRecord> for ChatFolder {
     /// absent, so a record from a client that predates `showMutedChats` reads
     /// as "hide muted", exactly as it does on Desktop.
     fn try_from(r: proto::ChatFolderRecord) -> Result<Self, Self::Error> {
-        let id = Uuid::from_slice(&r.identifier).map_err(|_| ChatFolderRecordError::MissingIdentifier)?;
+        let id = Uuid::from_slice(&r.identifier)
+            .map_err(|_| ChatFolderRecordError::MissingIdentifier)?;
         let folder_type = r.folder_type().into();
         Ok(Self {
             id,
@@ -333,6 +330,9 @@ mod tests {
         assert!(ChatFolder::is_valid_name(&"👨‍👩‍👧‍👦".repeat(32)));
         assert!(!ChatFolder::is_valid_name(&"a".repeat(33)));
         assert!(!ChatFolder::is_valid_name(""));
-        assert_eq!(ChatFolder::normalized_name("  Work \u{0301} "), "Work \u{0301}".nfc().collect::<String>().trim().to_owned());
+        assert_eq!(
+            ChatFolder::normalized_name("  Work \u{0301} "),
+            "Work \u{0301}".nfc().collect::<String>().trim().to_owned()
+        );
     }
 }
