@@ -29,6 +29,7 @@ use crate::{
     manager::RegistrationData,
     model::{
         calls::{transition_call_history, CallEventInfo, CallHistoryEntry, CallPeer},
+        chat_folders::ChatFolder,
         contacts::Contact,
         groups::Group,
     },
@@ -62,6 +63,7 @@ pub struct StorageSyncCursor {
 pub enum StorageRecordKey {
     Contact(ServiceId),
     GroupV2(GroupMasterKeyBytes),
+    ChatFolder(Uuid),
 }
 
 impl StorageRecordKey {
@@ -70,6 +72,7 @@ impl StorageRecordKey {
         match self {
             Self::Contact(_) => manifest_record::identifier::Type::Contact,
             Self::GroupV2(_) => manifest_record::identifier::Type::Groupv2,
+            Self::ChatFolder(_) => manifest_record::identifier::Type::ChatFolder,
         }
     }
 }
@@ -559,6 +562,83 @@ pub trait ContentsStore: Send + Sync {
         &self,
     ) -> impl Future<Output = Result<Vec<GroupMasterKeyBytes>, Self::ContentsStoreError>> + Send
     {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Every chat folder, tombstones included — the manifest upload needs both.
+    fn chat_folders(
+        &self,
+    ) -> impl Future<Output = Result<Vec<ChatFolder>, Self::ContentsStoreError>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    fn chat_folder(
+        &self,
+        _id: Uuid,
+    ) -> impl Future<Output = Result<Option<ChatFolder>, Self::ContentsStoreError>> + Send {
+        async { Ok(None) }
+    }
+
+    /// Insert or replace one chat folder's model fields. The storage-service
+    /// columns behind [`chat_folder_storage_identity`](Self::chat_folder_storage_identity)
+    /// are not touched.
+    fn save_chat_folder(
+        &self,
+        _folder: &ChatFolder,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Hard delete. Only for a tombstone past its expiry, or a row that never
+    /// reached the storage service — anything else has to be tombstoned so the
+    /// other devices see it go.
+    fn delete_chat_folder(
+        &self,
+        _id: Uuid,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Where this folder's storage-service record lives, if we have ever read
+    /// or written it. Same contract as the contact and group twins.
+    fn chat_folder_storage_identity(
+        &self,
+        _id: Uuid,
+    ) -> impl Future<Output = Result<Option<StorageRecordIdentity>, Self::ContentsStoreError>> + Send
+    {
+        async { Ok(None) }
+    }
+
+    fn save_chat_folder_storage_identity(
+        &mut self,
+        _id: Uuid,
+        _identity: &StorageRecordIdentity,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Forget where a folder's record lives. Used when the manifest no longer
+    /// lists that identifier, so the next publish appends instead of replacing.
+    fn clear_chat_folder_storage_identity(
+        &mut self,
+        _id: Uuid,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// The durable half of a folder publish, exactly as for contacts and groups.
+    fn set_chat_folder_needs_storage_sync(
+        &mut self,
+        _id: Uuid,
+        _needs_sync: bool,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Every chat folder with an unpublished local change, for the boot-time flush.
+    fn chat_folders_needing_storage_sync(
+        &self,
+    ) -> impl Future<Output = Result<Vec<Uuid>, Self::ContentsStoreError>> + Send {
         async { Ok(Vec::new()) }
     }
 
