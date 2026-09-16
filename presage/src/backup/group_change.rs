@@ -6,7 +6,9 @@
 //! params. Decryption needs only the master key — the server signature is not
 //! checked — so the import can encrypt the plaintext back and store exactly
 //! what the live receive path would have stored. Every reader of stored group
-//! history then works unchanged.
+//! history then works unchanged. The actions and the change are built by
+//! libsignal-service's own `GroupOperations`, next to the decoder that reads
+//! them back; this module only maps backup update kinds onto them.
 //!
 //! Member actions carry a profile-key ciphertext the decoder insists on; the
 //! backup has no profile key for them, so a random one is encrypted in its
@@ -20,14 +22,12 @@ use libsignal_service::{
     prelude::ProtobufMessage as _,
     proto::{
         backup::{self, group_change_chat_update::update::Update},
-        group_change::{actions, Actions},
-        GroupChange, MemberPendingAdminApproval,
+        group_change::Actions,
     },
     protocol::{Aci, Pni, ServiceId},
     zkgroup::{
         groups::{GroupMasterKey, GroupSecretParams},
         profiles::ProfileKey,
-        serialize,
     },
 };
 
@@ -69,20 +69,23 @@ pub fn plan_group_update(
     ops: &GroupOperations,
     our_aci: Aci,
     fallback_editor: Aci,
-) -> (Aci, GroupUpdate) {
+) -> Option<(Aci, GroupUpdate)> {
     if let Some(Update::GroupCreationUpdate(u)) = update.update.as_ref() {
-        return (
+        return Some((
             aci(&u.updater_aci).unwrap_or(fallback_editor),
             GroupUpdate::Created,
-        );
+        ));
     }
     let (editor, actions) = match update.update.as_ref() {
         Some(update) => plan(update, ops, our_aci),
         None => (None, None),
     };
     let editor = editor.unwrap_or(fallback_editor);
-    let change = encrypt_change(ops, editor, actions.unwrap_or_default());
-    (editor, GroupUpdate::Change(change))
+    let change = ops
+        .encrypt_group_change(editor, actions.unwrap_or_default())
+        .ok()?
+        .encode_to_vec();
+    Some((editor, GroupUpdate::Change(change)))
 }
 
 /// The editor the backup names, if any, and the actions of the change —
@@ -108,13 +111,11 @@ fn plan(update: &Update, ops: &GroupOperations, our_aci: Aci) -> (Option<Aci>, O
         Update::GroupAvatarUpdate(u) => actions(
             aci(&u.updater_aci),
             Some(Actions {
-                modify_avatar: Some(actions::ModifyAvatarAction {
-                    avatar: if u.was_removed {
-                        String::new()
-                    } else {
-                        BACKUP_AVATAR_PATH.to_string()
-                    },
-                }),
+                modify_avatar: Some(ops.build_modify_avatar_action(if u.was_removed {
+                    String::new()
+                } else {
+                    BACKUP_AVATAR_PATH.to_string()
+                })),
                 ..Default::default()
             }),
         ),
@@ -192,15 +193,13 @@ fn plan(update: &Update, ops: &GroupOperations, our_aci: Aci) -> (Option<Aci>, O
             let joiner = aci_bytes(&u.new_member_aci);
             actions(
                 joiner,
-                joiner.map(|joiner| Actions {
-                    promote_members_pending_profile_key: vec![
-                        actions::PromoteMemberPendingProfileKeyAction {
-                            user_id: encrypt_service_id(ops, joiner.into()),
-                            profile_key: encrypt_placeholder_profile_key(ops, joiner),
-                            presentation: Vec::new(),
-                        },
-                    ],
-                    ..Default::default()
+                joiner.and_then(|joiner| {
+                    Some(Actions {
+                        promote_members_pending_profile_key: vec![ops
+                            .build_promote_pending_member_action(joiner, placeholder_profile_key())
+                            .ok()?],
+                        ..Default::default()
+                    })
                 }),
             )
         }
@@ -245,34 +244,29 @@ fn plan(update: &Update, ops: &GroupOperations, our_aci: Aci) -> (Option<Aci>, O
             let requester = aci_bytes(&u.requestor_aci);
             actions(
                 requester,
-                requester.map(|requester| Actions {
-                    add_members_pending_admin_approval: vec![
-                        actions::AddMemberPendingAdminApprovalAction {
-                            added: Some(MemberPendingAdminApproval {
-                                user_id: encrypt_service_id(ops, requester.into()),
-                                profile_key: encrypt_placeholder_profile_key(ops, requester),
-                                presentation: Vec::new(),
-                                timestamp: 0,
-                            }),
-                        },
-                    ],
-                    ..Default::default()
+                requester.and_then(|requester| {
+                    Some(Actions {
+                        add_members_pending_admin_approval: vec![ops
+                            .build_add_requesting_member_action(
+                                requester,
+                                placeholder_profile_key(),
+                            )
+                            .ok()?],
+                        ..Default::default()
+                    })
                 }),
             )
         }
         Update::GroupJoinRequestApprovalUpdate(u) => actions(
             aci(&u.updater_aci),
-            aci_bytes(&u.requestor_aci).map(|requester| {
+            aci_bytes(&u.requestor_aci).and_then(|requester| {
                 if u.was_approved {
-                    Actions {
-                        promote_members_pending_admin_approval: vec![
-                            actions::PromoteMemberPendingAdminApprovalAction {
-                                user_id: encrypt_service_id(ops, requester.into()),
-                                role: Role::Default.into(),
-                            },
-                        ],
+                    Some(Actions {
+                        promote_members_pending_admin_approval: vec![ops
+                            .build_promote_requesting_member_action(requester, Role::Default)
+                            .ok()?],
                         ..Default::default()
-                    }
+                    })
                 } else {
                     remove_requesting_member(ops, requester)
                 }
@@ -282,40 +276,42 @@ fn plan(update: &Update, ops: &GroupOperations, our_aci: Aci) -> (Option<Aci>, O
             let requester = aci_bytes(&u.requestor_aci);
             actions(
                 requester,
-                requester.map(|requester| remove_requesting_member(ops, requester)),
+                requester.and_then(|requester| remove_requesting_member(ops, requester)),
             )
         }
         Update::GroupSequenceOfRequestsAndCancelsUpdate(u) => {
             let requester = aci_bytes(&u.requestor_aci);
             actions(
                 requester,
-                requester.map(|requester| remove_requesting_member(ops, requester)),
+                requester.and_then(|requester| remove_requesting_member(ops, requester)),
             )
         }
         Update::GroupInviteLinkResetUpdate(u) => actions(
             aci(&u.updater_aci),
             Some(Actions {
-                modify_invite_link_password: Some(actions::ModifyInviteLinkPasswordAction {
-                    invite_link_password: Vec::new(),
-                }),
+                modify_invite_link_password: Some(
+                    ops.build_modify_invite_link_password_action(Vec::new()),
+                ),
                 ..Default::default()
             }),
         ),
         Update::GroupInviteLinkEnabledUpdate(u) => actions(
             aci(&u.updater_aci),
-            Some(invite_link_access(link_access(
-                u.link_requires_admin_approval,
-            ))),
+            Some(invite_link_access(
+                ops,
+                link_access(u.link_requires_admin_approval),
+            )),
         ),
         Update::GroupInviteLinkAdminApprovalUpdate(u) => actions(
             aci(&u.updater_aci),
-            Some(invite_link_access(link_access(
-                u.link_requires_admin_approval,
-            ))),
+            Some(invite_link_access(
+                ops,
+                link_access(u.link_requires_admin_approval),
+            )),
         ),
         Update::GroupInviteLinkDisabledUpdate(u) => actions(
             aci(&u.updater_aci),
-            Some(invite_link_access(AccessRequired::Unsatisfiable)),
+            Some(invite_link_access(ops, AccessRequired::Unsatisfiable)),
         ),
         Update::GroupV2MigrationUpdate(_)
         | Update::GroupV2MigrationSelfInvitedUpdate(_)
@@ -338,34 +334,6 @@ fn plan(update: &Update, ops: &GroupOperations, our_aci: Aci) -> (Option<Aci>, O
     }
 }
 
-/// The encrypted `GroupChange` for `actions` as made by `editor`. The
-/// decoder requires the 32-byte group identifier, which the server would
-/// have stamped in; it is derived from the same master key here.
-fn encrypt_change(ops: &GroupOperations, editor: Aci, actions: Actions) -> Vec<u8> {
-    let actions = Actions {
-        source_user_id: encrypt_service_id(ops, editor.into()),
-        group_id: ops.group_secret_params.get_group_identifier().to_vec(),
-        ..actions
-    };
-    GroupChange {
-        actions: actions.encode_to_vec(),
-        server_signature: Vec::new(),
-        change_epoch: 0,
-    }
-    .encode_to_vec()
-}
-
-fn encrypt_service_id(ops: &GroupOperations, service_id: ServiceId) -> Vec<u8> {
-    serialize(&ops.group_secret_params.encrypt_service_id(service_id))
-}
-
-fn encrypt_placeholder_profile_key(ops: &GroupOperations, aci: Aci) -> Vec<u8> {
-    serialize(
-        &ops.group_secret_params
-            .encrypt_profile_key(placeholder_profile_key(), aci),
-    )
-}
-
 fn placeholder_profile_key() -> ProfileKey {
     ProfileKey::generate(rand::random())
 }
@@ -375,10 +343,12 @@ fn add_member(ops: &GroupOperations, aci: Aci, join_from_invite_link: bool) -> O
         .build_add_member_action(aci, placeholder_profile_key(), Role::Default)
         .ok()?;
     Some(Actions {
-        add_members: vec![actions::AddMemberAction {
-            join_from_invite_link,
-            ..added
-        }],
+        add_members: vec![
+            libsignal_service::proto::group_change::actions::AddMemberAction {
+                join_from_invite_link,
+                ..added
+            },
+        ],
         ..Default::default()
     })
 }
@@ -408,23 +378,19 @@ fn remove_pending_member(ops: &GroupOperations, invitee: ServiceId) -> Option<Ac
     })
 }
 
-fn remove_requesting_member(ops: &GroupOperations, aci: Aci) -> Actions {
-    Actions {
-        delete_members_pending_admin_approval: vec![
-            actions::DeleteMemberPendingAdminApprovalAction {
-                deleted_user_id: encrypt_service_id(ops, aci.into()),
-            },
-        ],
+fn remove_requesting_member(ops: &GroupOperations, aci: Aci) -> Option<Actions> {
+    Some(Actions {
+        delete_members_pending_admin_approval: vec![ops
+            .build_remove_requesting_member_action(aci)
+            .ok()?],
         ..Default::default()
-    }
+    })
 }
 
-fn invite_link_access(access: AccessRequired) -> Actions {
+fn invite_link_access(ops: &GroupOperations, access: AccessRequired) -> Actions {
     Actions {
         modify_add_from_invite_link_access: Some(
-            actions::ModifyAddFromInviteLinkAccessControlAction {
-                add_from_invite_link_access: access.into(),
-            },
+            ops.build_modify_invite_link_access_action(access),
         ),
         ..Default::default()
     }

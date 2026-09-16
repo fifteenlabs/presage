@@ -437,7 +437,7 @@ fn group_change_data_message(
     let update = gc.updates.first()?;
     let ops = group_ops_for(group_ops, *master_key);
     let fallback_editor = author.aci().unwrap_or(our_aci);
-    let (editor, update) = plan_group_update(update, ops, our_aci, fallback_editor);
+    let (editor, update) = plan_group_update(update, ops, our_aci, fallback_editor)?;
     let (revision, group_change) = match update {
         GroupUpdate::Created => (Some(0), None),
         GroupUpdate::Change(change) => (None, Some(change)),
