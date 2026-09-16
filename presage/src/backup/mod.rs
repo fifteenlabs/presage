@@ -1,4 +1,5 @@
 pub mod convert;
+mod group_change;
 
 pub use libsignal_service::proto::backup::{
     frame::Item as FrameItem, Chat, ChatItem, Frame, Recipient,
