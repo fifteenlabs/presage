@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use libsignal_service::{
     content::{Content, ContentBody, Metadata},
+    groups_v2::GroupOperations,
     prelude::Uuid,
     proto::{
         attachment_pointer::{AttachmentIdentifier, Flags as AttachPointerFlags},
@@ -20,7 +21,7 @@ use libsignal_service::{
     ServiceIdExt,
 };
 
-use super::group_change::{plan_group_update, GroupCipher, GroupUpdate};
+use super::group_change::{aci_bytes, group_operations, plan_group_update, GroupUpdate};
 use super::ChatItem;
 use crate::store::{BackupSendStatus, Thread};
 
@@ -36,11 +37,7 @@ pub fn recipient_info(r: &backup::Recipient, our_aci: Aci) -> Option<(u64, Recip
     use libsignal_service::proto::backup::recipient::Destination;
     let info = match r.destination.as_ref()? {
         Destination::Contact(c) => RecipientInfo {
-            service_id: c
-                .aci
-                .as_ref()
-                .and_then(|b| b.as_slice().try_into().ok())
-                .map(|bytes: [u8; 16]| ServiceId::Aci(Aci::from_uuid_bytes(bytes))),
+            service_id: c.aci.as_deref().and_then(aci_bytes).map(ServiceId::Aci),
             group_master_key: None,
         },
         Destination::Group(g) if g.master_key.len() == 32 => RecipientInfo {
@@ -230,9 +227,7 @@ fn reactions_to_contents(
     reactions
         .iter()
         .filter_map(|reaction| {
-            let author_service_id = recipients.get(&reaction.author_id)?.service_id?;
-            let is_outgoing = author_service_id.aci() == Some(our_aci);
-
+            let author = recipients.get(&reaction.author_id)?.service_id?;
             let dm_reaction = DataMessage {
                 reaction: Some(data_message::Reaction {
                     emoji: Some(reaction.emoji.clone()),
@@ -244,61 +239,14 @@ fn reactions_to_contents(
                 timestamp: Some(reaction.sent_timestamp),
                 ..Default::default()
             };
-
-            let (body, sender, destination) = if is_outgoing {
-                let dest_str = match thread {
-                    Thread::Contact(sid) => Some(sid.service_id_string()),
-                    Thread::Group(_) => None,
-                };
-                let destination = match thread {
-                    Thread::Contact(sid) => *sid,
-                    Thread::Group(_) => ServiceId::Aci(our_aci),
-                };
-                let sent = sync_message::Sent {
-                    destination_service_id: dest_str,
-                    timestamp: Some(reaction.sent_timestamp),
-                    message: Some(dm_reaction),
-                    ..Default::default()
-                };
-                (
-                    ContentBody::SynchronizeMessage(SyncMessage {
-                        content: Some(sync_message::Content::Sent(sent)),
-                        ..Default::default()
-                    }),
-                    ServiceId::Aci(our_aci),
-                    destination,
-                )
-            } else {
-                (
-                    ContentBody::DataMessage(dm_reaction),
-                    author_service_id,
-                    ServiceId::Aci(our_aci),
-                )
-            };
-
             Some(ImportedContent {
-                content: Content {
-                    metadata: Metadata {
-                        sender,
-                        destination,
-                        sender_device: *DEFAULT_DEVICE_ID,
-                        server_guid: None,
-                        client_timestamp: chrono::DateTime::from_timestamp_millis(
-                            reaction.sent_timestamp as i64,
-                        )
-                        .unwrap_or_default(),
-                        server_timestamp: chrono::DateTime::from_timestamp_millis(
-                            reaction.sent_timestamp as i64,
-                        )
-                        .unwrap_or_default(),
-                        needs_receipt: false,
-                        unidentified_sender: false,
-                        was_plaintext: false,
-                        report_spam_token: None,
-                        pni_verified: None,
-                    },
-                    body,
-                },
+                content: dm_content(
+                    dm_reaction,
+                    author,
+                    thread,
+                    our_aci,
+                    reaction.sent_timestamp,
+                ),
                 thread: thread.clone(),
                 // A backup `Reaction` carries only when it was sent, so that is
                 // the best arrival there is for it.
@@ -351,12 +299,18 @@ fn chat_item_arrival_ms(item: &ChatItem) -> u64 {
 /// merges, session switchovers, and every `SimpleUpdate` other than
 /// block/unblock. Those are client-local notifications a live client
 /// synthesises for itself, and would need a row that is not a `Content`.
+///
+/// `group_ops` caches the group operations per master key across the import;
+/// deriving them is elliptic-curve work, and a backup has many rows per group.
 pub fn chat_item_to_contents(
     item: &ChatItem,
     recipients: &HashMap<u64, RecipientInfo>,
     chats: &HashMap<u64, Thread>,
+    group_ops: &mut HashMap<[u8; 32], GroupOperations>,
     our_aci: Aci,
 ) -> Vec<ImportedContent> {
+    use backup::chat_update_message::Update;
+
     let Some(thread) = chats.get(&item.chat_id).cloned() else {
         return vec![];
     };
@@ -370,97 +324,98 @@ pub fn chat_item_to_contents(
             sticker_message_to_contents(sm, item, &thread, recipients, our_aci, timestamp)
         }
         Some(Item::UpdateMessage(cu)) => match cu.update.as_ref() {
-            Some(backup::chat_update_message::Update::IndividualCall(_)) => {
+            Some(Update::IndividualCall(_)) => {
                 individual_call_to_contents(cu, &thread, our_aci, timestamp)
             }
-            Some(backup::chat_update_message::Update::GroupCall(_)) => {
-                group_call_to_contents(cu, &thread, recipients, our_aci, timestamp)
+            Some(Update::GroupCall(_)) => {
+                group_call_to_contents(cu, &thread, recipients, group_ops, our_aci, timestamp)
             }
-            Some(backup::chat_update_message::Update::SimpleUpdate(_)) => {
+            Some(Update::SimpleUpdate(_)) => {
                 simple_update_to_contents(cu, &thread, our_aci, timestamp)
             }
-            Some(backup::chat_update_message::Update::ExpirationTimerChange(timer)) => update_row(
-                timer_data_message(timer.expires_in_ms, None, timestamp),
-                item_author(item, recipients, our_aci),
-                &thread,
-                our_aci,
-                timestamp,
+            Some(update) => update_row(
+                update, item, &thread, recipients, group_ops, our_aci, timestamp,
             ),
-            Some(backup::chat_update_message::Update::GroupChange(gc)) => {
-                group_change_to_contents(gc, item, &thread, recipients, our_aci, timestamp)
-            }
-            Some(backup::chat_update_message::Update::PollTerminate(pt)) => {
-                let dm = DataMessage {
-                    poll_terminate: Some(data_message::PollTerminate {
-                        target_sent_timestamp: Some(pt.target_sent_timestamp),
-                    }),
-                    timestamp: Some(timestamp),
-                    ..Default::default()
-                };
-                update_row(
-                    dm,
-                    item_author(item, recipients, our_aci),
-                    &thread,
-                    our_aci,
-                    timestamp,
-                )
-            }
-            Some(backup::chat_update_message::Update::PinMessage(pin)) => {
-                pin_message_to_contents(pin, item, &thread, recipients, our_aci, timestamp)
-            }
-            _ => vec![],
+            None => vec![],
         },
         _ => vec![],
     }
 }
 
-/// The message a live client sends to change a disappearing-message timer:
-/// the `EXPIRATION_TIMER_UPDATE` flag with the new duration, on the group
-/// context when the chat is a group.
-fn timer_data_message(
-    expires_in_ms: u64,
-    group_v2: Option<GroupContextV2>,
-    timestamp: u64,
-) -> DataMessage {
-    DataMessage {
-        flags: Some(data_message::Flags::ExpirationTimerUpdate as u32),
-        expire_timer: Some((expires_in_ms / 1000) as u32),
-        group_v2,
-        timestamp: Some(timestamp),
-        ..Default::default()
-    }
-}
-
-/// The wire form of pinning a message: a `DataMessage.pin_message` naming
-/// the pinned message by author and send time. Dropped when the backup
-/// cannot resolve that author, since the wire form requires one.
-fn pin_message_to_contents(
-    pin: &backup::PinMessageUpdate,
+/// One imported row for an update that is a `DataMessage` on the wire: a
+/// timer change, a pin, a poll end, or a group change. The backup dates
+/// such a row but records no arrival for it, so the send time stands in —
+/// as it does for the call and block rows. Kinds with no wire form yield
+/// nothing; the calls and block/unblock are routed before this.
+fn update_row(
+    update: &backup::chat_update_message::Update,
     item: &ChatItem,
     thread: &Thread,
     recipients: &HashMap<u64, RecipientInfo>,
+    group_ops: &mut HashMap<[u8; 32], GroupOperations>,
     our_aci: Aci,
     timestamp: u64,
 ) -> Vec<ImportedContent> {
-    let Some(target_author) = recipients.get(&pin.author_id).and_then(|r| r.service_id) else {
-        return vec![];
+    use backup::chat_update_message::Update;
+
+    let author = item_author(item, recipients, our_aci);
+    let (sender, dm) = match update {
+        Update::ExpirationTimerChange(timer) => (
+            author,
+            DataMessage {
+                flags: Some(data_message::Flags::ExpirationTimerUpdate as u32),
+                expire_timer: Some((timer.expires_in_ms / 1000) as u32),
+                ..Default::default()
+            },
+        ),
+        Update::PollTerminate(pt) => (
+            author,
+            DataMessage {
+                poll_terminate: Some(data_message::PollTerminate {
+                    target_sent_timestamp: Some(pt.target_sent_timestamp),
+                }),
+                ..Default::default()
+            },
+        ),
+        // The wire form names the pinned message by author, so a pin whose
+        // author the backup cannot resolve has no wire form.
+        Update::PinMessage(pin) => {
+            let Some(target_author) = recipients.get(&pin.author_id).and_then(|r| r.service_id)
+            else {
+                return vec![];
+            };
+            (
+                author,
+                DataMessage {
+                    pin_message: Some(data_message::PinMessage {
+                        target_author_aci_binary: Some(
+                            target_author.raw_uuid().as_bytes().to_vec(),
+                        ),
+                        target_sent_timestamp: Some(pin.target_sent_timestamp),
+                        pin_duration: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+        }
+        Update::GroupChange(gc) => {
+            let Some(row) = group_change_data_message(gc, thread, group_ops, author, our_aci)
+            else {
+                return vec![];
+            };
+            row
+        }
+        _ => return vec![],
     };
     let dm = DataMessage {
-        pin_message: Some(data_message::PinMessage {
-            target_author_aci_binary: Some(target_author.raw_uuid().as_bytes().to_vec()),
-            target_sent_timestamp: Some(pin.target_sent_timestamp),
-            pin_duration: None,
-        }),
         timestamp: Some(timestamp),
-        ..Default::default()
+        ..dm
     };
-    update_row(
-        dm,
-        item_author(item, recipients, our_aci),
-        thread,
-        our_aci,
-        timestamp,
-    )
+    vec![ImportedContent {
+        content: dm_content(dm, sender, thread, our_aci, timestamp),
+        thread: thread.clone(),
+        received_at_ms: timestamp,
+    }]
 }
 
 /// Rebuilds a backup group update as the `DataMessage` a live member would
@@ -469,48 +424,42 @@ fn pin_message_to_contents(
 /// updates yields one row for its first update — the row is keyed by thread,
 /// time and sender, so a batch could never be more than one row, and a live
 /// client renders the first change it recognises in a batch too.
-fn group_change_to_contents(
+fn group_change_data_message(
     gc: &backup::GroupChangeChatUpdate,
-    item: &ChatItem,
     thread: &Thread,
-    recipients: &HashMap<u64, RecipientInfo>,
+    group_ops: &mut HashMap<[u8; 32], GroupOperations>,
+    author: ServiceId,
     our_aci: Aci,
-    timestamp: u64,
-) -> Vec<ImportedContent> {
+) -> Option<(ServiceId, DataMessage)> {
     let Thread::Group(master_key) = thread else {
-        return vec![];
+        return None;
     };
-    let Some(update) = gc.updates.first() else {
-        return vec![];
+    let update = gc.updates.first()?;
+    let ops = group_ops_for(group_ops, *master_key);
+    let fallback_editor = author.aci().unwrap_or(our_aci);
+    let (editor, update) = plan_group_update(update, ops, our_aci, fallback_editor);
+    let (revision, group_change) = match update {
+        GroupUpdate::Created => (Some(0), None),
+        GroupUpdate::Change(change) => (None, Some(change)),
     };
-    let cipher = GroupCipher::new(*master_key);
-    let plan = plan_group_update(update, &cipher, our_aci);
-    let editor = plan
-        .editor
-        .or_else(|| item_author(item, recipients, our_aci).aci())
-        .unwrap_or(our_aci);
+    let dm = DataMessage {
+        group_v2: Some(GroupContextV2 {
+            master_key: Some(master_key.to_vec()),
+            revision,
+            group_change,
+        }),
+        ..Default::default()
+    };
+    Some((ServiceId::Aci(editor), dm))
+}
 
-    let context = |revision: Option<u32>, group_change: Option<Vec<u8>>| GroupContextV2 {
-        master_key: Some(master_key.to_vec()),
-        revision,
-        group_change,
-    };
-    let dm = match plan.update {
-        GroupUpdate::Created => DataMessage {
-            group_v2: Some(context(Some(0), None)),
-            timestamp: Some(timestamp),
-            ..Default::default()
-        },
-        GroupUpdate::Timer { expires_in_ms } => {
-            timer_data_message(expires_in_ms, Some(context(None, None)), timestamp)
-        }
-        GroupUpdate::Change(actions) => DataMessage {
-            group_v2: Some(context(None, Some(cipher.change(editor, *actions)))),
-            timestamp: Some(timestamp),
-            ..Default::default()
-        },
-    };
-    update_row(dm, ServiceId::Aci(editor), thread, our_aci, timestamp)
+fn group_ops_for(
+    group_ops: &mut HashMap<[u8; 32], GroupOperations>,
+    master_key: [u8; 32],
+) -> &GroupOperations {
+    group_ops
+        .entry(master_key)
+        .or_insert_with(|| group_operations(master_key))
 }
 
 /// Who a backup item says did it, or ourselves when the backup cannot say.
@@ -524,23 +473,6 @@ fn item_author(
         .get(&item.author_id)
         .and_then(|r| r.service_id)
         .unwrap_or(ServiceId::Aci(our_aci))
-}
-
-/// One imported row for a directionless update. The backup dates such a row
-/// but records no arrival for it, so the send time stands in — as it does
-/// for the call and block rows.
-fn update_row(
-    dm: DataMessage,
-    sender: ServiceId,
-    thread: &Thread,
-    our_aci: Aci,
-    timestamp: u64,
-) -> Vec<ImportedContent> {
-    vec![ImportedContent {
-        content: dm_content(dm, sender, thread, our_aci, timestamp),
-        thread: thread.clone(),
-        received_at_ms: timestamp,
-    }]
 }
 
 /// Restored state for a backup message row that the wire `Content` cannot
@@ -748,22 +680,28 @@ fn dm_content(
     };
 
     Content {
-        metadata: Metadata {
-            sender,
-            destination,
-            sender_device: *DEFAULT_DEVICE_ID,
-            server_guid: None,
-            client_timestamp: chrono::DateTime::from_timestamp_millis(timestamp as i64)
-                .unwrap_or_default(),
-            server_timestamp: chrono::DateTime::from_timestamp_millis(timestamp as i64)
-                .unwrap_or_default(),
-            needs_receipt: false,
-            unidentified_sender: false,
-            was_plaintext: false,
-            report_spam_token: None,
-            pni_verified: None,
-        },
+        metadata: imported_metadata(sender, destination, timestamp),
         body,
+    }
+}
+
+/// The envelope metadata of an imported row. Nothing about the transport
+/// survives a backup, so every row looks like a plain, receipted delivery
+/// from the sender's primary device at the time it was sent.
+fn imported_metadata(sender: ServiceId, destination: ServiceId, timestamp: u64) -> Metadata {
+    let at = chrono::DateTime::from_timestamp_millis(timestamp as i64).unwrap_or_default();
+    Metadata {
+        sender,
+        destination,
+        sender_device: *DEFAULT_DEVICE_ID,
+        server_guid: None,
+        client_timestamp: at,
+        server_timestamp: at,
+        needs_receipt: false,
+        unidentified_sender: false,
+        was_plaintext: false,
+        report_spam_token: None,
+        pni_verified: None,
     }
 }
 
@@ -836,27 +774,11 @@ fn individual_call_to_contents(
         ..Default::default()
     });
 
-    let main_content = Content {
-        metadata: Metadata {
-            sender: ServiceId::Aci(our_aci),
-            destination: ServiceId::Aci(our_aci),
-            sender_device: *DEFAULT_DEVICE_ID,
-            server_guid: None,
-            client_timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64)
-                .unwrap_or_default(),
-            server_timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64)
-                .unwrap_or_default(),
-            needs_receipt: false,
-            unidentified_sender: false,
-            was_plaintext: false,
-            report_spam_token: None,
-            pni_verified: None,
-        },
-        body,
-    };
-
     vec![ImportedContent {
-        content: main_content,
+        content: Content {
+            metadata: imported_metadata(ServiceId::Aci(our_aci), ServiceId::Aci(our_aci), call_ts),
+            body,
+        },
         thread: thread.clone(),
         received_at_ms: call_ts,
     }]
@@ -903,26 +825,11 @@ fn simple_update_to_contents(
         )),
         ..Default::default()
     });
-    let ts = chrono::DateTime::from_timestamp_millis(timestamp as i64).unwrap_or_default();
-    let main_content = Content {
-        metadata: Metadata {
-            sender: ServiceId::Aci(our_aci),
-            destination: *peer,
-            sender_device: *DEFAULT_DEVICE_ID,
-            server_guid: None,
-            client_timestamp: ts,
-            server_timestamp: ts,
-            needs_receipt: false,
-            unidentified_sender: false,
-            was_plaintext: false,
-            report_spam_token: None,
-            pni_verified: None,
-        },
-        body,
-    };
-
     vec![ImportedContent {
-        content: main_content,
+        content: Content {
+            metadata: imported_metadata(ServiceId::Aci(our_aci), *peer, timestamp),
+            body,
+        },
         thread: thread.clone(),
         received_at_ms: timestamp,
     }]
@@ -938,12 +845,12 @@ fn group_call_to_contents(
     cu: &backup::ChatUpdateMessage,
     thread: &Thread,
     recipients: &HashMap<u64, RecipientInfo>,
+    group_ops: &mut HashMap<[u8; 32], GroupOperations>,
     our_aci: Aci,
     fallback_ts: u64,
 ) -> Vec<ImportedContent> {
     use backup::chat_update_message::Update;
     use backup::group_call;
-    use libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
     use sync_message::call_event::{Direction as WireDir, Event as WireEvent, Type as WireType};
 
     let Some(Update::GroupCall(call)) = cu.update.as_ref() else {
@@ -959,10 +866,10 @@ fn group_call_to_contents(
     // conversation_id for a group call is the 32-byte derived group_id, not
     // the master_key. Derive it the same way live sync would emit it so the
     // downstream `resolve_call_peer` lookup matches.
-    let group_id: [u8; 32] =
-        GroupSecretParams::derive_from_master_key(GroupMasterKey::new(*master_key))
-            .get_group_identifier();
-    let conv_id: Vec<u8> = group_id.to_vec();
+    let conv_id: Vec<u8> = group_ops_for(group_ops, *master_key)
+        .group_secret_params
+        .get_group_identifier()
+        .to_vec();
 
     let state = group_call::State::try_from(call.state).unwrap_or(group_call::State::Generic);
 
@@ -1019,27 +926,11 @@ fn group_call_to_contents(
         ..Default::default()
     });
 
-    let main_content = Content {
-        metadata: Metadata {
-            sender: ServiceId::Aci(our_aci),
-            destination: ServiceId::Aci(our_aci),
-            sender_device: *DEFAULT_DEVICE_ID,
-            server_guid: None,
-            client_timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64)
-                .unwrap_or_default(),
-            server_timestamp: chrono::DateTime::from_timestamp_millis(call_ts as i64)
-                .unwrap_or_default(),
-            needs_receipt: false,
-            unidentified_sender: false,
-            was_plaintext: false,
-            report_spam_token: None,
-            pni_verified: None,
-        },
-        body,
-    };
-
     vec![ImportedContent {
-        content: main_content,
+        content: Content {
+            metadata: imported_metadata(ServiceId::Aci(our_aci), ServiceId::Aci(our_aci), call_ts),
+            body,
+        },
         thread: thread.clone(),
         received_at_ms: call_ts,
     }]
@@ -1398,7 +1289,14 @@ mod tests {
     }
 
     fn imported(item: &ChatItem) -> Vec<ImportedContent> {
-        chat_item_to_contents(item, &sender_recipients(), &sender_chats(), our_aci())
+        let chats: HashMap<u64, Thread> = sender_chats().into_iter().chain(group_chats()).collect();
+        chat_item_to_contents(
+            item,
+            &sender_recipients(),
+            &chats,
+            &mut HashMap::new(),
+            our_aci(),
+        )
     }
 
     /// Every row an import writes has to carry the arrival the backup recorded.
@@ -1531,29 +1429,32 @@ mod tests {
         })
     }
 
+    /// The one row an update imports as.
+    fn imported_row(item: &ChatItem) -> ImportedContent {
+        let mut rows = imported(item);
+        assert_eq!(rows.len(), 1, "an update imports as exactly one row");
+        rows.remove(0)
+    }
+
     /// The sender and inner `DataMessage` of the one row an update imports as,
     /// unwrapped from whichever envelope it was given.
-    fn imported_update(item: &ChatItem) -> (ServiceId, bool, DataMessage) {
-        let chats: HashMap<u64, Thread> = sender_chats().into_iter().chain(group_chats()).collect();
-        let mut rows = chat_item_to_contents(item, &sender_recipients(), &chats, our_aci());
-        assert_eq!(rows.len(), 1, "an update imports as exactly one row");
-        let row = rows.remove(0);
+    fn imported_update(item: &ChatItem) -> (ServiceId, DataMessage) {
+        let row = imported_row(item);
         let sender = row.content.metadata.sender;
-        match row.content.body {
-            ContentBody::DataMessage(dm) => (sender, false, dm),
+        let dm = match row.content.body {
+            ContentBody::DataMessage(dm) => dm,
             ContentBody::SynchronizeMessage(sync) => match sync.content {
-                Some(sync_message::Content::Sent(sent)) => (
-                    sender,
-                    true,
-                    sent.message.expect("sent transcript carries the message"),
-                ),
+                Some(sync_message::Content::Sent(sent)) => {
+                    sent.message.expect("sent transcript carries the message")
+                }
                 other => panic!("expected a Sent transcript, got {other:?}"),
             },
             other => panic!("expected a DataMessage envelope, got {other:?}"),
-        }
+        };
+        (sender, dm)
     }
 
-    fn imported_group_update(update: GroupUpdateKind) -> (ServiceId, bool, DataMessage) {
+    fn imported_group_update(update: GroupUpdateKind) -> (ServiceId, DataMessage) {
         imported_update(&update_item(20, 1, group_update(update)))
     }
 
@@ -1565,19 +1466,25 @@ mod tests {
 
     #[test]
     fn group_change_by_us_is_a_sync_transcript_that_decrypts_under_the_group_key() {
-        let (sender, is_sync, dm) = imported_group_update(GroupUpdateKind::GroupMemberAddedUpdate(
-            backup::GroupMemberAddedUpdate {
-                updater_aci: Some(Uuid::from(our_aci()).into_bytes().to_vec()),
-                new_member_aci: Uuid::from(peer()).into_bytes().to_vec(),
-                ..Default::default()
-            },
-        ));
-        assert_eq!(sender, ServiceId::Aci(our_aci()));
+        let added_by_us = update_item(
+            20,
+            1,
+            group_update(GroupUpdateKind::GroupMemberAddedUpdate(
+                backup::GroupMemberAddedUpdate {
+                    updater_aci: Some(Uuid::from(our_aci()).into_bytes().to_vec()),
+                    new_member_aci: Uuid::from(peer()).into_bytes().to_vec(),
+                    ..Default::default()
+                },
+            )),
+        );
+        let row = imported_row(&added_by_us);
+        assert_eq!(row.content.metadata.sender, ServiceId::Aci(our_aci()));
         assert!(
-            is_sync,
+            matches!(row.content.body, ContentBody::SynchronizeMessage(_)),
             "our own change arrives as a sent transcript, as it does live"
         );
 
+        let (_, dm) = imported_update(&added_by_us);
         let changes = decrypted(&dm);
         assert_eq!(changes.editor, our_aci());
         assert!(
@@ -1591,13 +1498,12 @@ mod tests {
     /// is theirs — that is what lets it read "You left the group".
     #[test]
     fn member_led_events_are_sent_by_the_member() {
-        let (sender, is_sync, dm) = imported_group_update(GroupUpdateKind::GroupMemberLeftUpdate(
+        let (sender, dm) = imported_group_update(GroupUpdateKind::GroupMemberLeftUpdate(
             backup::GroupMemberLeftUpdate {
                 aci: Uuid::from(peer()).into_bytes().to_vec(),
             },
         ));
         assert_eq!(sender, ServiceId::Aci(peer()));
-        assert!(!is_sync);
         let changes = decrypted(&dm);
         assert_eq!(changes.editor, peer());
         assert!(matches!(
@@ -1605,7 +1511,7 @@ mod tests {
             [GroupChange::DeleteMember(aci)] if *aci == peer()
         ));
 
-        let (sender, _, dm) = imported_group_update(GroupUpdateKind::GroupJoinRequestUpdate(
+        let (sender, dm) = imported_group_update(GroupUpdateKind::GroupJoinRequestUpdate(
             backup::GroupJoinRequestUpdate {
                 requestor_aci: Uuid::from(peer()).into_bytes().to_vec(),
             },
@@ -1619,7 +1525,7 @@ mod tests {
 
     #[test]
     fn group_creation_is_revision_zero_with_no_change() {
-        let (_, _, dm) = imported_group_update(GroupUpdateKind::GroupCreationUpdate(
+        let (_, dm) = imported_group_update(GroupUpdateKind::GroupCreationUpdate(
             backup::GroupCreationUpdate {
                 updater_aci: Some(Uuid::from(peer()).into_bytes().to_vec()),
             },
@@ -1631,26 +1537,39 @@ mod tests {
     }
 
     #[test]
-    fn group_timer_is_the_expiration_flag_on_the_group_context() {
-        let (_, _, dm) = imported_group_update(GroupUpdateKind::GroupExpirationTimerUpdate(
+    fn group_timer_is_a_timer_change_in_the_group_context() {
+        let (_, dm) = imported_group_update(GroupUpdateKind::GroupExpirationTimerUpdate(
             backup::GroupExpirationTimerUpdate {
                 expires_in_ms: 86_400_000,
                 updater_aci: Some(Uuid::from(peer()).into_bytes().to_vec()),
             },
         ));
-        assert_eq!(
-            dm.flags,
-            Some(data_message::Flags::ExpirationTimerUpdate as u32)
-        );
-        assert_eq!(dm.expire_timer, Some(86_400));
-        let ctx = dm.group_v2.expect("group context");
-        assert_eq!(ctx.master_key.as_deref(), Some(&GROUP_KEY[..]));
-        assert_eq!(ctx.group_change, None);
+        assert_eq!(dm.flags, None);
+        assert!(matches!(
+            decrypted(&dm).changes.as_slice(),
+            [GroupChange::Timer(Some(t))] if t.duration == 86_400
+        ));
+    }
+
+    /// The backup names who did it separately from whom it was done to; a
+    /// participant it left out costs the row its actions, not its author.
+    #[test]
+    fn an_unresolvable_participant_keeps_the_editor() {
+        let (sender, dm) = imported_group_update(GroupUpdateKind::GroupMemberRemovedUpdate(
+            backup::GroupMemberRemovedUpdate {
+                remover_aci: Some(Uuid::from(our_aci()).into_bytes().to_vec()),
+                removed_aci: vec![1, 2, 3],
+            },
+        ));
+        assert_eq!(sender, ServiceId::Aci(our_aci()));
+        let changes = decrypted(&dm);
+        assert_eq!(changes.editor, our_aci());
+        assert!(changes.changes.is_empty());
     }
 
     #[test]
     fn attribute_blobs_and_access_levels_decrypt() {
-        let (_, _, dm) =
+        let (_, dm) =
             imported_group_update(GroupUpdateKind::GroupNameUpdate(backup::GroupNameUpdate {
                 updater_aci: None,
                 new_group_name: Some("Team Lovelace".to_string()),
@@ -1660,7 +1579,7 @@ mod tests {
             [GroupChange::Title(t)] if t == "Team Lovelace"
         ));
 
-        let (_, _, dm) =
+        let (_, dm) =
             imported_group_update(GroupUpdateKind::GroupMembershipAccessLevelChangeUpdate(
                 backup::GroupMembershipAccessLevelChangeUpdate {
                     updater_aci: None,
@@ -1672,7 +1591,7 @@ mod tests {
             [GroupChange::MemberAccess(AccessRequired::Administrator)]
         ));
 
-        let (_, _, dm) = imported_group_update(GroupUpdateKind::GroupInviteLinkEnabledUpdate(
+        let (_, dm) = imported_group_update(GroupUpdateKind::GroupInviteLinkEnabledUpdate(
             backup::GroupInviteLinkEnabledUpdate {
                 updater_aci: None,
                 link_requires_admin_approval: true,
@@ -1686,7 +1605,7 @@ mod tests {
 
     #[test]
     fn pending_members_decrypt_with_the_invitee_address() {
-        let (sender, _, dm) = imported_group_update(GroupUpdateKind::SelfInvitedToGroupUpdate(
+        let (sender, dm) = imported_group_update(GroupUpdateKind::SelfInvitedToGroupUpdate(
             backup::SelfInvitedToGroupUpdate {
                 inviter_aci: Some(Uuid::from(peer()).into_bytes().to_vec()),
             },
@@ -1703,7 +1622,7 @@ mod tests {
     /// update and never be stored.
     #[test]
     fn inexpressible_updates_become_an_empty_change_from_the_item_author() {
-        let (sender, is_sync, dm) = imported_group_update(GroupUpdateKind::GroupV2MigrationUpdate(
+        let (sender, dm) = imported_group_update(GroupUpdateKind::GroupV2MigrationUpdate(
             backup::GroupV2MigrationUpdate {},
         ));
         assert_eq!(
@@ -1711,7 +1630,6 @@ mod tests {
             ServiceId::Aci(peer()),
             "falls back to the item's author"
         );
-        assert!(!is_sync);
         assert!(dm
             .group_v2
             .as_ref()
@@ -1724,7 +1642,7 @@ mod tests {
 
     #[test]
     fn one_to_one_timer_pin_and_poll_end_are_plain_data_messages() {
-        let (sender, is_sync, dm) = imported_update(&update_item(
+        let (sender, dm) = imported_update(&update_item(
             10,
             1,
             ChatUpdate::ExpirationTimerChange(backup::ExpirationTimerChatUpdate {
@@ -1732,7 +1650,6 @@ mod tests {
             }),
         ));
         assert_eq!(sender, ServiceId::Aci(peer()));
-        assert!(!is_sync);
         assert_eq!(
             dm.flags,
             Some(data_message::Flags::ExpirationTimerUpdate as u32)
@@ -1740,7 +1657,7 @@ mod tests {
         assert_eq!(dm.expire_timer, Some(300));
         assert!(dm.group_v2.is_none());
 
-        let (_, _, dm) = imported_update(&update_item(
+        let (_, dm) = imported_update(&update_item(
             10,
             1,
             ChatUpdate::PinMessage(backup::PinMessageUpdate {
@@ -1755,7 +1672,7 @@ mod tests {
             Some(&Uuid::from(peer()).into_bytes()[..])
         );
 
-        let (_, _, dm) = imported_update(&update_item(
+        let (_, dm) = imported_update(&update_item(
             10,
             1,
             ChatUpdate::PollTerminate(backup::PollTerminateUpdate {
@@ -1771,22 +1688,17 @@ mod tests {
 
     #[test]
     fn pin_of_an_unresolvable_author_is_dropped_and_unknown_updater_is_us() {
-        let dropped = chat_item_to_contents(
-            &update_item(
-                10,
-                1,
-                ChatUpdate::PinMessage(backup::PinMessageUpdate {
-                    target_sent_timestamp: 1,
-                    author_id: 99,
-                }),
-            ),
-            &sender_recipients(),
-            &sender_chats(),
-            our_aci(),
-        );
+        let dropped = imported(&update_item(
+            10,
+            1,
+            ChatUpdate::PinMessage(backup::PinMessageUpdate {
+                target_sent_timestamp: 1,
+                author_id: 99,
+            }),
+        ));
         assert!(dropped.is_empty());
 
-        let (sender, is_sync, _) = imported_update(&update_item(
+        let (sender, _) = imported_update(&update_item(
             10,
             99,
             ChatUpdate::ExpirationTimerChange(backup::ExpirationTimerChatUpdate {
@@ -1794,6 +1706,5 @@ mod tests {
             }),
         ));
         assert_eq!(sender, ServiceId::Aci(our_aci()));
-        assert!(is_sync);
     }
 }

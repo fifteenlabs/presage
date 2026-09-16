@@ -16,19 +16,17 @@
 //! of a member named by a system row.
 
 use libsignal_service::{
+    groups_v2::{AccessRequired, GroupOperations, Role, Timer},
     prelude::ProtobufMessage as _,
     proto::{
-        access_control::AccessRequired,
         backup::{self, group_change_chat_update::update::Update},
-        group_attribute_blob::Content as Blob,
         group_change::{actions, Actions},
-        member::Role,
-        GroupAttributeBlob, GroupChange, Member, MemberPendingAdminApproval,
-        MemberPendingProfileKey,
+        GroupChange, MemberPendingAdminApproval,
     },
     protocol::{Aci, Pni, ServiceId},
     zkgroup::{
         groups::{GroupMasterKey, GroupSecretParams},
+        profiles::ProfileKey,
         serialize,
     },
 };
@@ -38,204 +36,78 @@ pub enum GroupUpdate {
     /// `GroupContextV2 { revision: 0 }` with no change — how a live client
     /// signals group creation.
     Created,
-    /// A disappearing-timer change. Sent as the `EXPIRATION_TIMER_UPDATE`
-    /// flag rather than an encrypted timer blob; that is how live clients
-    /// announce it, and the flag is read before the group change is.
-    Timer { expires_in_ms: u64 },
-    /// Plaintext actions for the group context, encrypted by
-    /// [`GroupCipher::change`] once the editor is settled. Empty actions
-    /// still encrypt to a non-empty blob — an empty blob is what a silent
-    /// group update looks like, and those are never stored.
-    Change(Box<Actions>),
+    /// An encrypted `GroupChange` for the group context. Never empty: a
+    /// change with no actions still encrypts to a blob, and it must, because
+    /// the app's `is_silent_group_update` drops a context whose change bytes
+    /// are empty and keeps one that decrypts to zero changes, which then
+    /// renders as a generic "updated the group" row.
+    Change(Vec<u8>),
 }
 
-pub struct GroupUpdatePlan {
-    /// Who made the change — the sender of the synthesised message. `None`
-    /// when the backup does not say, so the caller falls back to the item's
-    /// author.
-    pub editor: Option<Aci>,
-    pub update: GroupUpdate,
+/// The group operations for one master key. Deriving the secret params
+/// costs four scalar multiplications, and a backup holds many items per
+/// group, so the import keeps one of these per group rather than per item.
+pub fn group_operations(master_key: [u8; 32]) -> GroupOperations {
+    GroupOperations::new(GroupSecretParams::derive_from_master_key(
+        GroupMasterKey::new(master_key),
+    ))
 }
 
-/// Encrypts plaintext group-change values under a group's secret params.
-pub struct GroupCipher {
-    params: GroupSecretParams,
-}
-
-impl GroupCipher {
-    pub fn new(master_key: [u8; 32]) -> Self {
-        Self {
-            params: GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key)),
-        }
-    }
-
-    fn service_id(&self, service_id: ServiceId) -> Vec<u8> {
-        serialize(&self.params.encrypt_service_id(service_id))
-    }
-
-    fn placeholder_profile_key(&self, aci: Aci) -> Vec<u8> {
-        serialize(&self.params.encrypt_profile_key_bytes(rand::random(), aci))
-    }
-
-    fn member(&self, aci: Aci, role: Role) -> Member {
-        Member {
-            user_id: self.service_id(aci.into()),
-            role: role as i32,
-            profile_key: self.placeholder_profile_key(aci),
-            ..Default::default()
-        }
-    }
-
-    fn pending_member(&self, invitee: ServiceId, inviter: Aci) -> MemberPendingProfileKey {
-        MemberPendingProfileKey {
-            member: Some(Member {
-                user_id: self.service_id(invitee),
-                role: Role::Default as i32,
-                ..Default::default()
-            }),
-            added_by_user_id: self.service_id(inviter.into()),
-            timestamp: 0,
-        }
-    }
-
-    fn requesting_member(&self, aci: Aci) -> MemberPendingAdminApproval {
-        MemberPendingAdminApproval {
-            user_id: self.service_id(aci.into()),
-            profile_key: self.placeholder_profile_key(aci),
-            presentation: Vec::new(),
-            timestamp: 0,
-        }
-    }
-
-    fn blob(&self, content: Blob) -> Vec<u8> {
-        let plaintext = GroupAttributeBlob {
-            content: Some(content),
-        }
-        .encode_to_vec();
-        self.params
-            .encrypt_blob_with_padding(rand::random(), &plaintext, 0)
-    }
-
-    /// The encrypted `GroupChange` for `actions` as made by `editor`. The
-    /// decoder requires the 32-byte group identifier, which the server would
-    /// have stamped in; it is derived from the same master key here.
-    pub fn change(&self, editor: Aci, actions: Actions) -> Vec<u8> {
-        let actions = Actions {
-            source_user_id: self.service_id(editor.into()),
-            group_id: self.params.get_group_identifier().to_vec(),
-            ..actions
-        };
-        GroupChange {
-            actions: actions.encode_to_vec(),
-            server_signature: Vec::new(),
-            change_epoch: 0,
-        }
-        .encode_to_vec()
-    }
-}
-
-/// Maps one backup group update to its wire form. Every update maps to
-/// something: the kinds the wire cannot express, and any whose required
-/// participant the backup left out, become a change with no actions, which
-/// renders as a generic "updated the group" row.
+/// Maps one backup group update to its wire form and the member who made
+/// it. Every update maps to something: the kinds the wire cannot express
+/// become a change with no actions, and an update whose participant the
+/// backup left out keeps its editor and loses only the actions.
 ///
-/// The editor is the person whose action the row describes: the updater
-/// where the backup names one, and the member themself for the events a
-/// member performs on their own behalf (leaving, joining, requesting,
-/// declining) — that distinction is what lets a row read "You left the
-/// group" rather than name a stranger.
+/// The editor is the person whose act the row describes: the updater where
+/// the backup names one, and the member themself for the events a member
+/// performs on their own behalf (leaving, joining, requesting, declining) —
+/// that distinction is what lets a row read "You left the group" rather
+/// than name a stranger. `fallback_editor` stands in when the backup names
+/// nobody.
 pub fn plan_group_update(
     update: &backup::group_change_chat_update::Update,
-    cipher: &GroupCipher,
+    ops: &GroupOperations,
     our_aci: Aci,
-) -> GroupUpdatePlan {
-    typed_plan(update, cipher, our_aci).unwrap_or_else(|| generic(None))
-}
-
-fn generic(editor: Option<Aci>) -> GroupUpdatePlan {
-    GroupUpdatePlan {
-        editor,
-        update: GroupUpdate::Change(Box::default()),
+    fallback_editor: Aci,
+) -> (Aci, GroupUpdate) {
+    if let Some(Update::GroupCreationUpdate(u)) = update.update.as_ref() {
+        return (
+            aci(&u.updater_aci).unwrap_or(fallback_editor),
+            GroupUpdate::Created,
+        );
     }
+    let (editor, actions) = match update.update.as_ref() {
+        Some(update) => plan(update, ops, our_aci),
+        None => (None, None),
+    };
+    let editor = editor.unwrap_or(fallback_editor);
+    let change = encrypt_change(ops, editor, actions.unwrap_or_default());
+    (editor, GroupUpdate::Change(change))
 }
 
-fn typed_plan(
-    update: &backup::group_change_chat_update::Update,
-    cipher: &GroupCipher,
-    our_aci: Aci,
-) -> Option<GroupUpdatePlan> {
-    let change = |editor: Option<Aci>, actions: Actions| {
-        Some(GroupUpdatePlan {
-            editor,
-            update: GroupUpdate::Change(Box::new(actions)),
-        })
-    };
-    let delete_member = |aci: Aci| Actions {
-        delete_members: vec![actions::DeleteMemberAction {
-            deleted_user_id: cipher.service_id(aci.into()),
-        }],
-        ..Default::default()
-    };
-    let add_member = |aci: Aci, join_from_invite_link: bool| Actions {
-        add_members: vec![actions::AddMemberAction {
-            added: Some(cipher.member(aci, Role::Default)),
-            join_from_invite_link,
-        }],
-        ..Default::default()
-    };
-    let delete_pending = |invitee: ServiceId| Actions {
-        delete_members_pending_profile_key: vec![actions::DeleteMemberPendingProfileKeyAction {
-            deleted_user_id: cipher.service_id(invitee),
-        }],
-        ..Default::default()
-    };
-    let delete_requesting = |aci: Aci| Actions {
-        delete_members_pending_admin_approval: vec![
-            actions::DeleteMemberPendingAdminApprovalAction {
-                deleted_user_id: cipher.service_id(aci.into()),
-            },
-        ],
-        ..Default::default()
-    };
-    let invite_link_access = |editor: &Option<Vec<u8>>, access: AccessRequired| {
-        change(
-            aci(editor),
-            Actions {
-                modify_add_from_invite_link_access: Some(
-                    actions::ModifyAddFromInviteLinkAccessControlAction {
-                        add_from_invite_link_access: access as i32,
-                    },
-                ),
-                ..Default::default()
-            },
-        )
-    };
-    let link_access = |requires_admin_approval: bool| {
-        if requires_admin_approval {
-            AccessRequired::Administrator
-        } else {
-            AccessRequired::Any
-        }
-    };
+/// The editor the backup names, if any, and the actions of the change —
+/// `None` when the backup left out a participant the actions need.
+fn plan(update: &Update, ops: &GroupOperations, our_aci: Aci) -> (Option<Aci>, Option<Actions>) {
+    let actions = |editor: Option<Aci>, actions: Option<Actions>| (editor, actions);
+    let mut rng = rand::rng();
 
-    match update.update.as_ref()? {
-        Update::GenericGroupUpdate(u) => Some(generic(aci(&u.updater_aci))),
-        Update::GroupCreationUpdate(u) => Some(GroupUpdatePlan {
-            editor: aci(&u.updater_aci),
-            update: GroupUpdate::Created,
-        }),
-        Update::GroupNameUpdate(u) => change(
+    match update {
+        Update::GenericGroupUpdate(u) => actions(aci(&u.updater_aci), None),
+        // Handled before the actions are planned: creation has no change.
+        Update::GroupCreationUpdate(u) => actions(aci(&u.updater_aci), None),
+        Update::GroupNameUpdate(u) => actions(
             aci(&u.updater_aci),
-            Actions {
-                modify_title: Some(actions::ModifyTitleAction {
-                    title: cipher.blob(Blob::Title(u.new_group_name.clone().unwrap_or_default())),
-                }),
+            Some(Actions {
+                modify_title: Some(ops.build_modify_title_action(
+                    u.new_group_name.as_deref().unwrap_or(""),
+                    &mut rng,
+                )),
                 ..Default::default()
-            },
+            }),
         ),
-        Update::GroupAvatarUpdate(u) => change(
+        Update::GroupAvatarUpdate(u) => actions(
             aci(&u.updater_aci),
-            Actions {
+            Some(Actions {
                 modify_avatar: Some(actions::ModifyAvatarAction {
                     avatar: if u.was_removed {
                         String::new()
@@ -244,45 +116,40 @@ fn typed_plan(
                     },
                 }),
                 ..Default::default()
-            },
+            }),
         ),
-        Update::GroupDescriptionUpdate(u) => change(
+        Update::GroupDescriptionUpdate(u) => actions(
             aci(&u.updater_aci),
-            Actions {
-                modify_description: Some(actions::ModifyDescriptionAction {
-                    description: cipher.blob(Blob::DescriptionText(
-                        u.new_description.clone().unwrap_or_default(),
-                    )),
-                }),
+            Some(Actions {
+                modify_description: Some(ops.build_modify_description_action(
+                    u.new_description.as_deref().unwrap_or(""),
+                    &mut rng,
+                )),
                 ..Default::default()
-            },
+            }),
         ),
-        Update::GroupMembershipAccessLevelChangeUpdate(u) => change(
+        Update::GroupMembershipAccessLevelChangeUpdate(u) => actions(
             aci(&u.updater_aci),
-            Actions {
-                modify_member_access: Some(actions::ModifyMembersAccessControlAction {
-                    members_access: u.access_level,
-                }),
+            access_level(u.access_level).map(|access| Actions {
+                modify_member_access: Some(ops.build_modify_members_access_action(access)),
                 ..Default::default()
-            },
+            }),
         ),
-        Update::GroupAttributesAccessLevelChangeUpdate(u) => change(
+        Update::GroupAttributesAccessLevelChangeUpdate(u) => actions(
             aci(&u.updater_aci),
-            Actions {
-                modify_attributes_access: Some(actions::ModifyAttributesAccessControlAction {
-                    attributes_access: u.access_level,
-                }),
+            access_level(u.access_level).map(|access| Actions {
+                modify_attributes_access: Some(ops.build_modify_attributes_access_action(access)),
                 ..Default::default()
-            },
+            }),
         ),
-        Update::GroupAnnouncementOnlyChangeUpdate(u) => change(
+        Update::GroupAnnouncementOnlyChangeUpdate(u) => actions(
             aci(&u.updater_aci),
-            Actions {
-                modify_announcements_only: Some(actions::ModifyAnnouncementsOnlyAction {
-                    announcements_only: u.is_announcement_only,
-                }),
+            Some(Actions {
+                modify_announcements_only: Some(
+                    ops.build_modify_announcements_only_action(u.is_announcement_only),
+                ),
                 ..Default::default()
-            },
+            }),
         ),
         Update::GroupAdminStatusUpdate(u) => {
             let role = if u.was_admin_status_granted {
@@ -290,170 +157,290 @@ fn typed_plan(
             } else {
                 Role::Default
             };
-            change(
+            actions(
                 aci(&u.updater_aci),
-                Actions {
-                    modify_member_roles: vec![actions::ModifyMemberRoleAction {
-                        user_id: cipher.service_id(aci_bytes(&u.member_aci)?.into()),
-                        role: role as i32,
-                    }],
-                    ..Default::default()
-                },
+                aci_bytes(&u.member_aci)
+                    .and_then(|member| ops.build_modify_member_role_action(member, role).ok())
+                    .map(|role| Actions {
+                        modify_member_roles: vec![role],
+                        ..Default::default()
+                    }),
             )
         }
         Update::GroupMemberLeftUpdate(u) => {
-            let leaver = aci_bytes(&u.aci)?;
-            change(Some(leaver), delete_member(leaver))
+            let leaver = aci_bytes(&u.aci);
+            actions(leaver, leaver.and_then(|leaver| remove_member(ops, leaver)))
         }
-        Update::GroupMemberRemovedUpdate(u) => change(
+        Update::GroupMemberRemovedUpdate(u) => actions(
             aci(&u.remover_aci),
-            delete_member(aci_bytes(&u.removed_aci)?),
+            aci_bytes(&u.removed_aci).and_then(|removed| remove_member(ops, removed)),
         ),
         Update::SelfInvitedToGroupUpdate(u) => {
             let inviter = aci(&u.inviter_aci);
-            change(
+            actions(
                 inviter,
-                Actions {
-                    add_members_pending_profile_key: vec![
-                        actions::AddMemberPendingProfileKeyAction {
-                            added: Some(
-                                cipher.pending_member(our_aci.into(), inviter.unwrap_or(our_aci)),
-                            ),
-                        },
-                    ],
-                    ..Default::default()
-                },
+                add_pending_member(ops, our_aci.into(), inviter.unwrap_or(our_aci)),
             )
         }
-        Update::SelfInvitedOtherUserToGroupUpdate(u) => {
-            let invitee = ServiceId::parse_from_service_id_binary(&u.invitee_service_id)?;
-            change(
-                Some(our_aci),
-                Actions {
-                    add_members_pending_profile_key: vec![
-                        actions::AddMemberPendingProfileKeyAction {
-                            added: Some(cipher.pending_member(invitee, our_aci)),
-                        },
-                    ],
-                    ..Default::default()
-                },
-            )
-        }
-        Update::GroupUnknownInviteeUpdate(u) => Some(generic(aci(&u.inviter_aci))),
+        Update::SelfInvitedOtherUserToGroupUpdate(u) => actions(
+            Some(our_aci),
+            ServiceId::parse_from_service_id_binary(&u.invitee_service_id)
+                .and_then(|invitee| add_pending_member(ops, invitee, our_aci)),
+        ),
+        Update::GroupUnknownInviteeUpdate(u) => actions(aci(&u.inviter_aci), None),
         Update::GroupInvitationAcceptedUpdate(u) => {
-            let joiner = aci_bytes(&u.new_member_aci)?;
-            change(
-                Some(joiner),
-                Actions {
+            let joiner = aci_bytes(&u.new_member_aci);
+            actions(
+                joiner,
+                joiner.map(|joiner| Actions {
                     promote_members_pending_profile_key: vec![
                         actions::PromoteMemberPendingProfileKeyAction {
-                            user_id: cipher.service_id(joiner.into()),
-                            profile_key: cipher.placeholder_profile_key(joiner),
+                            user_id: encrypt_service_id(ops, joiner.into()),
+                            profile_key: encrypt_placeholder_profile_key(ops, joiner),
                             presentation: Vec::new(),
                         },
                     ],
                     ..Default::default()
-                },
+                }),
             )
         }
         Update::GroupInvitationDeclinedUpdate(u) => match aci(&u.invitee_aci) {
-            Some(invitee) => change(Some(invitee), delete_pending(invitee.into())),
-            None => Some(generic(aci(&u.inviter_aci))),
+            Some(invitee) => actions(Some(invitee), remove_pending_member(ops, invitee.into())),
+            None => actions(aci(&u.inviter_aci), None),
         },
         Update::GroupMemberJoinedUpdate(u) => {
-            let joiner = aci_bytes(&u.new_member_aci)?;
-            change(Some(joiner), add_member(joiner, false))
+            let joiner = aci_bytes(&u.new_member_aci);
+            actions(
+                joiner,
+                joiner.and_then(|joiner| add_member(ops, joiner, false)),
+            )
         }
         Update::GroupMemberJoinedByLinkUpdate(u) => {
-            let joiner = aci_bytes(&u.new_member_aci)?;
-            change(Some(joiner), add_member(joiner, true))
+            let joiner = aci_bytes(&u.new_member_aci);
+            actions(
+                joiner,
+                joiner.and_then(|joiner| add_member(ops, joiner, true)),
+            )
         }
-        Update::GroupMemberAddedUpdate(u) => change(
+        Update::GroupMemberAddedUpdate(u) => actions(
             aci(&u.updater_aci),
-            add_member(aci_bytes(&u.new_member_aci)?, false),
+            aci_bytes(&u.new_member_aci).and_then(|added| add_member(ops, added, false)),
         ),
-        Update::GroupSelfInvitationRevokedUpdate(u) => {
-            change(aci(&u.revoker_aci), delete_pending(our_aci.into()))
-        }
+        Update::GroupSelfInvitationRevokedUpdate(u) => actions(
+            aci(&u.revoker_aci),
+            remove_pending_member(ops, our_aci.into()),
+        ),
         Update::GroupInvitationRevokedUpdate(u) => {
             let invitee = u.invitees.iter().find_map(|invitee| {
                 aci(&invitee.invitee_aci)
                     .map(ServiceId::from)
                     .or_else(|| pni(&invitee.invitee_pni).map(ServiceId::from))
             });
-            match invitee {
-                Some(invitee) => change(aci(&u.updater_aci), delete_pending(invitee)),
-                None => Some(generic(aci(&u.updater_aci))),
-            }
-        }
-        Update::GroupJoinRequestUpdate(u) => {
-            let requester = aci_bytes(&u.requestor_aci)?;
-            change(
-                Some(requester),
-                Actions {
-                    add_members_pending_admin_approval: vec![
-                        actions::AddMemberPendingAdminApprovalAction {
-                            added: Some(cipher.requesting_member(requester)),
-                        },
-                    ],
-                    ..Default::default()
-                },
+            actions(
+                aci(&u.updater_aci),
+                invitee.and_then(|invitee| remove_pending_member(ops, invitee)),
             )
         }
-        Update::GroupJoinRequestApprovalUpdate(u) => {
-            let requester = aci_bytes(&u.requestor_aci)?;
-            let actions = if u.was_approved {
-                Actions {
-                    promote_members_pending_admin_approval: vec![
-                        actions::PromoteMemberPendingAdminApprovalAction {
-                            user_id: cipher.service_id(requester.into()),
-                            role: Role::Default as i32,
+        Update::GroupJoinRequestUpdate(u) => {
+            let requester = aci_bytes(&u.requestor_aci);
+            actions(
+                requester,
+                requester.map(|requester| Actions {
+                    add_members_pending_admin_approval: vec![
+                        actions::AddMemberPendingAdminApprovalAction {
+                            added: Some(MemberPendingAdminApproval {
+                                user_id: encrypt_service_id(ops, requester.into()),
+                                profile_key: encrypt_placeholder_profile_key(ops, requester),
+                                presentation: Vec::new(),
+                                timestamp: 0,
+                            }),
                         },
                     ],
                     ..Default::default()
-                }
-            } else {
-                delete_requesting(requester)
-            };
-            change(aci(&u.updater_aci), actions)
+                }),
+            )
         }
+        Update::GroupJoinRequestApprovalUpdate(u) => actions(
+            aci(&u.updater_aci),
+            aci_bytes(&u.requestor_aci).map(|requester| {
+                if u.was_approved {
+                    Actions {
+                        promote_members_pending_admin_approval: vec![
+                            actions::PromoteMemberPendingAdminApprovalAction {
+                                user_id: encrypt_service_id(ops, requester.into()),
+                                role: Role::Default.into(),
+                            },
+                        ],
+                        ..Default::default()
+                    }
+                } else {
+                    remove_requesting_member(ops, requester)
+                }
+            }),
+        ),
         Update::GroupJoinRequestCanceledUpdate(u) => {
-            let requester = aci_bytes(&u.requestor_aci)?;
-            change(Some(requester), delete_requesting(requester))
+            let requester = aci_bytes(&u.requestor_aci);
+            actions(
+                requester,
+                requester.map(|requester| remove_requesting_member(ops, requester)),
+            )
         }
         Update::GroupSequenceOfRequestsAndCancelsUpdate(u) => {
-            let requester = aci_bytes(&u.requestor_aci)?;
-            change(Some(requester), delete_requesting(requester))
+            let requester = aci_bytes(&u.requestor_aci);
+            actions(
+                requester,
+                requester.map(|requester| remove_requesting_member(ops, requester)),
+            )
         }
-        Update::GroupInviteLinkResetUpdate(u) => change(
+        Update::GroupInviteLinkResetUpdate(u) => actions(
             aci(&u.updater_aci),
-            Actions {
+            Some(Actions {
                 modify_invite_link_password: Some(actions::ModifyInviteLinkPasswordAction {
                     invite_link_password: Vec::new(),
                 }),
                 ..Default::default()
-            },
+            }),
         ),
-        Update::GroupInviteLinkEnabledUpdate(u) => {
-            invite_link_access(&u.updater_aci, link_access(u.link_requires_admin_approval))
-        }
-        Update::GroupInviteLinkAdminApprovalUpdate(u) => {
-            invite_link_access(&u.updater_aci, link_access(u.link_requires_admin_approval))
-        }
-        Update::GroupInviteLinkDisabledUpdate(u) => {
-            invite_link_access(&u.updater_aci, AccessRequired::Unsatisfiable)
-        }
+        Update::GroupInviteLinkEnabledUpdate(u) => actions(
+            aci(&u.updater_aci),
+            Some(invite_link_access(link_access(
+                u.link_requires_admin_approval,
+            ))),
+        ),
+        Update::GroupInviteLinkAdminApprovalUpdate(u) => actions(
+            aci(&u.updater_aci),
+            Some(invite_link_access(link_access(
+                u.link_requires_admin_approval,
+            ))),
+        ),
+        Update::GroupInviteLinkDisabledUpdate(u) => actions(
+            aci(&u.updater_aci),
+            Some(invite_link_access(AccessRequired::Unsatisfiable)),
+        ),
         Update::GroupV2MigrationUpdate(_)
         | Update::GroupV2MigrationSelfInvitedUpdate(_)
         | Update::GroupV2MigrationInvitedMembersUpdate(_)
-        | Update::GroupV2MigrationDroppedMembersUpdate(_) => Some(generic(None)),
-        Update::GroupExpirationTimerUpdate(u) => Some(GroupUpdatePlan {
-            editor: aci(&u.updater_aci),
-            update: GroupUpdate::Timer {
-                expires_in_ms: u.expires_in_ms,
-            },
-        }),
+        | Update::GroupV2MigrationDroppedMembersUpdate(_) => actions(None, None),
+        Update::GroupExpirationTimerUpdate(u) => {
+            let timer = Timer {
+                duration: (u.expires_in_ms / 1000) as u32,
+            };
+            actions(
+                aci(&u.updater_aci),
+                Some(Actions {
+                    modify_disappearing_message_timer: Some(
+                        ops.build_modify_disappearing_messages_timer_action(&timer, &mut rng),
+                    ),
+                    ..Default::default()
+                }),
+            )
+        }
     }
+}
+
+/// The encrypted `GroupChange` for `actions` as made by `editor`. The
+/// decoder requires the 32-byte group identifier, which the server would
+/// have stamped in; it is derived from the same master key here.
+fn encrypt_change(ops: &GroupOperations, editor: Aci, actions: Actions) -> Vec<u8> {
+    let actions = Actions {
+        source_user_id: encrypt_service_id(ops, editor.into()),
+        group_id: ops.group_secret_params.get_group_identifier().to_vec(),
+        ..actions
+    };
+    GroupChange {
+        actions: actions.encode_to_vec(),
+        server_signature: Vec::new(),
+        change_epoch: 0,
+    }
+    .encode_to_vec()
+}
+
+fn encrypt_service_id(ops: &GroupOperations, service_id: ServiceId) -> Vec<u8> {
+    serialize(&ops.group_secret_params.encrypt_service_id(service_id))
+}
+
+fn encrypt_placeholder_profile_key(ops: &GroupOperations, aci: Aci) -> Vec<u8> {
+    serialize(
+        &ops.group_secret_params
+            .encrypt_profile_key(placeholder_profile_key(), aci),
+    )
+}
+
+fn placeholder_profile_key() -> ProfileKey {
+    ProfileKey::generate(rand::random())
+}
+
+fn add_member(ops: &GroupOperations, aci: Aci, join_from_invite_link: bool) -> Option<Actions> {
+    let added = ops
+        .build_add_member_action(aci, placeholder_profile_key(), Role::Default)
+        .ok()?;
+    Some(Actions {
+        add_members: vec![actions::AddMemberAction {
+            join_from_invite_link,
+            ..added
+        }],
+        ..Default::default()
+    })
+}
+
+fn remove_member(ops: &GroupOperations, aci: Aci) -> Option<Actions> {
+    Some(Actions {
+        delete_members: vec![ops.build_remove_member_action(aci).ok()?],
+        ..Default::default()
+    })
+}
+
+fn add_pending_member(ops: &GroupOperations, invitee: ServiceId, inviter: Aci) -> Option<Actions> {
+    Some(Actions {
+        add_members_pending_profile_key: vec![ops
+            .build_add_pending_member_action(invitee, inviter, Role::Default)
+            .ok()?],
+        ..Default::default()
+    })
+}
+
+fn remove_pending_member(ops: &GroupOperations, invitee: ServiceId) -> Option<Actions> {
+    Some(Actions {
+        delete_members_pending_profile_key: vec![ops
+            .build_remove_pending_member_action(invitee)
+            .ok()?],
+        ..Default::default()
+    })
+}
+
+fn remove_requesting_member(ops: &GroupOperations, aci: Aci) -> Actions {
+    Actions {
+        delete_members_pending_admin_approval: vec![
+            actions::DeleteMemberPendingAdminApprovalAction {
+                deleted_user_id: encrypt_service_id(ops, aci.into()),
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+fn invite_link_access(access: AccessRequired) -> Actions {
+    Actions {
+        modify_add_from_invite_link_access: Some(
+            actions::ModifyAddFromInviteLinkAccessControlAction {
+                add_from_invite_link_access: access.into(),
+            },
+        ),
+        ..Default::default()
+    }
+}
+
+fn link_access(requires_admin_approval: bool) -> AccessRequired {
+    if requires_admin_approval {
+        AccessRequired::Administrator
+    } else {
+        AccessRequired::Any
+    }
+}
+
+/// A backup `GroupV2AccessLevel` has the wire `AccessRequired`'s numbering.
+fn access_level(level: i32) -> Option<AccessRequired> {
+    AccessRequired::try_from(level).ok()
 }
 
 /// A group avatar change on the wire names the new avatar's server path;
@@ -462,7 +449,7 @@ fn typed_plan(
 /// from the group state, never from this row.
 const BACKUP_AVATAR_PATH: &str = "backup";
 
-fn aci_bytes(bytes: &[u8]) -> Option<Aci> {
+pub(super) fn aci_bytes(bytes: &[u8]) -> Option<Aci> {
     <[u8; 16]>::try_from(bytes).ok().map(Aci::from_uuid_bytes)
 }
 

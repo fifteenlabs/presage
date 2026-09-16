@@ -2680,6 +2680,7 @@ impl<S: Store> Manager<S, Registered> {
 
         let mut recipients: HashMap<u64, RecipientInfo> = HashMap::new();
         let mut chats: HashMap<u64, Thread> = HashMap::new();
+        let mut group_ops = HashMap::new();
 
         while let Some(bytes) = reader
             .read_next()
@@ -2757,8 +2758,13 @@ impl<S: Store> Manager<S, Registered> {
                         content,
                         thread,
                         received_at_ms,
-                    } in convert::chat_item_to_contents(&ci, &recipients, &chats, aci)
-                    {
+                    } in convert::chat_item_to_contents(
+                        &ci,
+                        &recipients,
+                        &chats,
+                        &mut group_ops,
+                        aci,
+                    ) {
                         // Synthesised sync `call_event` rows route through
                         // `ingest_call_event` so the same load + state machine +
                         // save pipeline runs for backup and live events alike.
