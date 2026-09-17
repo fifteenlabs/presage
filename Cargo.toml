@@ -7,5 +7,5 @@ quickcheck_async = { git = 'https://github.com/nytopop/quickcheck_async', rev = 
 libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = '2a42b3354c9194700d08aa070f70a131a470e7dc' }
 
 [patch."https://github.com/whisperfish/libsignal-service-rs.git"]
-libsignal-service = { git = "https://github.com/fifteenlabs/libsignal-service-rs", rev = "58c6e6a754814712d8da5619c5174020a7ca126e" }
+libsignal-service = { git = "https://github.com/fifteenlabs/libsignal-service-rs", rev = "34f0c4f2ddf7591d871cf4108887bd2682e9910d" }
 

@@ -2864,7 +2864,7 @@ dependencies = [
 [[package]]
 name = "libsignal-service"
 version = "0.1.0"
-source = "git+https://github.com/fifteenlabs/libsignal-service-rs?rev=58c6e6a754814712d8da5619c5174020a7ca126e#58c6e6a754814712d8da5619c5174020a7ca126e"
+source = "git+https://github.com/fifteenlabs/libsignal-service-rs?rev=34f0c4f2ddf7591d871cf4108887bd2682e9910d#34f0c4f2ddf7591d871cf4108887bd2682e9910d"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm",
