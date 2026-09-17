@@ -13,8 +13,9 @@ use libsignal_service::{
             message_attachment::Flag as AttachmentFlag,
         },
         body_range::AssociatedValue,
-        data_message, sync_message, AttachmentPointer, BodyRange, DataMessage, GroupContextV2,
-        Preview, SyncMessage,
+        data_message,
+        sync_message::{self, Content as SyncContent},
+        AttachmentPointer, BodyRange, DataMessage, GroupContextV2, Preview, SyncMessage,
     },
     protocol::{Aci, ServiceId},
     push_service::DEFAULT_DEVICE_ID,
@@ -670,7 +671,7 @@ fn dm_content(
         };
         (
             ContentBody::SynchronizeMessage(SyncMessage {
-                content: Some(sync_message::Content::Sent(sent)),
+                content: Some(SyncContent::Sent(sent)),
                 ..Default::default()
             }),
             destination,
@@ -770,7 +771,7 @@ fn individual_call_to_contents(
     };
 
     let body = ContentBody::SynchronizeMessage(SyncMessage {
-        content: Some(sync_message::Content::CallEvent(call_event)),
+        content: Some(SyncContent::CallEvent(call_event)),
         ..Default::default()
     });
 
@@ -816,7 +817,7 @@ fn simple_update_to_contents(
     };
 
     let body = ContentBody::SynchronizeMessage(SyncMessage {
-        content: Some(sync_message::Content::MessageRequestResponse(
+        content: Some(SyncContent::MessageRequestResponse(
             MessageRequestResponse {
                 thread_aci_binary: Some(peer.raw_uuid().as_bytes().to_vec()),
                 r#type: Some(mrr_type as i32),
@@ -922,7 +923,7 @@ fn group_call_to_contents(
     };
 
     let body = ContentBody::SynchronizeMessage(SyncMessage {
-        content: Some(sync_message::Content::CallEvent(call_event)),
+        content: Some(SyncContent::CallEvent(call_event)),
         ..Default::default()
     });
 
@@ -1444,7 +1445,7 @@ mod tests {
         let dm = match row.content.body {
             ContentBody::DataMessage(dm) => dm,
             ContentBody::SynchronizeMessage(sync) => match sync.content {
-                Some(sync_message::Content::Sent(sent)) => {
+                Some(SyncContent::Sent(sent)) => {
                     sent.message.expect("sent transcript carries the message")
                 }
                 other => panic!("expected a Sent transcript, got {other:?}"),

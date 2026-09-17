@@ -10,7 +10,7 @@ use libsignal_service::{
     prelude::{Content, MasterKey, ProfileKey, Uuid},
     proto::{
         manifest_record,
-        sync_message::{self, Sent},
+        sync_message::{self, Content as SyncContent, Sent},
         verified, DataMessage, EditMessage, GroupContextV2, SyncMessage, Verified,
     },
     protocol::{
@@ -849,13 +849,15 @@ impl TryFrom<&Content> for Thread {
         match &content.body {
             // [1-1] Message sent by us with another device (with string service ID)
             ContentBody::SynchronizeMessage(SyncMessage {
-                content: Some(sync_message::Content::Sent(sent @ Sent {
+                content:
+                    Some(SyncContent::Sent(sent @ Sent {
                         destination_service_id: Some(_),
                         ..
                     })),
                 ..
             }) | ContentBody::SynchronizeMessage(SyncMessage {
-                content: Some(sync_message::Content::Sent(sent @ Sent {
+                content:
+                    Some(SyncContent::Sent(sent @ Sent {
                         destination_service_id_binary: Some(_),
                         ..
                     })),
@@ -875,7 +877,8 @@ impl TryFrom<&Content> for Thread {
             })
             // [Group] message sent by us with another device
             | ContentBody::SynchronizeMessage(SyncMessage {
-                content: Some(sync_message::Content::Sent(Sent {
+                content:
+                    Some(SyncContent::Sent(Sent {
                         message:
                             Some(DataMessage {
                                 group_v2:
@@ -891,7 +894,8 @@ impl TryFrom<&Content> for Thread {
             })
             // [Group] message edit sent by us with another device
             | ContentBody::SynchronizeMessage(SyncMessage {
-                content: Some(sync_message::Content::Sent(Sent {
+                content:
+                    Some(SyncContent::Sent(Sent {
                         edit_message:
                             Some(EditMessage {
                                 data_message:
@@ -947,7 +951,7 @@ impl ContentExt for Content {
         match self.body {
             ContentBody::SynchronizeMessage(SyncMessage {
                 content:
-                    Some(sync_message::Content::Sent(sync_message::Sent {
+                    Some(SyncContent::Sent(sync_message::Sent {
                         timestamp: Some(ts),
                         ..
                     })),
@@ -955,7 +959,7 @@ impl ContentExt for Content {
             }) => ts,
             ContentBody::SynchronizeMessage(SyncMessage {
                 content:
-                    Some(sync_message::Content::Sent(sync_message::Sent {
+                    Some(SyncContent::Sent(sync_message::Sent {
                         edit_message:
                             Some(EditMessage {
                                 target_sent_timestamp: Some(ts),
@@ -1052,7 +1056,7 @@ pub async fn save_trusted_identity_message<S: Store>(
             pni_verified: None,
         },
         body: SyncMessage {
-            content: Some(sync_message::Content::Verified(Verified {
+            content: Some(SyncContent::Verified(Verified {
                 destination_aci: None,
                 destination_aci_binary: None,
                 identity_key: Some(right_identity_key.public_key().serialize().to_vec()),
