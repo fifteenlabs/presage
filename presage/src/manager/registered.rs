@@ -32,7 +32,9 @@ use libsignal_service::{
     proto::{
         data_message::Delete,
         group_change, manifest_record, storage_record,
-        sync_message::{self, sticker_pack_operation, StickerPackOperation},
+        sync_message::{
+            self, sticker_pack_operation, Content as SyncContent, StickerPackOperation,
+        },
         AttachmentPointer, DataMessage, EditMessage, GroupContextV2, GroupV2Record, NullMessage,
         StorageRecord, SyncMessage, Verified,
     },
@@ -326,7 +328,7 @@ impl<S: Store> Manager<S, Registered> {
     pub async fn request_contacts(&mut self) -> Result<(), Error<S::Error>> {
         trace!("requesting contacts sync");
         let sync_message = SyncMessage {
-            content: Some(sync_message::Content::Request(sync_message::Request {
+            content: Some(SyncContent::Request(sync_message::Request {
                 r#type: Some(sync_message::request::Type::Contacts.into()),
             })),
             ..SyncMessage::with_padding(&mut rand::rng())
@@ -1197,7 +1199,7 @@ impl<S: Store> Manager<S, Registered> {
                                     }
 
                                     if let ContentBody::SynchronizeMessage(SyncMessage {
-                                        content: Some(sync_message::Content::Request(request)),
+                                        content: Some(SyncContent::Request(request)),
                                         ..
                                     }) = &content.body
                                     {
@@ -1265,7 +1267,7 @@ impl<S: Store> Manager<S, Registered> {
                                                     .map(|aep| aep.to_string());
                                                 tokio::task::spawn_local(async move {
                                                     let result = message_sender.send_sync_message(SyncMessage {
-                                                        content: Some(sync_message::Content::Keys(libsignal_service::content::sync_message::Keys {
+                                                        content: Some(SyncContent::Keys(libsignal_service::content::sync_message::Keys {
                                                             account_entropy_pool,
                                                             media_root_backup_key: None,
                                                         })),
@@ -1285,11 +1287,9 @@ impl<S: Store> Manager<S, Registered> {
                                                 tokio::task::spawn_local(async move {
                                                     let result = message_sender
                                                         .send_sync_message(SyncMessage {
-                                                            content: Some(
-                                                                sync_message::Content::Blocked(
-                                                                    blocked,
-                                                                ),
-                                                            ),
+                                                            content: Some(SyncContent::Blocked(
+                                                                blocked,
+                                                            )),
                                                             ..SyncMessage::with_padding(
                                                                 &mut rand::rng(),
                                                             )
@@ -1309,7 +1309,7 @@ impl<S: Store> Manager<S, Registered> {
 
                                     // contacts synchronization sent from the primary device (happens after linking, or on demand)
                                     if let ContentBody::SynchronizeMessage(SyncMessage {
-                                        content: Some(sync_message::Content::Contacts(contacts)),
+                                        content: Some(SyncContent::Contacts(contacts)),
                                         ..
                                     }) = &content.body
                                     {
@@ -1379,7 +1379,7 @@ impl<S: Store> Manager<S, Registered> {
 
                                     // key synchronization sent from the primary device
                                     if let ContentBody::SynchronizeMessage(SyncMessage {
-                                        content: Some(sync_message::Content::Keys(keys)),
+                                        content: Some(SyncContent::Keys(keys)),
                                         ..
                                     }) = &content.body
                                     {
@@ -1448,7 +1448,7 @@ impl<S: Store> Manager<S, Registered> {
                                     })
                                     | ContentBody::SynchronizeMessage(SyncMessage {
                                         content:
-                                            Some(sync_message::Content::Sent(sync_message::Sent {
+                                            Some(SyncContent::Sent(sync_message::Sent {
                                                 message:
                                                     Some(DataMessage {
                                                         group_v2:
@@ -1534,7 +1534,7 @@ impl<S: Store> Manager<S, Registered> {
                                 tokio::task::spawn_local(async move {
                                     let result = message_sender
                                         .send_sync_message(SyncMessage {
-                                            content: Some(sync_message::Content::Request(
+                                            content: Some(SyncContent::Request(
                                                 sync_message::Request {
                                                     r#type: Some(
                                                         sync_message::request::Type::Keys.into(),
@@ -1692,7 +1692,7 @@ impl<S: Store> Manager<S, Registered> {
         sender
             .send_message(
                 &recipient,
-                unidentified_access,
+                unidentified_access.as_ref(),
                 content_body.clone(),
                 timestamp,
                 include_pni_signature,
@@ -1858,7 +1858,7 @@ impl<S: Store> Manager<S, Registered> {
             .expect("Time went backwards")
             .as_millis() as u64;
         let sync_message = SyncMessage {
-            content: Some(sync_message::Content::Blocked(blocked)),
+            content: Some(SyncContent::Blocked(blocked)),
             ..SyncMessage::with_padding(&mut rand::rng())
         };
         self.send_message(self.state.data.service_ids.aci(), sync_message, timestamp)
@@ -2933,7 +2933,7 @@ fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64)
         }
         ContentBody::SynchronizeMessage(SyncMessage {
             content:
-                Some(sync_message::Content::Sent(sync_message::Sent {
+                Some(SyncContent::Sent(sync_message::Sent {
                     message: Some(data_message),
                     ..
                 })),
@@ -3331,7 +3331,7 @@ async fn save_message<S: Store>(
         )
         | ContentBody::SynchronizeMessage(SyncMessage {
             content:
-                Some(sync_message::Content::Sent(sync_message::Sent {
+                Some(SyncContent::Sent(sync_message::Sent {
                     message:
                         Some(
                             ref data_message @ DataMessage {
@@ -3405,7 +3405,7 @@ async fn save_message<S: Store>(
             }
         }
         ContentBody::SynchronizeMessage(SyncMessage {
-            content: Some(sync_message::Content::DeleteForMe(ref delete)),
+            content: Some(SyncContent::DeleteForMe(ref delete)),
             ..
         }) => {
             // TODO: Conversations, local-only deletes, attachments
@@ -3454,7 +3454,7 @@ async fn save_message<S: Store>(
         })
         | ContentBody::SynchronizeMessage(SyncMessage {
             content:
-                Some(sync_message::Content::Sent(sync_message::Sent {
+                Some(SyncContent::Sent(sync_message::Sent {
                     edit_message:
                         Some(EditMessage {
                             target_sent_timestamp: Some(ts),
@@ -3479,7 +3479,7 @@ async fn save_message<S: Store>(
         }
         ContentBody::CallMessage(_)
         | ContentBody::SynchronizeMessage(SyncMessage {
-            content: Some(sync_message::Content::CallEvent(_)),
+            content: Some(SyncContent::CallEvent(_)),
             ..
         }) => Some(message),
         ContentBody::SynchronizeMessage(msg) => {

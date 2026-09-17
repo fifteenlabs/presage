@@ -21,7 +21,9 @@ use libsignal_service::{
     master_key::StorageServiceKey,
     prelude::{ProfileKey, ProtobufMessage, Uuid},
     proto::{
-        manifest_record, storage_record, sync_message, ManifestRecord, StorageRecord, SyncMessage,
+        manifest_record, storage_record,
+        sync_message::{self, Content as SyncContent},
+        ManifestRecord, StorageRecord, SyncMessage,
     },
     protocol::{Aci, ServiceId},
     push_service::PushService,
@@ -94,11 +96,9 @@ impl<S: Store> Manager<S, Registered> {
 
         if let Err(e) = sender
             .send_sync_message(SyncMessage {
-                content: Some(sync_message::Content::FetchLatest(
-                    sync_message::FetchLatest {
-                        r#type: Some(sync_message::fetch_latest::Type::StorageManifest.into()),
-                    },
-                )),
+                content: Some(SyncContent::FetchLatest(sync_message::FetchLatest {
+                    r#type: Some(sync_message::fetch_latest::Type::StorageManifest.into()),
+                })),
                 ..SyncMessage::with_padding(&mut rand::rng())
             })
             .await

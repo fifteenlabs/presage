@@ -10,8 +10,8 @@
 
 use libsignal_service::content::{Content, ContentBody};
 use libsignal_service::prelude::Uuid;
-use libsignal_service::proto::sync_message;
 use libsignal_service::proto::sync_message::call_event::{Direction, Event, Type};
+use libsignal_service::proto::sync_message::Content as SyncContent;
 use libsignal_service::protocol::{Aci, ServiceId};
 use libsignal_service::zkgroup::GroupMasterKeyBytes;
 
@@ -275,7 +275,7 @@ pub fn extract_call_event(body: &ContentBody) -> Option<CallEventInfo> {
         _ => return None,
     };
     let ce = match sm.content.as_ref()? {
-        sync_message::Content::CallEvent(ce) => ce,
+        SyncContent::CallEvent(ce) => ce,
         _ => return None,
     };
 
