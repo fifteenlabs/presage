@@ -774,6 +774,33 @@ pub trait ContentsStore: Send + Sync {
     fn sticker_packs(
         &self,
     ) -> impl Future<Output = Result<Self::StickerPacksIter, Self::ContentsStoreError>>;
+
+    /// Record that the account has this pack installed, before its manifest
+    /// has been fetched — what a storage-service record or a backup frame says,
+    /// neither of which carries more than the id and the key. A store that
+    /// already holds the pack's manifest marks it installed instead.
+    ///
+    /// [`Manager::download_pending_sticker_packs`](crate::Manager::download_pending_sticker_packs)
+    /// fetches the manifest and hands the whole pack to [`Self::add_sticker_pack`].
+    /// The default keeps nothing, so a store that does not implement this
+    /// simply never learns about packs installed on another device.
+    fn note_installed_sticker_pack(
+        &mut self,
+        _id: &[u8],
+        _key: &[u8],
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// The `(id, key)` of every pack noted with
+    /// [`Self::note_installed_sticker_pack`] whose manifest is still missing,
+    /// in the order they were noted.
+    fn sticker_packs_missing_manifest(
+        &self,
+    ) -> impl Future<Output = Result<Vec<StickerPackPointer>, Self::ContentsStoreError>> + Send
+    {
+        async { Ok(Vec::new()) }
+    }
 }
 
 /// The manager store trait combining all other stores into a single one
@@ -977,6 +1004,9 @@ impl ContentExt for Content {
         }
     }
 }
+
+/// A sticker pack's `(id, key)`: enough to fetch its manifest and its stickers.
+pub type StickerPackPointer = (Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StickerPack {
