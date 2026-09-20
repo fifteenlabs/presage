@@ -79,7 +79,10 @@ use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
 // Imported by name because `storage_record` in this module already refers to
 // the protobuf module of the same name.
-use super::storage::{contact_profile_key, merge_contact_from_snapshot, pending_publish_intent};
+use super::storage::{
+    contact_profile_key, is_sticker_pack_pointer, merge_contact_from_snapshot,
+    pending_publish_intent,
+};
 use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
 use crate::{
     model::groups::{Group, GroupMembersUpdate, GroupUpdate},
@@ -2173,34 +2176,32 @@ impl<S: Store> Manager<S, Registered> {
 
     /// Installs every pack the store has noted as installed on the account but
     /// holds no manifest for: packs learned from the storage service or from a
-    /// backup, which name a pack by id and key alone.
+    /// backup, which name a pack without describing it.
     ///
-    /// A pack whose manifest cannot be fetched is logged and left noted, so the
-    /// next call tries it again.
+    /// Neither of those touches the sticker CDN, so call this once they are
+    /// done — after [`Self::sync_storage_service`] or
+    /// [`Self::download_and_import_backup`]. A pack that cannot be fetched is
+    /// logged and stays noted, so the next call tries it again.
     pub async fn download_pending_sticker_packs(&mut self) -> Result<(), Error<S::Error>> {
-        let pending = self.store.sticker_packs_missing_manifest().await?;
+        let pending = self.store.pending_sticker_packs().await?;
         if pending.is_empty() {
             return Ok(());
         }
-        let mut unidentified_websocket = self.unidentified_websocket().await?;
-        for (id, key) in pending {
-            let manifest = match fetch_sticker_pack_manifest::<S>(
-                &mut unidentified_websocket,
-                &id,
-                &key,
+        let unidentified_websocket = self.unidentified_websocket().await?;
+        for (pack_id, pack_key) in pending {
+            let operation = StickerPackOperation {
+                pack_id: Some(pack_id),
+                pack_key: Some(pack_key),
+                r#type: Some(sticker_pack_operation::Type::Install as i32),
+            };
+            if let Err(error) = download_sticker_pack(
+                self.store.clone(),
+                unidentified_websocket.clone(),
+                &operation,
             )
             .await
             {
-                Ok(manifest) => manifest,
-                Err(error) => {
-                    warn!(pack_id = %hex::encode(&id), %error, "failed to fetch a pending sticker pack manifest");
-                    continue;
-                }
-            };
-            debug!(title = %manifest.title, "installing a pending sticker pack");
-            let pack = StickerPack { id, key, manifest };
-            if let Err(error) = self.store.add_sticker_pack(&pack).await {
-                warn!(%error, "failed to save a pending sticker pack");
+                warn!(pack_id = %hex::encode(operation.pack_id()), %error, "failed to install a pending sticker pack");
             }
         }
         Ok(())
@@ -2568,6 +2569,9 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     /// Download and import a Signal backup after device linking (Link & Sync).
+    ///
+    /// The backup's sticker packs are only noted; follow with
+    /// [`Self::download_pending_sticker_packs`] to install them.
     pub async fn download_and_import_backup<F: Fn(BackupImportProgress)>(
         &mut self,
         ephemeral_key: Option<MessageBackupKey>,
@@ -2850,13 +2854,14 @@ impl<S: Store> Manager<S, Registered> {
                     }
                 }
                 Some(FrameItem::StickerPack(pack)) => {
-                    match super::storage::sticker_pack_pointer(&pack.pack_id, &pack.pack_key) {
-                        Some((id, key)) => {
-                            if let Err(e) = self.store.note_installed_sticker_pack(id, key).await {
-                                warn!(%e, "backup import: failed to note a sticker pack");
-                            }
-                        }
-                        None => warn!("backup import: skipping a malformed sticker pack frame"),
+                    if !is_sticker_pack_pointer(&pack.pack_id, &pack.pack_key) {
+                        warn!("backup import: skipping a malformed sticker pack frame");
+                    } else if let Err(e) = self
+                        .store
+                        .note_installed_sticker_pack(&pack.pack_id, &pack.pack_key, None)
+                        .await
+                    {
+                        warn!(%e, "backup import: failed to note a sticker pack");
                     }
                 }
                 _ => {}

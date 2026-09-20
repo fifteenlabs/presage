@@ -764,7 +764,10 @@ pub trait ContentsStore: Send + Sync {
         id: &[u8],
     ) -> impl Future<Output = Result<Option<StickerPack>, Self::ContentsStoreError>>;
 
-    /// Removes a sticker pack
+    /// Removes a sticker pack, including one that was only noted with
+    /// [`Self::note_installed_sticker_pack`] and has no manifest yet — otherwise
+    /// the next [`Manager::download_pending_sticker_packs`](crate::Manager::download_pending_sticker_packs)
+    /// would install a pack the account has just removed.
     fn remove_sticker_pack(
         &mut self,
         id: &[u8],
@@ -776,26 +779,26 @@ pub trait ContentsStore: Send + Sync {
     ) -> impl Future<Output = Result<Self::StickerPacksIter, Self::ContentsStoreError>>;
 
     /// Record that the account has this pack installed, before its manifest
-    /// has been fetched — what a storage-service record or a backup frame says,
-    /// neither of which carries more than the id and the key. A store that
-    /// already holds the pack's manifest marks it installed instead.
+    /// has been fetched. A storage-service record names a pack by its id, key
+    /// and `position`; a backup frame by id and key alone, hence the `Option`.
     ///
+    /// Called again for every installed pack each time the storage manifest
+    /// changes, so it must be idempotent: a pack already held is left as it is,
+    /// apart from taking a `position` that is given.
     /// [`Manager::download_pending_sticker_packs`](crate::Manager::download_pending_sticker_packs)
-    /// fetches the manifest and hands the whole pack to [`Self::add_sticker_pack`].
-    /// The default keeps nothing, so a store that does not implement this
-    /// simply never learns about packs installed on another device.
+    /// then hands the whole pack to [`Self::add_sticker_pack`].
     fn note_installed_sticker_pack(
         &mut self,
         _id: &[u8],
         _key: &[u8],
+        _position: Option<u32>,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
         async { Ok(()) }
     }
 
-    /// The `(id, key)` of every pack noted with
-    /// [`Self::note_installed_sticker_pack`] whose manifest is still missing,
-    /// in the order they were noted.
-    fn sticker_packs_missing_manifest(
+    /// Every pack noted with [`Self::note_installed_sticker_pack`] whose
+    /// manifest is still missing.
+    fn pending_sticker_packs(
         &self,
     ) -> impl Future<Output = Result<Vec<StickerPackPointer>, Self::ContentsStoreError>> + Send
     {

@@ -932,8 +932,7 @@ impl<S: Store> Manager<S, Registered> {
             .ok_or_else(|| Error::MissingKeyError("master_key".into()))?;
         let storage_key = StorageServiceKey::from_master_key(&master_key);
         let push_service = self.identified_push_service();
-        sync_storage_service(&mut self.store, &push_service, storage_key).await?;
-        self.download_pending_sticker_packs().await
+        sync_storage_service(&mut self.store, &push_service, storage_key).await
     }
 }
 
@@ -1234,7 +1233,11 @@ async fn sync_storage_service<S: Store>(
         "storage sync: chat folder keys in manifest"
     );
 
-    if contact_keys.is_empty() && group_keys.is_empty() && folder_keys.is_empty() {
+    if contact_keys.is_empty()
+        && group_keys.is_empty()
+        && folder_keys.is_empty()
+        && sticker_pack_keys.is_empty()
+    {
         debug!("storage sync: nothing to sync");
         store
             .store_storage_manifest_version(manifest_version)
@@ -1315,7 +1318,6 @@ async fn sync_storage_service<S: Store>(
         None => 0,
     };
 
-    let mut installed_sticker_packs: Vec<(u32, Vec<u8>, Vec<u8>)> = Vec::new();
     let mut total_processed = 0usize;
     for (i, batch) in batches.into_iter().enumerate().skip(resume_from) {
         debug!(
@@ -1469,19 +1471,20 @@ async fn sync_storage_service<S: Store>(
                     }
                 }
                 Some(libsignal_service::proto::storage_record::Record::StickerPack(record)) => {
-                    match sticker_pack_change(&record) {
+                    match sticker_pack_change(record) {
                         Some(StickerPackChange::Removed { id }) => {
-                            debug!(pack_id = %hex::encode(id), "storage sync: sticker pack removed");
-                            if let Err(e) = store.remove_sticker_pack(id).await {
+                            debug!(pack_id = %hex::encode(&id), "storage sync: sticker pack removed");
+                            if let Err(e) = store.remove_sticker_pack(&id).await {
                                 warn!(%e, "storage sync: failed to remove sticker pack");
                             }
                         }
-                        Some(StickerPackChange::Installed { id, key }) => {
-                            installed_sticker_packs.push((
-                                record.position,
-                                id.to_vec(),
-                                key.to_vec(),
-                            ));
+                        Some(StickerPackChange::Installed { id, key, position }) => {
+                            if let Err(e) = store
+                                .note_installed_sticker_pack(&id, &key, Some(position))
+                                .await
+                            {
+                                warn!(%e, "storage sync: failed to note an installed sticker pack");
+                            }
                         }
                         None => warn!("storage sync: skipping malformed sticker pack record"),
                     }
@@ -1506,16 +1509,6 @@ async fn sync_storage_service<S: Store>(
         };
         if let Err(e) = store.store_storage_sync_cursor(&cursor).await {
             warn!(%e, "storage sync: failed to persist sync cursor, continuing");
-        }
-    }
-
-    // Noted in the order the record's `position` asks them to be shown —
-    // ascending, so the pack to show first is the one noted last — because a
-    // store keeps a pack in the order it learned of it.
-    sort_sticker_packs_for_noting(&mut installed_sticker_packs);
-    for (_, id, key) in &installed_sticker_packs {
-        if let Err(e) = store.note_installed_sticker_pack(id, key).await {
-            warn!(%e, "storage sync: failed to note an installed sticker pack");
         }
     }
 
@@ -1545,9 +1538,15 @@ const STICKER_PACK_KEY_LEN: usize = 32;
 
 /// What a `StickerPackRecord` says happened to a pack on the account.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum StickerPackChange<'a> {
-    Installed { id: &'a [u8], key: &'a [u8] },
-    Removed { id: &'a [u8] },
+enum StickerPackChange {
+    Installed {
+        id: Vec<u8>,
+        key: Vec<u8>,
+        position: u32,
+    },
+    Removed {
+        id: Vec<u8>,
+    },
 }
 
 /// Signal-Desktop's `mergeStickerPackRecord`, reduced to what a device that
@@ -1557,33 +1556,27 @@ pub(super) enum StickerPackChange<'a> {
 /// - A non-zero `deletedAtTimestamp` is an uninstall, whatever else the record
 ///   carries — a tombstone is meant to have no key or position.
 /// - Otherwise the pack is installed, and needs its 32-byte key to be of use.
-pub(super) fn sticker_pack_change(
-    record: &libsignal_service::proto::StickerPackRecord,
-) -> Option<StickerPackChange<'_>> {
+fn sticker_pack_change(
+    record: libsignal_service::proto::StickerPackRecord,
+) -> Option<StickerPackChange> {
     if record.pack_id.len() != STICKER_PACK_ID_LEN {
         return None;
     }
     if record.deleted_at_timestamp != 0 {
-        return Some(StickerPackChange::Removed {
-            id: &record.pack_id,
-        });
+        return Some(StickerPackChange::Removed { id: record.pack_id });
     }
-    let (id, key) = sticker_pack_pointer(&record.pack_id, &record.pack_key)?;
-    Some(StickerPackChange::Installed { id, key })
+    is_sticker_pack_pointer(&record.pack_id, &record.pack_key).then_some(
+        StickerPackChange::Installed {
+            id: record.pack_id,
+            key: record.pack_key,
+            position: record.position,
+        },
+    )
 }
 
-/// The id and key of a pack, when both are the size Signal gives them.
-pub(super) fn sticker_pack_pointer<'a>(
-    id: &'a [u8],
-    key: &'a [u8],
-) -> Option<(&'a [u8], &'a [u8])> {
-    (id.len() == STICKER_PACK_ID_LEN && key.len() == STICKER_PACK_KEY_LEN).then_some((id, key))
-}
-
-/// Packs are shown in descending `position`, then ascending id; noting them in
-/// the reverse of that leaves the first one to show as the most recently noted.
-fn sort_sticker_packs_for_noting(packs: &mut [(u32, Vec<u8>, Vec<u8>)]) {
-    packs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+/// Whether an id and a key are the sizes Signal gives a sticker pack's.
+pub(super) fn is_sticker_pack_pointer(id: &[u8], key: &[u8]) -> bool {
+    id.len() == STICKER_PACK_ID_LEN && key.len() == STICKER_PACK_KEY_LEN
 }
 
 /// Signal-Desktop's `mergeChatFolderRecord`, with presage's rule for the
@@ -1725,27 +1718,25 @@ async fn ensure_single_all_chats_folder<S: Store>(store: &mut S, create_missing:
 mod sticker_pack_tests {
     use libsignal_service::proto::StickerPackRecord;
 
-    use super::{
-        sort_sticker_packs_for_noting, sticker_pack_change, sticker_pack_pointer, StickerPackChange,
-    };
+    use super::{sticker_pack_change, StickerPackChange};
 
     fn record(id_len: usize, key_len: usize, deleted_at_timestamp: u64) -> StickerPackRecord {
         StickerPackRecord {
             pack_id: vec![1; id_len],
             pack_key: vec![2; key_len],
-            position: 0,
+            position: 7,
             deleted_at_timestamp,
         }
     }
 
     #[test]
-    fn a_live_record_installs_the_pack() {
-        let record = record(16, 32, 0);
+    fn a_live_record_installs_the_pack_at_its_position() {
         assert_eq!(
-            sticker_pack_change(&record),
+            sticker_pack_change(record(16, 32, 0)),
             Some(StickerPackChange::Installed {
-                id: &[1; 16],
-                key: &[2; 32],
+                id: vec![1; 16],
+                key: vec![2; 32],
+                position: 7,
             })
         );
     }
@@ -1753,40 +1744,19 @@ mod sticker_pack_tests {
     #[test]
     fn a_tombstone_removes_the_pack_with_or_without_a_key() {
         for key_len in [0, 32] {
-            let record = record(16, key_len, 1_700_000_000_000);
             assert_eq!(
-                sticker_pack_change(&record),
-                Some(StickerPackChange::Removed { id: &[1; 16] })
+                sticker_pack_change(record(16, key_len, 1_700_000_000_000)),
+                Some(StickerPackChange::Removed { id: vec![1; 16] })
             );
         }
     }
 
     #[test]
     fn a_record_no_client_could_act_on_is_skipped() {
-        assert_eq!(sticker_pack_change(&record(0, 32, 0)), None);
-        assert_eq!(sticker_pack_change(&record(15, 32, 1)), None);
-        assert_eq!(sticker_pack_change(&record(16, 0, 0)), None);
-        assert_eq!(sticker_pack_change(&record(16, 31, 0)), None);
-    }
-
-    #[test]
-    fn a_pointer_needs_both_sizes() {
-        assert!(sticker_pack_pointer(&[0; 16], &[0; 32]).is_some());
-        assert!(sticker_pack_pointer(&[0; 16], &[0; 16]).is_none());
-        assert!(sticker_pack_pointer(&[0; 32], &[0; 32]).is_none());
-    }
-
-    #[test]
-    fn packs_are_noted_so_the_first_to_show_is_noted_last() {
-        let mut packs = vec![
-            (2, vec![0xbb], vec![]),
-            (0, vec![0xaa], vec![]),
-            (2, vec![0xaa], vec![]),
-            (1, vec![0xcc], vec![]),
-        ];
-        sort_sticker_packs_for_noting(&mut packs);
-        let order: Vec<(u32, u8)> = packs.iter().map(|(p, id, _)| (*p, id[0])).collect();
-        assert_eq!(order, vec![(0, 0xaa), (1, 0xcc), (2, 0xbb), (2, 0xaa)]);
+        assert_eq!(sticker_pack_change(record(0, 32, 0)), None);
+        assert_eq!(sticker_pack_change(record(15, 32, 1)), None);
+        assert_eq!(sticker_pack_change(record(16, 0, 0)), None);
+        assert_eq!(sticker_pack_change(record(16, 31, 0)), None);
     }
 }
 
