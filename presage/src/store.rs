@@ -764,7 +764,10 @@ pub trait ContentsStore: Send + Sync {
         id: &[u8],
     ) -> impl Future<Output = Result<Option<StickerPack>, Self::ContentsStoreError>>;
 
-    /// Removes a sticker pack
+    /// Removes a sticker pack, including one that was only noted with
+    /// [`Self::note_installed_sticker_pack`] and has no manifest yet — otherwise
+    /// the next [`Manager::download_pending_sticker_packs`](crate::Manager::download_pending_sticker_packs)
+    /// would install a pack the account has just removed.
     fn remove_sticker_pack(
         &mut self,
         id: &[u8],
@@ -774,6 +777,33 @@ pub trait ContentsStore: Send + Sync {
     fn sticker_packs(
         &self,
     ) -> impl Future<Output = Result<Self::StickerPacksIter, Self::ContentsStoreError>>;
+
+    /// Record that the account has this pack installed, before its manifest
+    /// has been fetched. A storage-service record names a pack by its id, key
+    /// and `position`; a backup frame by id and key alone, hence the `Option`.
+    ///
+    /// Called again for every installed pack each time the storage manifest
+    /// changes, so it must be idempotent: a pack already held is left as it is,
+    /// apart from taking a `position` that is given.
+    /// [`Manager::download_pending_sticker_packs`](crate::Manager::download_pending_sticker_packs)
+    /// then hands the whole pack to [`Self::add_sticker_pack`].
+    fn note_installed_sticker_pack(
+        &mut self,
+        _id: &[u8],
+        _key: &[u8],
+        _position: Option<u32>,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Every pack noted with [`Self::note_installed_sticker_pack`] whose
+    /// manifest is still missing.
+    fn pending_sticker_packs(
+        &self,
+    ) -> impl Future<Output = Result<Vec<StickerPackPointer>, Self::ContentsStoreError>> + Send
+    {
+        async { Ok(Vec::new()) }
+    }
 }
 
 /// The manager store trait combining all other stores into a single one
@@ -977,6 +1007,9 @@ impl ContentExt for Content {
         }
     }
 }
+
+/// A sticker pack's `(id, key)`: enough to fetch its manifest and its stickers.
+pub type StickerPackPointer = (Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StickerPack {

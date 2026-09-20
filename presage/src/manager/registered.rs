@@ -79,7 +79,10 @@ use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
 // Imported by name because `storage_record` in this module already refers to
 // the protobuf module of the same name.
-use super::storage::{contact_profile_key, merge_contact_from_snapshot, pending_publish_intent};
+use super::storage::{
+    contact_profile_key, is_sticker_pack_pointer, merge_contact_from_snapshot,
+    pending_publish_intent,
+};
 use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
 use crate::{
     model::groups::{Group, GroupMembersUpdate, GroupUpdate},
@@ -2159,7 +2162,55 @@ impl<S: Store> Manager<S, Registered> {
         download_sticker::<S>(&mut unidentified_websocket, pack_id, pack_key, sticker_id).await
     }
 
-    /// Installs a sticker pack and notifies other registered devices
+    /// Downloads and decrypts a sticker pack's manifest — its title, author,
+    /// cover and the id and emoji of each sticker — without installing the
+    /// pack, storing anything, or telling the account's other devices.
+    pub async fn sticker_pack_manifest(
+        &self,
+        pack_id: &[u8],
+        pack_key: &[u8],
+    ) -> Result<StickerPackManifest, Error<S::Error>> {
+        let mut unidentified_websocket = self.unidentified_websocket().await?;
+        fetch_sticker_pack_manifest::<S>(&mut unidentified_websocket, pack_id, pack_key).await
+    }
+
+    /// Installs every pack the store has noted as installed on the account but
+    /// holds no manifest for: packs learned from the storage service or from a
+    /// backup, which name a pack without describing it.
+    ///
+    /// Neither of those touches the sticker CDN, so call this once they are
+    /// done — after [`Self::sync_storage_service`] or
+    /// [`Self::download_and_import_backup`]. A pack that cannot be fetched is
+    /// logged and stays noted, so the next call tries it again.
+    pub async fn download_pending_sticker_packs(&mut self) -> Result<(), Error<S::Error>> {
+        let pending = self.store.pending_sticker_packs().await?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let unidentified_websocket = self.unidentified_websocket().await?;
+        for (pack_id, pack_key) in pending {
+            let operation = StickerPackOperation {
+                pack_id: Some(pack_id),
+                pack_key: Some(pack_key),
+                r#type: Some(sticker_pack_operation::Type::Install as i32),
+            };
+            if let Err(error) = download_sticker_pack(
+                self.store.clone(),
+                unidentified_websocket.clone(),
+                &operation,
+            )
+            .await
+            {
+                warn!(pack_id = %hex::encode(operation.pack_id()), %error, "failed to install a pending sticker pack");
+            }
+        }
+        Ok(())
+    }
+
+    /// Installs a sticker pack and notifies other registered devices.
+    ///
+    /// Only the manifest is fetched; a sticker's image is downloaded on demand
+    /// with [`Self::download_sticker`].
     pub async fn install_sticker_pack(
         &mut self,
         pack_id: &[u8],
@@ -2518,6 +2569,9 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     /// Download and import a Signal backup after device linking (Link & Sync).
+    ///
+    /// The backup's sticker packs are only noted; follow with
+    /// [`Self::download_pending_sticker_packs`] to install them.
     pub async fn download_and_import_backup<F: Fn(BackupImportProgress)>(
         &mut self,
         ephemeral_key: Option<MessageBackupKey>,
@@ -2797,6 +2851,17 @@ impl<S: Store> Manager<S, Registered> {
                         {
                             warn!(%e, "backup import: failed to restore message state");
                         }
+                    }
+                }
+                Some(FrameItem::StickerPack(pack)) => {
+                    if !is_sticker_pack_pointer(&pack.pack_id, &pack.pack_key) {
+                        warn!("backup import: skipping a malformed sticker pack frame");
+                    } else if let Err(e) = self
+                        .store
+                        .note_installed_sticker_pack(&pack.pack_id, &pack.pack_key, None)
+                        .await
+                    {
+                        warn!(%e, "backup import: failed to note a sticker pack");
                     }
                 }
                 _ => {}
@@ -3220,7 +3285,9 @@ async fn fetch_and_store_group<S: Store>(
     Ok(store.group(master_key).await?)
 }
 
-/// Download and decrypt a sticker manifest
+/// Fetches a sticker pack's manifest and saves the pack as installed. The
+/// stickers' images are not downloaded; [`download_sticker`] fetches one when it
+/// is needed.
 async fn download_sticker_pack<C: ContentsStore>(
     mut store: C,
     mut unidentified_websocket: SignalWebSocket<websocket::Unidentified>,
@@ -3229,6 +3296,26 @@ async fn download_sticker_pack<C: ContentsStore>(
     debug!("downloading sticker pack");
     let pack_key = operation.pack_key();
     let pack_id = operation.pack_id();
+    let manifest =
+        fetch_sticker_pack_manifest::<C>(&mut unidentified_websocket, pack_id, pack_key).await?;
+
+    let sticker_pack = StickerPack {
+        id: pack_id.to_vec(),
+        key: pack_key.to_vec(),
+        manifest,
+    };
+
+    store.add_sticker_pack(&sticker_pack).await?;
+
+    Ok(sticker_pack)
+}
+
+/// Downloads and decrypts a sticker pack manifest
+async fn fetch_sticker_pack_manifest<C: ContentsStore>(
+    unidentified_websocket: &mut SignalWebSocket<websocket::Unidentified>,
+    pack_id: &[u8],
+    pack_key: &[u8],
+) -> Result<StickerPackManifest, Error<C::ContentsStoreError>> {
     let key = derive_key(pack_key)?;
 
     let mut ciphertext = Vec::new();
@@ -3243,33 +3330,11 @@ async fn download_sticker_pack<C: ContentsStore>(
 
     decrypt_in_place(key, &mut ciphertext)?;
 
-    let mut sticker_pack_manifest: StickerPackManifest =
+    Ok(
         libsignal_service::proto::Pack::decode(ciphertext.as_slice())
             .map_err(ProvisioningError::from)?
-            .into();
-
-    for sticker in &mut sticker_pack_manifest.stickers {
-        match download_sticker::<C>(&mut unidentified_websocket, pack_id, pack_key, sticker.id)
-            .await
-        {
-            Ok(decrypted_sticker_bytes) => {
-                debug!(id = sticker.id, "downloaded sticker");
-                sticker.bytes = Some(decrypted_sticker_bytes);
-            }
-            Err(error) => error!(sticker.id, %error,"failed to download sticker"),
-        }
-    }
-
-    let sticker_pack = StickerPack {
-        id: pack_id.to_vec(),
-        key: pack_key.to_vec(),
-        manifest: sticker_pack_manifest,
-    };
-
-    // save everything in store
-    store.add_sticker_pack(&sticker_pack).await?;
-
-    Ok(sticker_pack)
+            .into(),
+    )
 }
 
 /// Downloads and decrypts a single sticker

@@ -1208,12 +1208,14 @@ async fn sync_storage_service<S: Store>(
     let mut contact_keys: Vec<Vec<u8>> = Vec::new();
     let mut group_keys: Vec<Vec<u8>> = Vec::new();
     let mut folder_keys: Vec<Vec<u8>> = Vec::new();
+    let mut sticker_pack_keys: Vec<Vec<u8>> = Vec::new();
     let mut manifest_ids: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     for id in &manifest_record.identifiers {
         match id.r#type() {
             StorageType::Contact => contact_keys.push(id.raw.clone()),
             StorageType::Groupv2 => group_keys.push(id.raw.clone()),
             StorageType::ChatFolder => folder_keys.push(id.raw.clone()),
+            StorageType::StickerPack => sticker_pack_keys.push(id.raw.clone()),
             _ => {}
         }
         manifest_ids.insert(id.raw.clone());
@@ -1231,7 +1233,11 @@ async fn sync_storage_service<S: Store>(
         "storage sync: chat folder keys in manifest"
     );
 
-    if contact_keys.is_empty() && group_keys.is_empty() && folder_keys.is_empty() {
+    if contact_keys.is_empty()
+        && group_keys.is_empty()
+        && folder_keys.is_empty()
+        && sticker_pack_keys.is_empty()
+    {
         debug!("storage sync: nothing to sync");
         store
             .store_storage_manifest_version(manifest_version)
@@ -1245,7 +1251,11 @@ async fn sync_storage_service<S: Store>(
     // by the time one is merged its recipients are already in the store — the
     // same ordering Signal-Desktop imposes. Keeping the types in separate
     // batches is what makes that hold under the per-batch resume cursor.
-    let subject_keys: Vec<Vec<u8>> = contact_keys.into_iter().chain(group_keys).collect();
+    let subject_keys: Vec<Vec<u8>> = contact_keys
+        .into_iter()
+        .chain(group_keys)
+        .chain(sticker_pack_keys)
+        .collect();
     let total = subject_keys.len() + folder_keys.len();
     let batches: Vec<&[Vec<u8>]> = subject_keys
         .chunks(STORAGE_SERVICE_BATCH_SIZE)
@@ -1460,6 +1470,25 @@ async fn sync_storage_service<S: Store>(
                         warn!(%e, "storage sync: failed to save chat folder storage identity");
                     }
                 }
+                Some(libsignal_service::proto::storage_record::Record::StickerPack(record)) => {
+                    match sticker_pack_change(record) {
+                        Some(StickerPackChange::Removed { id }) => {
+                            debug!(pack_id = %hex::encode(&id), "storage sync: sticker pack removed");
+                            if let Err(e) = store.remove_sticker_pack(&id).await {
+                                warn!(%e, "storage sync: failed to remove sticker pack");
+                            }
+                        }
+                        Some(StickerPackChange::Installed { id, key, position }) => {
+                            if let Err(e) = store
+                                .note_installed_sticker_pack(&id, &key, Some(position))
+                                .await
+                            {
+                                warn!(%e, "storage sync: failed to note an installed sticker pack");
+                            }
+                        }
+                        None => warn!("storage sync: skipping malformed sticker pack record"),
+                    }
+                }
                 Some(other) => {
                     debug!(?other, "storage sync: skipping unmodelled record");
                 }
@@ -1502,6 +1531,52 @@ async fn sync_storage_service<S: Store>(
 fn chat_folder_tombstone_expired(folder: &ChatFolder, now_ms: u64) -> bool {
     let ttl_ms = CHAT_FOLDER_TOMBSTONE_TTL.as_millis() as u64;
     folder.deleted_at_timestamp_ms != 0 && folder.deleted_at_timestamp_ms + ttl_ms < now_ms
+}
+
+const STICKER_PACK_ID_LEN: usize = 16;
+const STICKER_PACK_KEY_LEN: usize = 32;
+
+/// What a `StickerPackRecord` says happened to a pack on the account.
+#[derive(Debug, PartialEq, Eq)]
+enum StickerPackChange {
+    Installed {
+        id: Vec<u8>,
+        key: Vec<u8>,
+        position: u32,
+    },
+    Removed {
+        id: Vec<u8>,
+    },
+}
+
+/// Signal-Desktop's `mergeStickerPackRecord`, reduced to what a device that
+/// only reads the records needs. `None` is a record no client could act on.
+///
+/// - A pack is named by its 16-byte id; a record without one is malformed.
+/// - A non-zero `deletedAtTimestamp` is an uninstall, whatever else the record
+///   carries — a tombstone is meant to have no key or position.
+/// - Otherwise the pack is installed, and needs its 32-byte key to be of use.
+fn sticker_pack_change(
+    record: libsignal_service::proto::StickerPackRecord,
+) -> Option<StickerPackChange> {
+    if record.pack_id.len() != STICKER_PACK_ID_LEN {
+        return None;
+    }
+    if record.deleted_at_timestamp != 0 {
+        return Some(StickerPackChange::Removed { id: record.pack_id });
+    }
+    is_sticker_pack_pointer(&record.pack_id, &record.pack_key).then_some(
+        StickerPackChange::Installed {
+            id: record.pack_id,
+            key: record.pack_key,
+            position: record.position,
+        },
+    )
+}
+
+/// Whether an id and a key are the sizes Signal gives a sticker pack's.
+pub(super) fn is_sticker_pack_pointer(id: &[u8], key: &[u8]) -> bool {
+    id.len() == STICKER_PACK_ID_LEN && key.len() == STICKER_PACK_KEY_LEN
 }
 
 /// Signal-Desktop's `mergeChatFolderRecord`, with presage's rule for the
@@ -1636,6 +1711,52 @@ async fn ensure_single_all_chats_folder<S: Store>(store: &mut S, create_missing:
         let all = ChatFolder::all_chats(Uuid::from_bytes(raw));
         debug!(id = %all.id, "storage sync: account has no all-chats folder, creating one");
         stage_chat_folder(store, &all).await.ok();
+    }
+}
+
+#[cfg(test)]
+mod sticker_pack_tests {
+    use libsignal_service::proto::StickerPackRecord;
+
+    use super::{sticker_pack_change, StickerPackChange};
+
+    fn record(id_len: usize, key_len: usize, deleted_at_timestamp: u64) -> StickerPackRecord {
+        StickerPackRecord {
+            pack_id: vec![1; id_len],
+            pack_key: vec![2; key_len],
+            position: 7,
+            deleted_at_timestamp,
+        }
+    }
+
+    #[test]
+    fn a_live_record_installs_the_pack_at_its_position() {
+        assert_eq!(
+            sticker_pack_change(record(16, 32, 0)),
+            Some(StickerPackChange::Installed {
+                id: vec![1; 16],
+                key: vec![2; 32],
+                position: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn a_tombstone_removes_the_pack_with_or_without_a_key() {
+        for key_len in [0, 32] {
+            assert_eq!(
+                sticker_pack_change(record(16, key_len, 1_700_000_000_000)),
+                Some(StickerPackChange::Removed { id: vec![1; 16] })
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_no_client_could_act_on_is_skipped() {
+        assert_eq!(sticker_pack_change(record(0, 32, 0)), None);
+        assert_eq!(sticker_pack_change(record(15, 32, 1)), None);
+        assert_eq!(sticker_pack_change(record(16, 0, 0)), None);
+        assert_eq!(sticker_pack_change(record(16, 31, 0)), None);
     }
 }
 
