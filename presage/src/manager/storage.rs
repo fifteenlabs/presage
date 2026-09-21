@@ -40,9 +40,11 @@ use crate::model::groups::Group;
 use crate::storage_record::{
     chat_folder_unknown_fields, contact_blocked, contact_muted_until, encode_chat_folder_record,
     group_muted_until, set_contact_blocked, set_contact_muted_until, set_group_muted_until,
-    StorageRecordEditError,
+    set_sticker_pack_state, sticker_pack_state, StorageRecordEditError,
 };
-use crate::store::{StorageRecordIdentity, StorageRecordKey, StorageSyncCursor, Store};
+use crate::store::{
+    StickerPackRecordState, StorageRecordIdentity, StorageRecordKey, StorageSyncCursor, Store,
+};
 use crate::{Error, Manager};
 
 use super::Registered;
@@ -474,6 +476,11 @@ impl<S: Store> Manager<S, Registered> {
                     .set_chat_folder_needs_storage_sync(*id, needs_sync)
                     .await?
             }
+            StorageRecordKey::StickerPack(id) => {
+                self.store
+                    .set_sticker_pack_needs_storage_sync(id, needs_sync)
+                    .await?
+            }
         }
         Ok(())
     }
@@ -491,6 +498,9 @@ impl<S: Store> Manager<S, Registered> {
             }
             StorageRecordKey::ChatFolder(id) => {
                 self.store.chat_folder_storage_identity(*id).await?
+            }
+            StorageRecordKey::StickerPack(id) => {
+                self.store.sticker_pack_storage_identity(id).await?
             }
         })
     }
@@ -514,6 +524,11 @@ impl<S: Store> Manager<S, Registered> {
             StorageRecordKey::ChatFolder(id) => {
                 self.store
                     .save_chat_folder_storage_identity(*id, identity)
+                    .await?
+            }
+            StorageRecordKey::StickerPack(id) => {
+                self.store
+                    .save_sticker_pack_storage_identity(id, identity)
                     .await?
             }
         }
@@ -712,6 +727,85 @@ impl<S: Store> Manager<S, Registered> {
                     .set_group_needs_storage_sync(master_key, true)
                     .await?;
             }
+        }
+        Ok(())
+    }
+
+    /// Publish every sticker pack installed or removed here that the storage
+    /// service has not heard about.
+    ///
+    /// Same contract as the contact and group drains: no argument, the work list
+    /// is the store, safe to call at any time, and one pack's failure never
+    /// stops the rest. It takes their one-record-at-a-time shape rather than the
+    /// chat folders' single write because no pack's record depends on another's:
+    /// an install takes the next position and a removal only tombstones.
+    ///
+    /// Callers must hold the storage-service lock.
+    pub async fn push_pending_sticker_pack_records(&mut self) -> Result<(), Error<S::Error>> {
+        let pending = self.store.sticker_packs_needing_storage_sync().await?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        debug!(
+            count = pending.len(),
+            "storage manifest: publishing pending sticker pack records"
+        );
+
+        for id in pending {
+            if let Err(e) = self.push_sticker_pack_record(&id).await {
+                warn!(%e, "storage manifest: failed to publish a sticker pack record");
+            }
+        }
+        Ok(())
+    }
+
+    /// Bring one pack's storage-service record in line with the local row.
+    async fn push_sticker_pack_record(&mut self, id: &[u8]) -> Result<(), Error<S::Error>> {
+        let Some(wanted) = self.store.sticker_pack_record_state(id).await? else {
+            // Flagged with nothing to say: clear it, or every drain retries it.
+            warn!("storage manifest: pending sticker pack has no state to publish");
+            self.store
+                .set_sticker_pack_needs_storage_sync(id, false)
+                .await?;
+            return Ok(());
+        };
+        let key = StorageRecordKey::StickerPack(id.to_vec());
+
+        match self
+            .update_storage_record(&key, |record| {
+                if wanted.published_as(&sticker_pack_state(record)?) {
+                    return Ok(None);
+                }
+                Ok(Some(set_sticker_pack_state(record, &wanted)?))
+            })
+            .await
+        {
+            // The account holds no record for this pack. A removal is appended
+            // too, as Signal-Desktop does for any pack that had been installed:
+            // the other devices were already told of the install, and the
+            // tombstone is what they converge on if the removal never reaches
+            // them.
+            Err(Error::StorageRecordUnknown) => {
+                debug!("storage manifest: sticker pack has no record yet, appending one");
+                let record = StorageRecord {
+                    record: Some(storage_record::Record::StickerPack(wanted.to_record(id))),
+                };
+                self.append_record(&key, record).await?
+            }
+            other => other?,
+        }
+
+        // The state was read before a manifest fetch, a write, and possibly two
+        // backoff sleeps. See `push_contact_record` for why the flag goes back up.
+        let changed = match self.store.sticker_pack_record_state(id).await? {
+            Some(current) => !current.published_as(&wanted),
+            None => false,
+        };
+        if changed {
+            debug!("storage manifest: sticker pack changed while publishing, re-flagging");
+            self.store
+                .set_sticker_pack_needs_storage_sync(id, true)
+                .await?;
         }
         Ok(())
     }
@@ -1285,11 +1379,22 @@ async fn sync_storage_service<S: Store>(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    if !contact_pending.is_empty() || !group_pending.is_empty() || !folder_pending.is_empty() {
+    let sticker_pack_pending: std::collections::HashSet<Vec<u8>> = store
+        .sticker_packs_needing_storage_sync()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if !contact_pending.is_empty()
+        || !group_pending.is_empty()
+        || !folder_pending.is_empty()
+        || !sticker_pack_pending.is_empty()
+    {
         debug!(
             contacts = contact_pending.len(),
             groups = group_pending.len(),
             folders = folder_pending.len(),
+            sticker_packs = sticker_pack_pending.len(),
             "storage sync: subjects with an unpublished local change"
         );
     }
@@ -1471,22 +1576,45 @@ async fn sync_storage_service<S: Store>(
                     }
                 }
                 Some(libsignal_service::proto::storage_record::Record::StickerPack(record)) => {
-                    match sticker_pack_change(record) {
-                        Some(StickerPackChange::Removed { id }) => {
+                    let Some((id, state)) = sticker_pack_change(record) else {
+                        warn!("storage sync: skipping malformed sticker pack record");
+                        continue;
+                    };
+                    match &state {
+                        // A pack installed or removed here and not yet published
+                        // is kept as it is: this record is the one that change is
+                        // about to replace.
+                        _ if sticker_pack_pending.contains(&id) => debug!(
+                            pack_id = %hex::encode(&id),
+                            "storage sync: sticker pack has an unpublished local change, keeping it"
+                        ),
+                        StickerPackRecordState::Removed { .. } => {
                             debug!(pack_id = %hex::encode(&id), "storage sync: sticker pack removed");
                             if let Err(e) = store.remove_sticker_pack(&id).await {
                                 warn!(%e, "storage sync: failed to remove sticker pack");
                             }
                         }
-                        Some(StickerPackChange::Installed { id, key, position }) => {
+                        StickerPackRecordState::Installed { key, position } => {
                             if let Err(e) = store
-                                .note_installed_sticker_pack(&id, &key, Some(position))
+                                .note_installed_sticker_pack(&id, key, Some(*position))
                                 .await
                             {
                                 warn!(%e, "storage sync: failed to note an installed sticker pack");
                             }
                         }
-                        None => warn!("storage sync: skipping malformed sticker pack record"),
+                    }
+                    // Saved even when the local state was kept: the next publish
+                    // has to replace the identifier the server holds now.
+                    let identity = StorageRecordIdentity {
+                        storage_id: item.key,
+                        storage_version: manifest_version,
+                        record: item.plaintext,
+                    };
+                    if let Err(e) = store
+                        .save_sticker_pack_storage_identity(&id, &identity)
+                        .await
+                    {
+                        warn!(%e, "storage sync: failed to save sticker pack storage identity");
                     }
                 }
                 Some(other) => {
@@ -1536,42 +1664,22 @@ fn chat_folder_tombstone_expired(folder: &ChatFolder, now_ms: u64) -> bool {
 const STICKER_PACK_ID_LEN: usize = 16;
 const STICKER_PACK_KEY_LEN: usize = 32;
 
-/// What a `StickerPackRecord` says happened to a pack on the account.
-#[derive(Debug, PartialEq, Eq)]
-enum StickerPackChange {
-    Installed {
-        id: Vec<u8>,
-        key: Vec<u8>,
-        position: u32,
-    },
-    Removed {
-        id: Vec<u8>,
-    },
-}
-
-/// Signal-Desktop's `mergeStickerPackRecord`, reduced to what a device that
-/// only reads the records needs. `None` is a record no client could act on.
-///
-/// - A pack is named by its 16-byte id; a record without one is malformed.
-/// - A non-zero `deletedAtTimestamp` is an uninstall, whatever else the record
-///   carries — a tombstone is meant to have no key or position.
-/// - Otherwise the pack is installed, and needs its 32-byte key to be of use.
+/// The pack a `StickerPackRecord` is about and what it says of it, or `None`
+/// for a record no client could act on: a pack is named by its 16-byte id, and
+/// an installed one needs its 32-byte key to be of use. A tombstone needs no
+/// key, and is meant to have none.
 fn sticker_pack_change(
-    record: libsignal_service::proto::StickerPackRecord,
-) -> Option<StickerPackChange> {
+    mut record: libsignal_service::proto::StickerPackRecord,
+) -> Option<(Vec<u8>, StickerPackRecordState)> {
     if record.pack_id.len() != STICKER_PACK_ID_LEN {
         return None;
     }
-    if record.deleted_at_timestamp != 0 {
-        return Some(StickerPackChange::Removed { id: record.pack_id });
+    let id = std::mem::take(&mut record.pack_id);
+    let state = StickerPackRecordState::from(record);
+    match &state {
+        StickerPackRecordState::Installed { key, .. } if !is_sticker_pack_pointer(&id, key) => None,
+        _ => Some((id, state)),
     }
-    is_sticker_pack_pointer(&record.pack_id, &record.pack_key).then_some(
-        StickerPackChange::Installed {
-            id: record.pack_id,
-            key: record.pack_key,
-            position: record.position,
-        },
-    )
 }
 
 /// Whether an id and a key are the sizes Signal gives a sticker pack's.
@@ -1718,7 +1826,7 @@ async fn ensure_single_all_chats_folder<S: Store>(store: &mut S, create_missing:
 mod sticker_pack_tests {
     use libsignal_service::proto::StickerPackRecord;
 
-    use super::{sticker_pack_change, StickerPackChange};
+    use super::{sticker_pack_change, StickerPackRecordState};
 
     fn record(id_len: usize, key_len: usize, deleted_at_timestamp: u64) -> StickerPackRecord {
         StickerPackRecord {
@@ -1733,11 +1841,13 @@ mod sticker_pack_tests {
     fn a_live_record_installs_the_pack_at_its_position() {
         assert_eq!(
             sticker_pack_change(record(16, 32, 0)),
-            Some(StickerPackChange::Installed {
-                id: vec![1; 16],
-                key: vec![2; 32],
-                position: 7,
-            })
+            Some((
+                vec![1; 16],
+                StickerPackRecordState::Installed {
+                    key: vec![2; 32],
+                    position: 7,
+                }
+            ))
         );
     }
 
@@ -1746,7 +1856,12 @@ mod sticker_pack_tests {
         for key_len in [0, 32] {
             assert_eq!(
                 sticker_pack_change(record(16, key_len, 1_700_000_000_000)),
-                Some(StickerPackChange::Removed { id: vec![1; 16] })
+                Some((
+                    vec![1; 16],
+                    StickerPackRecordState::Removed {
+                        deleted_at_ms: 1_700_000_000_000
+                    }
+                ))
             );
         }
     }

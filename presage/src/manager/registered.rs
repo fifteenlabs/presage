@@ -2207,73 +2207,85 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
-    /// Installs a sticker pack and notifies other registered devices.
+    /// Installs a sticker pack: locally at once, then on the account.
     ///
-    /// Only the manifest is fetched; a sticker's image is downloaded on demand
-    /// with [`Self::download_sticker`].
+    /// A pack the store already holds — a default pack, or one removed earlier —
+    /// is installed from that copy, so it needs no network. Otherwise only the
+    /// manifest is fetched; a sticker's image is downloaded on demand with
+    /// [`Self::download_sticker`].
+    ///
+    /// The install is staged for the storage service, which is what makes it
+    /// last: the caller publishes it with
+    /// [`Self::push_pending_sticker_pack_records`], and until that lands the
+    /// flag keeps a storage sync from undoing it. The sync message to the other
+    /// devices is a courtesy on top — they read the same record — so its
+    /// failure is logged and not returned.
     pub async fn install_sticker_pack(
         &mut self,
         pack_id: &[u8],
         pack_key: &[u8],
     ) -> Result<(), Error<S::Error>> {
-        let sticker_pack_operation = StickerPackOperation {
-            pack_id: Some(pack_id.to_vec()),
-            pack_key: Some(pack_key.to_vec()),
-            r#type: Some(sticker_pack_operation::Type::Install as i32),
-        };
+        let operation = pack_operation(pack_id, pack_key, sticker_pack_operation::Type::Install);
 
-        let unidentified_websocket = self.unidentified_websocket().await?;
-        download_sticker_pack(
-            self.store.clone(),
-            unidentified_websocket,
-            &sticker_pack_operation,
-        )
-        .await?;
-
-        // Sync the change with the other devices
-        let sync_message = SyncMessage {
-            sticker_pack_operation: vec![sticker_pack_operation],
-            ..Default::default()
-        };
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis() as u64;
-
-        self.send_message(self.state.data.service_ids.aci(), sync_message, timestamp)
+        match self.store.sticker_pack(pack_id).await? {
+            Some(held) => self.store.add_sticker_pack(&held).await?,
+            None => {
+                let unidentified_websocket = self.unidentified_websocket().await?;
+                download_sticker_pack(self.store.clone(), unidentified_websocket, &operation)
+                    .await?;
+            }
+        }
+        self.store
+            .set_sticker_pack_needs_storage_sync(pack_id, true)
             .await?;
 
+        self.send_sticker_pack_operation(operation).await;
         Ok(())
     }
 
-    /// Removes an installed sticker pack
+    /// Removes an installed sticker pack: locally at once, then on the account.
+    ///
+    /// Staged and announced exactly as [`Self::install_sticker_pack`] is, which
+    /// is why this works offline — the removal is already durable by the time
+    /// anything is sent.
     pub async fn remove_sticker_pack(
         &mut self,
         pack_id: &[u8],
         pack_key: &[u8],
     ) -> Result<(), Error<S::Error>> {
-        // Sync the change with the other clients
-        let sync_message = SyncMessage {
-            sticker_pack_operation: vec![StickerPackOperation {
-                pack_id: Some(pack_id.to_vec()),
-                pack_key: Some(pack_key.to_vec()), // The pack key might not be neccesary in the message
-                r#type: Some(sticker_pack_operation::Type::Remove as i32),
-            }],
-            ..Default::default()
-        };
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis() as u64;
-
-        self.send_message(self.state.data.service_ids.aci(), sync_message, timestamp)
+        self.store.remove_sticker_pack(pack_id).await?;
+        self.store
+            .set_sticker_pack_needs_storage_sync(pack_id, true)
             .await?;
 
-        self.store.remove_sticker_pack(pack_id).await?;
-
+        self.send_sticker_pack_operation(pack_operation(
+            pack_id,
+            pack_key,
+            sticker_pack_operation::Type::Remove,
+        ))
+        .await;
         Ok(())
+    }
+
+    /// Tell the account's other devices about an install or a removal.
+    /// Best-effort: the storage-service record is what they converge on.
+    async fn send_sticker_pack_operation(&mut self, operation: StickerPackOperation) {
+        let mut sender = match self.new_message_sender().await {
+            Ok(sender) => sender,
+            Err(error) => {
+                warn!(%error, "failed to build the sender for a sticker pack sync message");
+                return;
+            }
+        };
+        if let Err(error) = sender
+            .send_sync_message(SyncMessage {
+                sticker_pack_operation: vec![operation],
+                ..SyncMessage::with_padding(&mut rand::rng())
+            })
+            .await
+        {
+            warn!(%error, "failed to send the sticker pack sync message");
+        }
     }
 
     pub async fn send_session_reset(
@@ -3283,6 +3295,20 @@ async fn fetch_and_store_group<S: Store>(
         };
     store.save_group(master_key, group).await?;
     Ok(store.group(master_key).await?)
+}
+
+/// The sync message body that tells the other devices about an install or a
+/// removal.
+fn pack_operation(
+    pack_id: &[u8],
+    pack_key: &[u8],
+    operation: sticker_pack_operation::Type,
+) -> StickerPackOperation {
+    StickerPackOperation {
+        pack_id: Some(pack_id.to_vec()),
+        pack_key: Some(pack_key.to_vec()),
+        r#type: Some(operation as i32),
+    }
 }
 
 /// Fetches a sticker pack's manifest and saves the pack as installed. The

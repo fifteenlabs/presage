@@ -20,6 +20,8 @@ const STORAGE_RECORD_CONTACT: u32 = 1;
 const STORAGE_RECORD_GROUP_V2: u32 = 3;
 /// `StorageRecord.chatFolder`, from `StorageService.proto`.
 const STORAGE_RECORD_CHAT_FOLDER: u32 = 8;
+/// `StorageRecord.stickerPack`, from `StorageService.proto`.
+const STORAGE_RECORD_STICKER_PACK: u32 = 6;
 /// Every `ChatFolderRecord` field presage models, `identifier` through
 /// `deletedAtTimestampMs`. Anything outside is carried through verbatim.
 const CHAT_FOLDER_RECORD_KNOWN_FIELDS: std::ops::RangeInclusive<u32> = 1..=11;
@@ -29,6 +31,12 @@ const CONTACT_RECORD_BLOCKED: u32 = 9;
 const CONTACT_RECORD_MUTED_UNTIL: u32 = 13;
 /// `GroupV2Record.mutedUntilTimestamp`.
 const GROUP_V2_RECORD_MUTED_UNTIL: u32 = 6;
+/// `StickerPackRecord.packKey`.
+const STICKER_PACK_RECORD_KEY: u32 = 2;
+/// `StickerPackRecord.position`.
+const STICKER_PACK_RECORD_POSITION: u32 = 3;
+/// `StickerPackRecord.deletedAtTimestamp`.
+const STICKER_PACK_RECORD_DELETED_AT: u32 = 4;
 
 const WIRE_VARINT: u8 = 0;
 const WIRE_I64: u8 = 1;
@@ -283,9 +291,9 @@ pub fn contact_muted_until(record: &[u8]) -> Result<u64, EditError> {
 
 /// Set `ContactRecord.mutedUntilTimestamp` on an encoded `StorageRecord`,
 /// preserving every other byte of both messages. See
-/// [`set_muted_until_field`] for the unmute convention.
+/// [`set_varint_field_or_remove`] for the unmute convention.
 pub fn set_contact_muted_until(record: &[u8], muted_until: u64) -> Result<Vec<u8>, EditError> {
-    set_muted_until_field(
+    set_varint_field_or_remove(
         record,
         STORAGE_RECORD_CONTACT,
         CONTACT_RECORD_MUTED_UNTIL,
@@ -303,9 +311,9 @@ pub fn group_muted_until(record: &[u8]) -> Result<u64, EditError> {
 /// preserving every other byte of both messages — `dontNotifyForMentionsIfMuted`
 /// and `avatarColor` included, neither of which presage models, and the latter
 /// of which has explicit presence so a re-encode could not restore it. See
-/// [`set_muted_until_field`] for the unmute convention.
+/// [`set_varint_field_or_remove`] for the unmute convention.
 pub fn set_group_muted_until(record: &[u8], muted_until: u64) -> Result<Vec<u8>, EditError> {
-    set_muted_until_field(
+    set_varint_field_or_remove(
         record,
         STORAGE_RECORD_GROUP_V2,
         GROUP_V2_RECORD_MUTED_UNTIL,
@@ -346,20 +354,78 @@ pub fn encode_chat_folder_record(
     encode_len_delimited(STORAGE_RECORD_CHAT_FOLDER, &inner)
 }
 
-/// Write a mute expiry into whichever record holds one.
+/// What an encoded `StorageRecord { stickerPack }` says about its pack.
 ///
-/// `0` (not muted) **removes** the field rather than writing an explicit zero.
+/// Decoded through prost rather than walked: reading drops nothing, and the
+/// fields a decode ignores are exactly the ones [`set_sticker_pack_state`]
+/// leaves alone.
+pub fn sticker_pack_state(
+    record: &[u8],
+) -> Result<crate::store::StickerPackRecordState, EditError> {
+    use libsignal_service::prelude::ProtobufMessage;
+
+    let payload = record_payload(record, STORAGE_RECORD_STICKER_PACK)?;
+    let pack = libsignal_service::proto::StickerPackRecord::decode(&record[payload])
+        .map_err(|_| EditError::Malformed)?;
+    Ok(pack.into())
+}
+
+/// Make an encoded `StorageRecord { stickerPack }` say `state`, preserving the
+/// pack id and every field presage does not model.
+///
+/// The two states are exclusive on the wire. An installed pack carries its key
+/// and position and no deletion time; a removed one carries the deletion time
+/// and neither of the others — `StorageService.proto` says a tombstone has
+/// them "not set", and Signal-Desktop's `toStickerPackRecord` writes it so.
+pub fn set_sticker_pack_state(
+    record: &[u8],
+    state: &crate::store::StickerPackRecordState,
+) -> Result<Vec<u8>, EditError> {
+    use crate::store::StickerPackRecordState;
+
+    let (key, position, deleted_at) = match state {
+        StickerPackRecordState::Installed { key, position } => (
+            Some(encode_len_delimited(STICKER_PACK_RECORD_KEY, key)),
+            u64::from(*position),
+            0,
+        ),
+        StickerPackRecordState::Removed { deleted_at_ms } => (None, 0, *deleted_at_ms),
+    };
+    let record = set_record_field(
+        record,
+        STORAGE_RECORD_STICKER_PACK,
+        STICKER_PACK_RECORD_KEY,
+        key.as_deref(),
+    )?;
+    let record = set_varint_field_or_remove(
+        &record,
+        STORAGE_RECORD_STICKER_PACK,
+        STICKER_PACK_RECORD_POSITION,
+        position,
+    )?;
+    set_varint_field_or_remove(
+        &record,
+        STORAGE_RECORD_STICKER_PACK,
+        STICKER_PACK_RECORD_DELETED_AT,
+        deleted_at,
+    )
+}
+
+/// Write a varint into whichever record holds one, where `0` means absent:
+/// a mute expiry, a sticker pack's position or deletion time.
+///
+/// `0` **removes** the field rather than writing an explicit zero.
 /// Signal-Desktop, -Android and -iOS all write an explicit `0`; under proto3
 /// implicit presence the two are indistinguishable on decode, so this is
 /// equivalent rather than identical. "Muted forever" is `i64::MAX`, a ten-byte
 /// varint.
-fn set_muted_until_field(
+fn set_varint_field_or_remove(
     record: &[u8],
     record_field: u32,
     number: u32,
-    muted_until: u64,
+    value: u64,
 ) -> Result<Vec<u8>, EditError> {
-    let replacement = (muted_until != 0).then(|| encode_varint_field(number, muted_until));
+    let replacement = (value != 0).then(|| encode_varint_field(number, value));
     set_record_field(record, record_field, number, replacement.as_deref())
 }
 
@@ -827,6 +893,122 @@ mod chat_folder_tests {
         let record = encode_len_delimited(STORAGE_RECORD_CONTACT, b"");
         assert_eq!(
             chat_folder_unknown_fields(&record),
+            Err(EditError::WrongRecordType)
+        );
+    }
+}
+
+#[cfg(test)]
+mod sticker_pack_tests {
+    use super::*;
+    use crate::store::StickerPackRecordState;
+    use libsignal_service::prelude::ProtobufMessage;
+    use libsignal_service::proto::{storage_record::Record, StickerPackRecord, StorageRecord};
+
+    const UNKNOWN: &[u8] = b"from the future";
+
+    fn installed() -> StickerPackRecordState {
+        StickerPackRecordState::Installed {
+            key: vec![9; 32],
+            position: 4,
+        }
+    }
+
+    fn removed() -> StickerPackRecordState {
+        StickerPackRecordState::Removed {
+            deleted_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    /// An installed pack as a newer client wrote it: our fields plus one we do
+    /// not know.
+    fn installed_record() -> Vec<u8> {
+        let mut inner = installed().to_record(&[3; 16]).encode_to_vec();
+        inner.extend_from_slice(&encode_len_delimited(250, UNKNOWN));
+        encode_len_delimited(STORAGE_RECORD_STICKER_PACK, &inner)
+    }
+
+    fn decode(record: &[u8]) -> StickerPackRecord {
+        match StorageRecord::decode(record).expect("decodes").record {
+            Some(Record::StickerPack(pack)) => pack,
+            other => panic!("not a sticker pack: {other:?}"),
+        }
+    }
+
+    fn unknown_field_survived(record: &[u8]) -> bool {
+        let payload = record_payload(record, STORAGE_RECORD_STICKER_PACK).expect("well-formed");
+        record[payload]
+            .windows(UNKNOWN.len())
+            .any(|window| window == UNKNOWN)
+    }
+
+    #[test]
+    fn a_record_reads_as_the_state_it_was_written_with() {
+        assert_eq!(sticker_pack_state(&installed_record()), Ok(installed()));
+    }
+
+    #[test]
+    fn a_tombstone_keeps_the_id_and_carries_no_key_or_position() {
+        let tombstone = set_sticker_pack_state(&installed_record(), &removed()).unwrap();
+
+        assert_eq!(
+            decode(&tombstone),
+            StickerPackRecord {
+                pack_id: vec![3; 16],
+                pack_key: Vec::new(),
+                position: 0,
+                deleted_at_timestamp: 1_700_000_000_000,
+            }
+        );
+        assert_eq!(sticker_pack_state(&tombstone), Ok(removed()));
+        assert!(unknown_field_survived(&tombstone));
+    }
+
+    #[test]
+    fn reinstalling_a_tombstone_clears_the_deletion_time() {
+        let tombstone = set_sticker_pack_state(&installed_record(), &removed()).unwrap();
+        let reinstalled = set_sticker_pack_state(&tombstone, &installed()).unwrap();
+
+        assert_eq!(decode(&reinstalled), decode(&installed_record()));
+        assert!(unknown_field_survived(&reinstalled));
+    }
+
+    #[test]
+    fn writing_the_state_a_record_already_holds_changes_nothing() {
+        let record = installed_record();
+        assert_eq!(set_sticker_pack_state(&record, &installed()), Ok(record));
+    }
+
+    #[test]
+    fn a_state_survives_the_record_it_is_written_as() {
+        for state in [installed(), removed()] {
+            let record = state.to_record(&[3; 16]);
+            assert_eq!(record.pack_id, vec![3; 16]);
+            assert_eq!(StickerPackRecordState::from(record), state);
+        }
+    }
+
+    #[test]
+    fn tombstones_agree_whatever_their_times_and_installs_only_when_equal() {
+        let earlier = StickerPackRecordState::Removed { deleted_at_ms: 1 };
+        assert!(removed().published_as(&earlier));
+        assert!(installed().published_as(&installed()));
+        assert!(!installed().published_as(&removed()));
+        assert!(!removed().published_as(&installed()));
+        assert!(
+            !installed().published_as(&StickerPackRecordState::Installed {
+                key: vec![9; 32],
+                position: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn a_contact_record_is_not_a_sticker_pack() {
+        let record = encode_len_delimited(STORAGE_RECORD_CONTACT, b"");
+        assert_eq!(sticker_pack_state(&record), Err(EditError::WrongRecordType));
+        assert_eq!(
+            set_sticker_pack_state(&record, &removed()),
             Err(EditError::WrongRecordType)
         );
     }
