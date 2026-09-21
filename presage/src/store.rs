@@ -11,7 +11,8 @@ use libsignal_service::{
     proto::{
         manifest_record,
         sync_message::{self, Content as SyncContent, Sent},
-        verified, DataMessage, EditMessage, GroupContextV2, SyncMessage, Verified,
+        verified, DataMessage, EditMessage, GroupContextV2, StickerPackRecord, SyncMessage,
+        Verified,
     },
     protocol::{
         IdentityKey, IdentityKeyPair, ProtocolAddress, ProtocolStore, SenderCertificate,
@@ -64,6 +65,7 @@ pub enum StorageRecordKey {
     Contact(ServiceId),
     GroupV2(GroupMasterKeyBytes),
     ChatFolder(Uuid),
+    StickerPack(Vec<u8>),
 }
 
 impl StorageRecordKey {
@@ -73,6 +75,7 @@ impl StorageRecordKey {
             Self::Contact(_) => manifest_record::identifier::Type::Contact,
             Self::GroupV2(_) => manifest_record::identifier::Type::Groupv2,
             Self::ChatFolder(_) => manifest_record::identifier::Type::ChatFolder,
+            Self::StickerPack(_) => manifest_record::identifier::Type::StickerPack,
         }
     }
 }
@@ -103,6 +106,65 @@ pub struct StorageRecordIdentity {
     pub storage_version: u64,
     /// Decrypted `StorageRecord` plaintext, exactly as the server holds it.
     pub record: Vec<u8>,
+}
+
+/// What this device wants the account's storage-service record for a sticker
+/// pack to say.
+///
+/// A `StickerPackRecord` is one or the other, never both: an installed pack
+/// carries its key and position and no deletion time, a removed one carries
+/// only the time it was removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StickerPackRecordState {
+    Installed { key: Vec<u8>, position: u32 },
+    Removed { deleted_at_ms: u64 },
+}
+
+impl StickerPackRecordState {
+    /// Whether a record that says `held` already says this. Two tombstones
+    /// agree whatever their times: the one on the account may have been written
+    /// by another device, and a removal is not made any truer by moving it.
+    pub fn published_as(&self, held: &Self) -> bool {
+        self == held || matches!((self, held), (Self::Removed { .. }, Self::Removed { .. }))
+    }
+
+    /// The record that says this about pack `id`.
+    pub fn to_record(&self, id: &[u8]) -> StickerPackRecord {
+        let pack_id = id.to_vec();
+        match self {
+            Self::Installed { key, position } => StickerPackRecord {
+                pack_id,
+                pack_key: key.clone(),
+                position: *position,
+                deleted_at_timestamp: 0,
+            },
+            Self::Removed { deleted_at_ms } => StickerPackRecord {
+                pack_id,
+                pack_key: Vec::new(),
+                position: 0,
+                deleted_at_timestamp: *deleted_at_ms,
+            },
+        }
+    }
+}
+
+/// Signal-Desktop's `mergeStickerPackRecord` reading of a record: a non-zero
+/// `deletedAtTimestamp` is a removal whatever else the record carries — a
+/// tombstone is meant to have no key or position — and anything else is an
+/// installed pack.
+impl From<StickerPackRecord> for StickerPackRecordState {
+    fn from(record: StickerPackRecord) -> Self {
+        if record.deleted_at_timestamp != 0 {
+            Self::Removed {
+                deleted_at_ms: record.deleted_at_timestamp,
+            }
+        } else {
+            Self::Installed {
+                key: record.pack_key,
+                position: record.position,
+            }
+        }
+    }
 }
 
 /// Stores the registered state of the manager
@@ -802,6 +864,51 @@ pub trait ContentsStore: Send + Sync {
         &self,
     ) -> impl Future<Output = Result<Vec<StickerPackPointer>, Self::ContentsStoreError>> + Send
     {
+        async { Ok(Vec::new()) }
+    }
+
+    /// What the account's record for this pack should say, read when a pending
+    /// change is published. `None` for a pack this device has nothing to say
+    /// about — one it never installed or removed — which publishes nothing.
+    fn sticker_pack_record_state(
+        &self,
+        _id: &[u8],
+    ) -> impl Future<Output = Result<Option<StickerPackRecordState>, Self::ContentsStoreError>> + Send
+    {
+        async { Ok(None) }
+    }
+
+    /// Where this pack's storage-service record lives, if we have ever read or
+    /// written it. Same contract as the contact, group and chat folder twins.
+    fn sticker_pack_storage_identity(
+        &self,
+        _id: &[u8],
+    ) -> impl Future<Output = Result<Option<StorageRecordIdentity>, Self::ContentsStoreError>> + Send
+    {
+        async { Ok(None) }
+    }
+
+    fn save_sticker_pack_storage_identity(
+        &mut self,
+        _id: &[u8],
+        _identity: &StorageRecordIdentity,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// The durable half of a pack publish, exactly as for contacts and groups.
+    fn set_sticker_pack_needs_storage_sync(
+        &mut self,
+        _id: &[u8],
+        _needs_sync: bool,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Every sticker pack with an unpublished install or removal.
+    fn sticker_packs_needing_storage_sync(
+        &self,
+    ) -> impl Future<Output = Result<Vec<Vec<u8>>, Self::ContentsStoreError>> + Send {
         async { Ok(Vec::new()) }
     }
 }
