@@ -1510,11 +1510,20 @@ impl<S: Store> Manager<S, Registered> {
                                                 ..
                                             },
                                         ) => ServiceId::parse_from_service_id_string(address.name())
-                                            .map(|sender| (sender, address.device_id(), original)),
+                                            .map(|sender| RetryContext {
+                                                sender,
+                                                sender_device: address.device_id(),
+                                                original,
+                                            }),
                                         _ => session_retry_context(&envelope),
                                     };
 
-                                    if let Some((sender, sender_device, original)) = retry {
+                                    if let Some(RetryContext {
+                                        sender,
+                                        sender_device,
+                                        original,
+                                    }) = retry
+                                    {
                                         return Some((
                                             Received::DecryptionError {
                                                 sender,
@@ -2885,23 +2894,25 @@ impl<S: Store> Manager<S, Registered> {
 
 /// What a 1:1 retry receipt needs about an envelope we could not open.
 ///
-/// Returns the sender, the sending device, and the ciphertext we failed to
-/// decrypt together with its type, from which
-/// [`Received::DecryptionError`] is built.  The ciphertext is what makes
-/// the receipt useful: the ratchet key is read back out of it, and the peer
-/// only resets the session when the receipt names a ratchet key it recognises.
+/// The sender, the sending device, and the ciphertext we failed to decrypt
+/// together with its type, from which [`Received::DecryptionError`] is built.
+/// The ciphertext is what makes the receipt useful: the ratchet key is read back
+/// out of it, and the peer only resets the session when the receipt names a
+/// ratchet key it recognises.  `original` is absent when decryption failed
+/// before the payload was reached, in which case no receipt can be built.
+struct RetryContext {
+    sender: ServiceId,
+    sender_device: DeviceId,
+    original: Option<(CiphertextMessageType, Vec<u8>)>,
+}
+
+/// The retry context of an envelope whose unsealed ciphertext we could not open.
 ///
 /// `None` for every envelope that is not an unsealed 1:1 message.  A sealed
 /// sender envelope hides its inner ciphertext behind a layer we did not open
 /// either, and is reported as a sender-key failure instead; every other type is
 /// not a 1:1 message at all.
-fn session_retry_context(
-    envelope: &libsignal_service::proto::Envelope,
-) -> Option<(
-    ServiceId,
-    DeviceId,
-    Option<(CiphertextMessageType, Vec<u8>)>,
-)> {
+fn session_retry_context(envelope: &libsignal_service::proto::Envelope) -> Option<RetryContext> {
     use libsignal_service::proto::envelope::Type;
 
     let original_type = match envelope.r#type() {
@@ -2914,11 +2925,11 @@ fn session_retry_context(
     let sender_device = DeviceId::try_from(envelope.source_device_id()).ok()?;
     let original_ciphertext = envelope.content.clone()?;
 
-    Some((
+    Some(RetryContext {
         sender,
         sender_device,
-        Some((original_type, original_ciphertext)),
-    ))
+        original: Some((original_type, original_ciphertext)),
+    })
 }
 
 /// Build the `Blocked` sync payload from locally-stored blocked contacts.
