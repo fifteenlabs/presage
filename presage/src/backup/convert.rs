@@ -303,6 +303,73 @@ fn chat_item_arrival_ms(item: &ChatItem) -> u64 {
 ///
 /// `group_ops` caches the group operations per master key across the import;
 /// deriving them is elliptic-curve work, and a backup has many rows per group.
+/// Holds a group change back so that the items a primary wrote for one
+/// group state change import as the single batch the wire carried.
+///
+/// Desktop exports a batched change as one item with one update per
+/// action. The phone apps export one item per action, every one of them
+/// at the instant of the change, from the same author, in the same chat.
+/// Stored rows are keyed by thread, time and sender, so those items would
+/// overwrite each other and only the last member added would survive.
+/// Absorbing the run into its first item gives both exports the same shape.
+///
+/// `next` is absorbed into `pending` when both are group changes of the
+/// same chat, author and instant. Otherwise the caller gets back whatever
+/// is now ready to import, in order: the pending item, if a different item
+/// ended its run, and `next` itself unless it starts a run of its own.
+pub fn coalesce_group_changes(pending: &mut Option<ChatItem>, next: ChatItem) -> Vec<ChatItem> {
+    let mut ready = Vec::new();
+    match pending.take() {
+        Some(mut held) if same_group_change_run(&held, &next) => {
+            if let (Some(into), Some(from)) = (
+                group_change_updates_mut(&mut held),
+                group_change_updates(&next),
+            ) {
+                into.extend(from.iter().cloned());
+            }
+            *pending = Some(held);
+            return ready;
+        }
+        Some(held) => ready.push(held),
+        None => {}
+    }
+    if group_change_updates(&next).is_some() {
+        *pending = Some(next);
+    } else {
+        ready.push(next);
+    }
+    ready
+}
+
+fn same_group_change_run(held: &ChatItem, next: &ChatItem) -> bool {
+    held.chat_id == next.chat_id
+        && held.author_id == next.author_id
+        && held.date_sent == next.date_sent
+        && group_change_updates(next).is_some()
+}
+
+fn group_change_updates(item: &ChatItem) -> Option<&Vec<backup::group_change_chat_update::Update>> {
+    use backup::chat_update_message::Update;
+    match item.item.as_ref()? {
+        Item::UpdateMessage(backup::ChatUpdateMessage {
+            update: Some(Update::GroupChange(gc)),
+        }) => Some(&gc.updates),
+        _ => None,
+    }
+}
+
+fn group_change_updates_mut(
+    item: &mut ChatItem,
+) -> Option<&mut Vec<backup::group_change_chat_update::Update>> {
+    use backup::chat_update_message::Update;
+    match item.item.as_mut()? {
+        Item::UpdateMessage(backup::ChatUpdateMessage {
+            update: Some(Update::GroupChange(gc)),
+        }) => Some(&mut gc.updates),
+        _ => None,
+    }
+}
+
 pub fn chat_item_to_contents(
     item: &ChatItem,
     recipients: &HashMap<u64, RecipientInfo>,
@@ -1508,6 +1575,41 @@ mod tests {
             "{:?}",
             changes.changes
         );
+    }
+
+    #[test]
+    fn one_item_per_member_at_the_same_instant_coalesces_into_a_batch() {
+        let first = update_item(20, 1, group_update(member_added(our_aci(), peer())));
+        let second = update_item(20, 1, group_update(member_added(our_aci(), second_peer())));
+        let mut later = update_item(20, 1, group_update(member_added(our_aci(), peer())));
+        later.date_sent += 1;
+        let text = update_item(20, 1, ChatUpdate::ExpirationTimerChange(Default::default()));
+
+        let mut pending = None;
+        assert!(coalesce_group_changes(&mut pending, first).is_empty());
+        assert!(coalesce_group_changes(&mut pending, second).is_empty());
+
+        let ready = coalesce_group_changes(&mut pending, later);
+        assert_eq!(ready.len(), 1, "a later instant ends the run");
+        let (_, dm) = imported_update(&ready[0]);
+        let changes = decrypted(&dm);
+        assert!(
+            matches!(
+                changes.changes.as_slice(),
+                [GroupChange::NewMember(a), GroupChange::NewMember(b)]
+                    if a.aci == peer() && b.aci == second_peer()
+            ),
+            "{:?}",
+            changes.changes
+        );
+
+        let ready = coalesce_group_changes(&mut pending, text);
+        assert_eq!(
+            ready.len(),
+            2,
+            "a non-group item flushes the run and passes through itself"
+        );
+        assert!(pending.is_none());
     }
 
     #[test]
