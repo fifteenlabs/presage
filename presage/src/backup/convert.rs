@@ -422,9 +422,9 @@ fn update_row(
 /// Rebuilds a backup group update as the `DataMessage` a live member would
 /// have received for it: a `GroupContextV2` carrying the change, encrypted
 /// under the group's own key, from the member who made it. A batch of
-/// updates yields one row for its first update — the row is keyed by thread,
-/// time and sender, so a batch could never be more than one row, and a live
-/// client renders the first change it recognises in a batch too.
+/// updates is one row, as it is one message live: the row is keyed by
+/// thread, time and sender, and the change it carries holds every update's
+/// actions, so the reader renders one line per change.
 fn group_change_data_message(
     gc: &backup::GroupChangeChatUpdate,
     thread: &Thread,
@@ -435,10 +435,12 @@ fn group_change_data_message(
     let Thread::Group(master_key) = thread else {
         return None;
     };
-    let update = gc.updates.first()?;
+    if gc.updates.is_empty() {
+        return None;
+    }
     let ops = group_ops_for(group_ops, *master_key);
     let fallback_editor = author.aci().unwrap_or(our_aci);
-    let (editor, update) = plan_group_update(update, ops, our_aci, fallback_editor)?;
+    let (editor, update) = plan_group_update(&gc.updates, ops, our_aci, fallback_editor)?;
     let (revision, group_change) = match update {
         GroupUpdate::Created => (Some(0), None),
         GroupUpdate::Change(change) => (None, Some(change)),
@@ -1423,11 +1425,109 @@ mod tests {
     }
 
     fn group_update(update: GroupUpdateKind) -> ChatUpdate {
+        group_updates(vec![update])
+    }
+
+    fn group_updates(updates: Vec<GroupUpdateKind>) -> ChatUpdate {
         ChatUpdate::GroupChange(backup::GroupChangeChatUpdate {
-            updates: vec![backup::group_change_chat_update::Update {
-                update: Some(update),
-            }],
+            updates: updates
+                .into_iter()
+                .map(|update| backup::group_change_chat_update::Update {
+                    update: Some(update),
+                })
+                .collect(),
         })
+    }
+
+    fn member_added(updater: Aci, new_member: Aci) -> GroupUpdateKind {
+        GroupUpdateKind::GroupMemberAddedUpdate(backup::GroupMemberAddedUpdate {
+            updater_aci: Some(Uuid::from(updater).into_bytes().to_vec()),
+            new_member_aci: Uuid::from(new_member).into_bytes().to_vec(),
+            ..Default::default()
+        })
+    }
+
+    /// A second "other person", for batches that name more than one.
+    fn second_peer() -> Aci {
+        Aci::from(Uuid::from_bytes([10u8; 16]))
+    }
+
+    fn invitee(aci: Aci) -> backup::group_invitation_revoked_update::Invitee {
+        backup::group_invitation_revoked_update::Invitee {
+            invitee_aci: Some(Uuid::from(aci).into_bytes().to_vec()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_batched_member_add_keeps_every_member() {
+        let item = update_item(
+            20,
+            1,
+            group_updates(vec![
+                member_added(our_aci(), peer()),
+                member_added(our_aci(), second_peer()),
+            ]),
+        );
+        let (_, dm) = imported_update(&item);
+        let changes = decrypted(&dm);
+        assert_eq!(changes.editor, our_aci());
+        assert!(
+            matches!(
+                changes.changes.as_slice(),
+                [GroupChange::NewMember(a), GroupChange::NewMember(b)]
+                    if a.aci == peer() && b.aci == second_peer()
+            ),
+            "{:?}",
+            changes.changes
+        );
+    }
+
+    #[test]
+    fn a_mixed_batch_merges_actions_and_takes_the_last_named_editor() {
+        let item = update_item(
+            20,
+            1,
+            group_updates(vec![
+                member_added(peer(), second_peer()),
+                GroupUpdateKind::GroupNameUpdate(backup::GroupNameUpdate {
+                    updater_aci: Some(Uuid::from(our_aci()).into_bytes().to_vec()),
+                    new_group_name: Some("renamed".to_string()),
+                }),
+            ]),
+        );
+        let (_, dm) = imported_update(&item);
+        let changes = decrypted(&dm);
+        assert_eq!(changes.editor, our_aci());
+        assert!(
+            matches!(
+                changes.changes.as_slice(),
+                [GroupChange::NewMember(m), GroupChange::Title(t)]
+                    if m.aci == second_peer() && t == "renamed"
+            ),
+            "{:?}",
+            changes.changes
+        );
+    }
+
+    #[test]
+    fn a_batched_invitation_revoke_removes_every_invitee() {
+        let (_, dm) = imported_group_update(GroupUpdateKind::GroupInvitationRevokedUpdate(
+            backup::GroupInvitationRevokedUpdate {
+                updater_aci: Some(Uuid::from(our_aci()).into_bytes().to_vec()),
+                invitees: vec![invitee(peer()), invitee(second_peer())],
+            },
+        ));
+        let changes = decrypted(&dm);
+        assert!(
+            matches!(
+                changes.changes.as_slice(),
+                [GroupChange::DeletePendingMember(a), GroupChange::DeletePendingMember(b)]
+                    if *a == ServiceId::from(peer()) && *b == ServiceId::from(second_peer())
+            ),
+            "{:?}",
+            changes.changes
+        );
     }
 
     /// The one row an update imports as.

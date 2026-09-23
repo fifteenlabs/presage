@@ -53,39 +53,132 @@ pub fn group_operations(master_key: [u8; 32]) -> GroupOperations {
     ))
 }
 
-/// Maps one backup group update to its wire form and the member who made
-/// it. Every update maps to something: the kinds the wire cannot express
-/// become a change with no actions, and an update whose participant the
-/// backup left out keeps its editor and loses only the actions.
+/// Maps one backup group change — a batch of one or more updates that came
+/// from a single group state change — to its wire form and the member who
+/// made it. Every update maps to something: the kinds the wire cannot
+/// express become a change with no actions, and an update whose participant
+/// the backup left out keeps its editor and loses only the actions. The
+/// batch encrypts as one change carrying every update's actions, which the
+/// decoder reads back as one change per action, so an add of three people
+/// renders as three rows, as it does live.
 ///
 /// The editor is the person whose act the row describes: the updater where
 /// the backup names one, and the member themself for the events a member
 /// performs on their own behalf (leaving, joining, requesting, declining) —
 /// that distinction is what lets a row read "You left the group" rather
-/// than name a stranger. `fallback_editor` stands in when the backup names
-/// nobody.
+/// than name a stranger. A batch has one editor: the last update that names
+/// one, as Desktop's own importer picks it. `fallback_editor` stands in when
+/// the backup names nobody.
 pub fn plan_group_update(
-    update: &backup::group_change_chat_update::Update,
+    updates: &[backup::group_change_chat_update::Update],
     ops: &GroupOperations,
     our_aci: Aci,
     fallback_editor: Aci,
 ) -> Option<(Aci, GroupUpdate)> {
-    if let Some(Update::GroupCreationUpdate(u)) = update.update.as_ref() {
+    let creation = updates
+        .iter()
+        .find_map(|update| match update.update.as_ref() {
+            Some(Update::GroupCreationUpdate(u)) => Some(u),
+            _ => None,
+        });
+    if let Some(u) = creation {
         return Some((
             aci(&u.updater_aci).unwrap_or(fallback_editor),
             GroupUpdate::Created,
         ));
     }
-    let (editor, actions) = match update.update.as_ref() {
-        Some(update) => plan(update, ops, our_aci),
-        None => (None, None),
-    };
+    let mut editor = None;
+    let mut merged = Actions::default();
+    for update in updates.iter().filter_map(|update| update.update.as_ref()) {
+        let (update_editor, actions) = plan(update, ops, our_aci);
+        editor = update_editor.or(editor);
+        if let Some(actions) = actions {
+            merge_actions(&mut merged, actions);
+        }
+    }
     let editor = editor.unwrap_or(fallback_editor);
     let change = ops
-        .encrypt_group_change(editor, actions.unwrap_or_default())
+        .encrypt_group_change(editor, merged)
         .ok()?
         .encode_to_vec();
     Some((editor, GroupUpdate::Change(change)))
+}
+
+/// Folds one update's actions into the batch's. Repeated fields
+/// concatenate; a singular field takes the later value, as the wire would
+/// after two edits. Every field is named so a new one fails to compile here
+/// rather than being dropped. `source_user_id` and `group_id` are stamped
+/// by `encrypt_group_change`, and `version` stays at its default.
+fn merge_actions(into: &mut Actions, from: Actions) {
+    let Actions {
+        source_user_id: _,
+        group_id: _,
+        version: _,
+        add_members,
+        delete_members,
+        modify_member_roles,
+        modify_member_profile_keys,
+        add_members_pending_profile_key,
+        delete_members_pending_profile_key,
+        promote_members_pending_profile_key,
+        modify_title,
+        modify_avatar,
+        modify_disappearing_message_timer,
+        modify_attributes_access,
+        modify_member_access,
+        modify_add_from_invite_link_access,
+        add_members_pending_admin_approval,
+        delete_members_pending_admin_approval,
+        promote_members_pending_admin_approval,
+        modify_invite_link_password,
+        modify_description,
+        modify_announcements_only,
+        add_members_banned,
+        delete_members_banned,
+        promote_members_pending_pni_aci_profile_key,
+        modify_member_labels,
+        modify_member_label_access,
+        terminate_group,
+    } = from;
+    into.add_members.extend(add_members);
+    into.delete_members.extend(delete_members);
+    into.modify_member_roles.extend(modify_member_roles);
+    into.modify_member_profile_keys
+        .extend(modify_member_profile_keys);
+    into.add_members_pending_profile_key
+        .extend(add_members_pending_profile_key);
+    into.delete_members_pending_profile_key
+        .extend(delete_members_pending_profile_key);
+    into.promote_members_pending_profile_key
+        .extend(promote_members_pending_profile_key);
+    into.add_members_pending_admin_approval
+        .extend(add_members_pending_admin_approval);
+    into.delete_members_pending_admin_approval
+        .extend(delete_members_pending_admin_approval);
+    into.promote_members_pending_admin_approval
+        .extend(promote_members_pending_admin_approval);
+    into.add_members_banned.extend(add_members_banned);
+    into.delete_members_banned.extend(delete_members_banned);
+    into.promote_members_pending_pni_aci_profile_key
+        .extend(promote_members_pending_pni_aci_profile_key);
+    into.modify_member_labels.extend(modify_member_labels);
+    into.modify_title = modify_title.or(into.modify_title.take());
+    into.modify_avatar = modify_avatar.or(into.modify_avatar.take());
+    into.modify_disappearing_message_timer =
+        modify_disappearing_message_timer.or(into.modify_disappearing_message_timer.take());
+    into.modify_attributes_access =
+        modify_attributes_access.or(into.modify_attributes_access.take());
+    into.modify_member_access = modify_member_access.or(into.modify_member_access.take());
+    into.modify_add_from_invite_link_access =
+        modify_add_from_invite_link_access.or(into.modify_add_from_invite_link_access.take());
+    into.modify_invite_link_password =
+        modify_invite_link_password.or(into.modify_invite_link_password.take());
+    into.modify_description = modify_description.or(into.modify_description.take());
+    into.modify_announcements_only =
+        modify_announcements_only.or(into.modify_announcements_only.take());
+    into.modify_member_label_access =
+        modify_member_label_access.or(into.modify_member_label_access.take());
+    into.terminate_group = terminate_group.or(into.terminate_group.take());
 }
 
 /// The editor the backup names, if any, and the actions of the change —
@@ -230,14 +323,17 @@ fn plan(update: &Update, ops: &GroupOperations, our_aci: Aci) -> (Option<Aci>, O
             remove_pending_member(ops, our_aci.into()),
         ),
         Update::GroupInvitationRevokedUpdate(u) => {
-            let invitee = u.invitees.iter().find_map(|invitee| {
+            let mut invitees = u.invitees.iter().filter_map(|invitee| {
                 aci(&invitee.invitee_aci)
                     .map(ServiceId::from)
                     .or_else(|| pni(&invitee.invitee_pni).map(ServiceId::from))
             });
             actions(
                 aci(&u.updater_aci),
-                invitee.and_then(|invitee| remove_pending_member(ops, invitee)),
+                invitees.try_fold(Actions::default(), |mut all, invitee| {
+                    merge_actions(&mut all, remove_pending_member(ops, invitee)?);
+                    Some(all)
+                }),
             )
         }
         Update::GroupJoinRequestUpdate(u) => {
