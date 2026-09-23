@@ -72,7 +72,7 @@ use url::Url;
 
 use crate::backup::{
     convert::{self, RecipientInfo},
-    BackupImportProgress, Frame, FrameItem, TransferArchive,
+    BackupImportProgress, ChatItem, Frame, FrameItem, TransferArchive,
 };
 use crate::model::calls::{extract_call_event, CallPeer};
 use crate::model::contacts::Contact;
@@ -2600,58 +2600,73 @@ impl<S: Store> Manager<S, Registered> {
     ) -> Result<bool, Error<S::Error>> {
         let aci = Aci::from_uuid_bytes(self.state.data.service_ids.aci.into_bytes());
 
-        let (stream, total_bytes, path, download_offset, message_backup_key) =
-            if let Some(message_backup_key) = ephemeral_key {
-                let archive = match self.store.fetch_transfer_archive().await? {
-                    Some(cached) => cached,
-                    None => {
-                        on_progress(BackupImportProgress::WaitingForUpload);
-                        let mut svc = self.state.identified_push_service();
-                        match svc
-                            .get_transfer_archive(std::time::Duration::from_secs(3600))
-                            .await?
-                        {
-                            TransferArchiveResult::Available { cdn, key } => {
-                                let archive = TransferArchive {
-                                    cdn,
-                                    key,
-                                    path: crate::backup::random_backup_path(),
-                                };
-                                self.store.store_transfer_archive(Some(&archive)).await?;
-                                archive
-                            }
-                            TransferArchiveResult::Error {
-                                error: TransferArchiveError::RelinkRequested,
-                            } => return Err(Error::BackupRelinkRequested),
-                            TransferArchiveResult::Error {
-                                error: TransferArchiveError::ContinueWithoutUpload,
-                            } => return Ok(false),
+        let (stream, total_bytes, path, download_offset, message_backup_key) = if let Some(
+            message_backup_key,
+        ) = ephemeral_key
+        {
+            let archive = match self.store.fetch_transfer_archive().await? {
+                Some(cached) => {
+                    info!(
+                        cdn = cached.cdn,
+                        "backup import: resuming a cached transfer archive"
+                    );
+                    cached
+                }
+                None => {
+                    on_progress(BackupImportProgress::WaitingForUpload);
+                    let mut svc = self.state.identified_push_service();
+                    match svc
+                        .get_transfer_archive(std::time::Duration::from_secs(3600))
+                        .await?
+                    {
+                        TransferArchiveResult::Available { cdn, key } => {
+                            info!(
+                                cdn,
+                                "backup import: the primary uploaded a transfer archive"
+                            );
+                            let archive = TransferArchive {
+                                cdn,
+                                key,
+                                path: crate::backup::random_backup_path(),
+                            };
+                            self.store.store_transfer_archive(Some(&archive)).await?;
+                            archive
+                        }
+                        TransferArchiveResult::Error {
+                            error: TransferArchiveError::RelinkRequested,
+                        } => return Err(Error::BackupRelinkRequested),
+                        TransferArchiveResult::Error {
+                            error: TransferArchiveError::ContinueWithoutUpload,
+                        } => {
+                            info!("backup import: the primary chose to continue without uploading history");
+                            return Ok(false);
                         }
                     }
-                };
-                let download_offset = match tokio::fs::metadata(&archive.path).await {
-                    Ok(m) => m.len(),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-                    Err(e) => return Err(e.into()),
-                };
-                let mut svc = self.state.identified_push_service();
-                let (stream, total_bytes) = svc
-                    .download_transfer_archive(archive.cdn, &archive.key, download_offset)
-                    .await?;
-                (
-                    stream,
-                    total_bytes,
-                    archive.path,
-                    download_offset,
-                    message_backup_key,
-                )
-            } else {
-                // Regular backup restore needs a different download path — equivalent
-                // to Signal Desktop's api.download() with ZKP credentials, not
-                // api.downloadEphemeral() which is used for Link & Sync.
-                warn!("regular (non-ephemeral) backup restore is not yet implemented");
-                return Ok(false);
+                }
             };
+            let download_offset = match tokio::fs::metadata(&archive.path).await {
+                Ok(m) => m.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(e) => return Err(e.into()),
+            };
+            let mut svc = self.state.identified_push_service();
+            let (stream, total_bytes) = svc
+                .download_transfer_archive(archive.cdn, &archive.key, download_offset)
+                .await?;
+            (
+                stream,
+                total_bytes,
+                archive.path,
+                download_offset,
+                message_backup_key,
+            )
+        } else {
+            // Regular backup restore needs a different download path — equivalent
+            // to Signal Desktop's api.download() with ZKP credentials, not
+            // api.downloadEphemeral() which is used for Link & Sync.
+            warn!("regular (non-ephemeral) backup restore is not yet implemented");
+            return Ok(false);
+        };
 
         self.write_archive_to_file(&path, stream, total_bytes, download_offset, &on_progress)
             .await?;
@@ -2756,6 +2771,9 @@ impl<S: Store> Manager<S, Registered> {
         let mut recipients: HashMap<u64, RecipientInfo> = HashMap::new();
         let mut chats: HashMap<u64, Thread> = HashMap::new();
         let mut group_ops = HashMap::new();
+        let mut pending_group_change: Option<ChatItem> = None;
+        let mut chat_items = 0usize;
+        let mut rows = 0usize;
 
         while let Some(bytes) = reader
             .read_next()
@@ -2829,49 +2847,11 @@ impl<S: Store> Manager<S, Registered> {
                     }
                 }
                 Some(FrameItem::ChatItem(ci)) => {
-                    for convert::ImportedContent {
-                        content,
-                        thread,
-                        received_at_ms,
-                    } in convert::chat_item_to_contents(
-                        &ci,
-                        &recipients,
-                        &chats,
-                        &mut group_ops,
-                        aci,
-                    ) {
-                        // Synthesised sync `call_event` rows route through
-                        // `ingest_call_event` so the same load + state machine +
-                        // save pipeline runs for backup and live events alike.
-                        // The converter built this proto upstream from typed
-                        // backup data — `extract_call_event` reverses that to
-                        // hand the state machine its `CallEventInfo`.
-                        let call_info = extract_call_event(&content.body);
-                        let call_peer = CallPeer::from_thread(&thread);
-                        self.store
-                            .save_message_received_at(&thread, content, received_at_ms)
+                    chat_items += 1;
+                    for item in convert::coalesce_group_changes(&mut pending_group_change, ci) {
+                        rows += self
+                            .import_chat_item(item, &recipients, &chats, &mut group_ops, aci)
                             .await?;
-                        if let (Some(info), Some(peer)) = (call_info, call_peer) {
-                            self.store.ingest_call_event(&info, &peer).await?;
-                        }
-                    }
-                    // Restore read / delivery state — neither of which the wire
-                    // `Content` can carry — so linked history shows correct
-                    // unread badges and outgoing ticks. Arrival time came in
-                    // with the row itself, above.
-                    if let Some(state) = convert::chat_item_backup_state(&ci, &recipients, &chats) {
-                        if let Err(e) = self
-                            .store
-                            .restore_backup_message_state(
-                                &state.thread,
-                                state.ts,
-                                state.read,
-                                &state.send_states,
-                            )
-                            .await
-                        {
-                            warn!(%e, "backup import: failed to restore message state");
-                        }
                     }
                 }
                 Some(FrameItem::StickerPack(pack)) => {
@@ -2888,7 +2868,73 @@ impl<S: Store> Manager<S, Registered> {
                 _ => {}
             }
         }
+        if let Some(item) = pending_group_change.take() {
+            rows += self
+                .import_chat_item(item, &recipients, &chats, &mut group_ops, aci)
+                .await?;
+        }
+        info!(
+            recipients = recipients.len(),
+            chats = chats.len(),
+            chat_items,
+            rows,
+            "backup import: frames processed"
+        );
         Ok(())
+    }
+
+    /// Stores one backup chat item as the rows the live path would have
+    /// stored for it, and returns how many rows that was.
+    async fn import_chat_item(
+        &mut self,
+        item: ChatItem,
+        recipients: &HashMap<u64, RecipientInfo>,
+        chats: &HashMap<u64, Thread>,
+        group_ops: &mut HashMap<[u8; 32], GroupOperations>,
+        aci: libsignal_service::protocol::Aci,
+    ) -> Result<usize, Error<S::Error>> {
+        let mut rows = 0;
+        for convert::ImportedContent {
+            content,
+            thread,
+            received_at_ms,
+        } in convert::chat_item_to_contents(&item, recipients, chats, group_ops, aci)
+        {
+            // Synthesised sync `call_event` rows route through
+            // `ingest_call_event` so the same load + state machine +
+            // save pipeline runs for backup and live events alike.
+            // The converter built this proto upstream from typed
+            // backup data — `extract_call_event` reverses that to
+            // hand the state machine its `CallEventInfo`.
+            let call_info = extract_call_event(&content.body);
+            let call_peer = CallPeer::from_thread(&thread);
+            rows += 1;
+            self.store
+                .save_message_received_at(&thread, content, received_at_ms)
+                .await?;
+            if let (Some(info), Some(peer)) = (call_info, call_peer) {
+                self.store.ingest_call_event(&info, &peer).await?;
+            }
+        }
+        // Restore read / delivery state — neither of which the wire
+        // `Content` can carry — so linked history shows correct
+        // unread badges and outgoing ticks. Arrival time came in
+        // with the row itself, above.
+        if let Some(state) = convert::chat_item_backup_state(&item, recipients, chats) {
+            if let Err(e) = self
+                .store
+                .restore_backup_message_state(
+                    &state.thread,
+                    state.ts,
+                    state.read,
+                    &state.send_states,
+                )
+                .await
+            {
+                warn!(%e, "backup import: failed to restore message state");
+            }
+        }
+        Ok(rows)
     }
 }
 
