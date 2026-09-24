@@ -1963,10 +1963,9 @@ mod tests {
         assert_eq!(sender, ServiceId::Aci(our_aci()));
     }
 
-    fn pinned(
-        mut item: ChatItem,
-        expiry: Option<backup::chat_item::pin_details::PinExpiry>,
-    ) -> ChatItem {
+    use backup::chat_item::pin_details::PinExpiry;
+
+    fn pinned(mut item: ChatItem, expiry: Option<PinExpiry>) -> ChatItem {
         item.item = Some(Item::StandardMessage(backup::StandardMessage::default()));
         item.pin_details = Some(backup::chat_item::PinDetails {
             pinned_at_timestamp: 1700000005000,
@@ -1981,8 +1980,6 @@ mod tests {
 
     #[test]
     fn a_pin_addresses_the_row_the_import_stored() {
-        use backup::chat_item::pin_details::PinExpiry;
-
         let item = pinned(
             incoming_item(),
             Some(PinExpiry::PinExpiresAtTimestamp(1700000009000)),
@@ -1998,8 +1995,6 @@ mod tests {
 
     #[test]
     fn an_outgoing_pin_is_ours_and_an_unset_expiry_never_expires() {
-        use backup::chat_item::pin_details::PinExpiry;
-
         let mut item = pinned(incoming_item(), Some(PinExpiry::PinNeverExpires(true)));
         item.directional_details = Some(DirectionalDetails::Outgoing(Default::default()));
         let pin = pin_of(&item).expect("pin");
