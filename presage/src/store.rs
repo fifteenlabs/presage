@@ -416,6 +416,25 @@ pub trait ContentsStore: Send + Sync {
         async { Ok(()) }
     }
 
+    /// Restore a message that is pinned on the primary device, decoded from a
+    /// backup `ChatItem.pinDetails`. The message is addressed like the row the
+    /// importer just saved for it: `thread`, its sent timestamp `ts` and its
+    /// `author`. `expires_at_ms` is `None` for a pin that never expires. The
+    /// store applies the same cap and expiry as a live pin, so a pin that has
+    /// lapsed by import time need not be filtered out by the caller. Called
+    /// once per pinned ChatItem that produced a row. Default no-op so stores
+    /// that don't model pins still compile; persistent stores override it.
+    fn restore_backup_pin(
+        &self,
+        _thread: &Thread,
+        _ts: u64,
+        _author: &ServiceId,
+        _pinned_at_ms: u64,
+        _expires_at_ms: Option<u64>,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
     /// Look up the canonical call history entry for a given `call_id`.
     /// Returns `None` when no entry exists for this id.
     ///

@@ -610,6 +610,50 @@ pub fn chat_item_backup_state(
     }
 }
 
+/// A message that is pinned on the primary device, addressed like the row the
+/// importer stored for it.
+pub struct BackupPin {
+    pub thread: Thread,
+    /// The pinned message's sent timestamp.
+    pub ts: u64,
+    /// The pinned message's author — the stored row's sender.
+    pub author: ServiceId,
+    pub pinned_at_ms: u64,
+    /// `None` when the pin never expires.
+    pub expires_at_ms: Option<u64>,
+}
+
+/// Extract the pin a backup `ChatItem` carries, if any. Only message kinds the
+/// importer stores a row for can be pinned here — a pin on anything else would
+/// point at a message this device doesn't have. An unset expiry is read as
+/// never expiring.
+pub fn chat_item_pin(
+    item: &ChatItem,
+    recipients: &HashMap<u64, RecipientInfo>,
+    chats: &HashMap<u64, Thread>,
+    our_aci: Aci,
+) -> Option<BackupPin> {
+    use backup::chat_item::pin_details::PinExpiry;
+
+    let pin = item.pin_details.as_ref()?;
+    if !matches!(
+        item.item,
+        Some(Item::StandardMessage(_) | Item::StickerMessage(_))
+    ) {
+        return None;
+    }
+    Some(BackupPin {
+        thread: chats.get(&item.chat_id).cloned()?,
+        ts: item.date_sent,
+        author: message_sender(item, recipients, our_aci)?,
+        pinned_at_ms: pin.pinned_at_timestamp,
+        expires_at_ms: match pin.pin_expiry {
+            Some(PinExpiry::PinExpiresAtTimestamp(at)) => Some(at),
+            Some(PinExpiry::PinNeverExpires(_)) | None => None,
+        },
+    })
+}
+
 /// Build a `DataMessage` for a backup `StandardMessage` (text + attachments +
 /// quote + link previews), then hand off to the shared envelope/reactions
 /// wrapper.
@@ -678,10 +722,25 @@ fn sticker_message_to_contents(
     )
 }
 
+/// Who sent a message item, as the row stored for it records: ourselves for
+/// outgoing, the resolved author for incoming. `None` for directionless items
+/// and for incoming items whose author can't be resolved — the importer stores
+/// no row for either, so nothing may refer to one.
+fn message_sender(
+    item: &ChatItem,
+    recipients: &HashMap<u64, RecipientInfo>,
+    our_aci: Aci,
+) -> Option<ServiceId> {
+    match item.directional_details.as_ref()? {
+        DirectionalDetails::Outgoing(_) => Some(ServiceId::Aci(our_aci)),
+        DirectionalDetails::Incoming(_) => recipients.get(&item.author_id)?.service_id,
+        DirectionalDetails::Directionless(_) => None,
+    }
+}
+
 /// Wrap a `DataMessage` into a sync (outgoing) or direct (incoming) envelope,
-/// then append per-reaction Contents. Returns `vec![]` for missing
-/// directional details, or for incoming items whose author can't be resolved
-/// to a ServiceId — same drop-cases as the original inline implementation.
+/// then append per-reaction Contents. Returns `vec![]` when
+/// [`message_sender`] has no sender for the item.
 fn wrap_dm_with_reactions(
     dm: DataMessage,
     reactions: &[backup::Reaction],
@@ -691,15 +750,8 @@ fn wrap_dm_with_reactions(
     our_aci: Aci,
     timestamp: u64,
 ) -> Vec<ImportedContent> {
-    let sender = match item.directional_details.as_ref() {
-        Some(DirectionalDetails::Outgoing(_)) => ServiceId::Aci(our_aci),
-        Some(DirectionalDetails::Incoming(_)) => {
-            let Some(sender) = recipients.get(&item.author_id).and_then(|r| r.service_id) else {
-                return vec![];
-            };
-            sender
-        }
-        _ => return vec![],
+    let Some(sender) = message_sender(item, recipients, our_aci) else {
+        return vec![];
     };
 
     let mut results = vec![ImportedContent {
@@ -1909,5 +1961,68 @@ mod tests {
             }),
         ));
         assert_eq!(sender, ServiceId::Aci(our_aci()));
+    }
+
+    fn pinned(
+        mut item: ChatItem,
+        expiry: Option<backup::chat_item::pin_details::PinExpiry>,
+    ) -> ChatItem {
+        item.item = Some(Item::StandardMessage(backup::StandardMessage::default()));
+        item.pin_details = Some(backup::chat_item::PinDetails {
+            pinned_at_timestamp: 1700000005000,
+            pin_expiry: expiry,
+        });
+        item
+    }
+
+    fn pin_of(item: &ChatItem) -> Option<BackupPin> {
+        chat_item_pin(item, &sender_recipients(), &sender_chats(), our_aci())
+    }
+
+    #[test]
+    fn a_pin_addresses_the_row_the_import_stored() {
+        use backup::chat_item::pin_details::PinExpiry;
+
+        let item = pinned(
+            incoming_item(),
+            Some(PinExpiry::PinExpiresAtTimestamp(1700000009000)),
+        );
+        let pin = pin_of(&item).expect("pin");
+        let row = imported_row(&item);
+        assert_eq!(pin.thread, row.thread);
+        assert_eq!(pin.ts, item.date_sent);
+        assert_eq!(pin.author, row.content.metadata.sender);
+        assert_eq!(pin.pinned_at_ms, 1700000005000);
+        assert_eq!(pin.expires_at_ms, Some(1700000009000));
+    }
+
+    #[test]
+    fn an_outgoing_pin_is_ours_and_an_unset_expiry_never_expires() {
+        use backup::chat_item::pin_details::PinExpiry;
+
+        let mut item = pinned(incoming_item(), Some(PinExpiry::PinNeverExpires(true)));
+        item.directional_details = Some(DirectionalDetails::Outgoing(Default::default()));
+        let pin = pin_of(&item).expect("pin");
+        assert_eq!(pin.author, ServiceId::Aci(our_aci()));
+        assert_eq!(pin.expires_at_ms, None);
+
+        let unset = pinned(incoming_item(), None);
+        assert_eq!(pin_of(&unset).expect("pin").expires_at_ms, None);
+    }
+
+    #[test]
+    fn no_pin_without_a_row_to_point_at() {
+        assert!(pin_of(&incoming_item()).is_none(), "not pinned");
+
+        let mut unresolved = pinned(incoming_item(), None);
+        unresolved.author_id = 99;
+        assert!(pin_of(&unresolved).is_none(), "author unresolvable");
+
+        let mut poll = pinned(incoming_item(), None);
+        poll.item = Some(Item::Poll(Default::default()));
+        assert!(
+            pin_of(&poll).is_none(),
+            "kind the importer stores no row for"
+        );
     }
 }

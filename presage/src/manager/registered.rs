@@ -2934,6 +2934,25 @@ impl<S: Store> Manager<S, Registered> {
                 warn!(%e, "backup import: failed to restore message state");
             }
         }
+        // Restore the pin the primary holds on this message, only if its row
+        // was stored above: a pin on a message we don't have has nothing to show.
+        if rows > 0 {
+            if let Some(pin) = convert::chat_item_pin(&item, recipients, chats, aci) {
+                if let Err(e) = self
+                    .store
+                    .restore_backup_pin(
+                        &pin.thread,
+                        pin.ts,
+                        &pin.author,
+                        pin.pinned_at_ms,
+                        pin.expires_at_ms,
+                    )
+                    .await
+                {
+                    warn!(%e, "backup import: failed to restore pin");
+                }
+            }
+        }
         Ok(rows)
     }
 }
