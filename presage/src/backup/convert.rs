@@ -214,6 +214,7 @@ fn backup_sticker_to_dm_sticker(s: &backup::Sticker) -> data_message::Sticker {
 fn reactions_to_contents(
     reactions: &[backup::Reaction],
     parent_item: &ChatItem,
+    parent_timestamp: u64,
     recipients: &HashMap<u64, RecipientInfo>,
     thread: &Thread,
     our_aci: Aci,
@@ -235,7 +236,7 @@ fn reactions_to_contents(
                     remove: Some(false),
                     target_author_aci: Some(parent_author_aci.service_id_string()),
                     target_author_aci_binary: Some(parent_author_aci_bytes.to_vec()),
-                    target_sent_timestamp: Some(parent_item.date_sent),
+                    target_sent_timestamp: Some(parent_timestamp),
                 }),
                 timestamp: Some(reaction.sent_timestamp),
                 ..Default::default()
@@ -271,10 +272,24 @@ pub struct ImportedContent {
     pub received_at_ms: u64,
 }
 
+/// The item that dates a message. An edited message is exported as its
+/// latest version, dated by the edit, with every earlier version under
+/// `revisions`, oldest first — and the oldest is when the message was sent
+/// and arrived. An item nobody edited dates itself.
+fn first_version(item: &ChatItem) -> &ChatItem {
+    item.revisions.first().unwrap_or(item)
+}
+
+/// The sent timestamp a message's row is stored under and addressed by.
+fn chat_item_sent_ms(item: &ChatItem) -> u64 {
+    first_version(item).date_sent
+}
+
 /// When a message reached the exporting device. Only a directional `ChatItem`
 /// records that; a `0` there means the backup left it out, and the send time
 /// stands in, the same substitution migration 17 made for the whole column.
 fn chat_item_arrival_ms(item: &ChatItem) -> u64 {
+    let item = first_version(item);
     let date_received = match item.directional_details.as_ref() {
         Some(DirectionalDetails::Incoming(inc)) => Some(inc.date_received),
         Some(DirectionalDetails::Outgoing(out)) => Some(out.date_received),
@@ -382,7 +397,7 @@ pub fn chat_item_to_contents(
     let Some(thread) = chats.get(&item.chat_id).cloned() else {
         return vec![];
     };
-    let timestamp = item.date_sent;
+    let timestamp = chat_item_sent_ms(item);
 
     match item.item.as_ref() {
         Some(Item::StandardMessage(sm)) => {
@@ -569,7 +584,7 @@ pub fn chat_item_backup_state(
     chats: &HashMap<u64, Thread>,
 ) -> Option<BackupMessageState> {
     let thread = chats.get(&item.chat_id).cloned()?;
-    let ts = item.date_sent;
+    let ts = chat_item_sent_ms(item);
     match item.directional_details.as_ref()? {
         DirectionalDetails::Incoming(inc) => Some(BackupMessageState {
             thread,
@@ -644,13 +659,44 @@ pub fn chat_item_pin(
     }
     Some(BackupPin {
         thread: chats.get(&item.chat_id).cloned()?,
-        ts: item.date_sent,
+        ts: chat_item_sent_ms(item),
         author: message_sender(item, recipients, our_aci)?,
         pinned_at_ms: pin.pinned_at_timestamp,
         expires_at_ms: match pin.pin_expiry {
             Some(PinExpiry::PinExpiresAtTimestamp(at)) => Some(at),
             Some(PinExpiry::PinNeverExpires(_)) | None => None,
         },
+    })
+}
+
+/// The last edit of a message, addressed like the row the importer stored
+/// for it.
+pub struct BackupEdit {
+    pub thread: Thread,
+    /// The sent timestamp of the message as it was first sent.
+    pub ts: u64,
+    /// The edited message's author — the stored row's sender.
+    pub author: ServiceId,
+    /// When the version the row holds was sent.
+    pub edited_at_ms: u64,
+}
+
+/// Extract the edit a backup `ChatItem` carries, if any. Only a standard
+/// message is both editable and stored by the importer.
+pub fn chat_item_edit(
+    item: &ChatItem,
+    recipients: &HashMap<u64, RecipientInfo>,
+    chats: &HashMap<u64, Thread>,
+    our_aci: Aci,
+) -> Option<BackupEdit> {
+    if item.revisions.is_empty() || !matches!(item.item, Some(Item::StandardMessage(_))) {
+        return None;
+    }
+    Some(BackupEdit {
+        thread: chats.get(&item.chat_id).cloned()?,
+        ts: chat_item_sent_ms(item),
+        author: message_sender(item, recipients, our_aci)?,
+        edited_at_ms: item.date_sent,
     })
 }
 
@@ -760,7 +806,7 @@ fn wrap_dm_with_reactions(
         received_at_ms: chat_item_arrival_ms(item),
     }];
     results.extend(reactions_to_contents(
-        reactions, item, recipients, thread, our_aci,
+        reactions, item, timestamp, recipients, thread, our_aci,
     ));
     results
 }
@@ -1961,6 +2007,111 @@ mod tests {
             }),
         ));
         assert_eq!(sender, ServiceId::Aci(our_aci()));
+    }
+
+    fn text_message(body: &str) -> Item {
+        Item::StandardMessage(backup::StandardMessage {
+            text: Some(backup::Text {
+                body: body.to_string(),
+                body_ranges: Vec::new(),
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// `incoming_item` sent at 1700000000000, then edited an hour later.
+    fn edited_item() -> ChatItem {
+        let mut first = incoming_item();
+        first.item = Some(text_message("first"));
+
+        let mut item = incoming_item();
+        item.date_sent = 1700003600000;
+        if let Some(DirectionalDetails::Incoming(incoming)) = item.directional_details.as_mut() {
+            incoming.date_received = 1700003600001;
+        }
+        item.item = Some(text_message("edited"));
+        item.revisions = vec![first];
+        item
+    }
+
+    fn edit_of(item: &ChatItem) -> Option<BackupEdit> {
+        chat_item_edit(item, &sender_recipients(), &sender_chats(), our_aci())
+    }
+
+    /// A backup exports an edited message as its latest version, dated by the
+    /// edit. Importing it under that date moves the message to where the
+    /// edit happened — an old message edited today becomes today's newest.
+    #[test]
+    fn an_edited_message_stays_where_it_was_first_sent() {
+        let item = edited_item();
+        let row = imported_row(&item);
+        assert_eq!(
+            row.content.metadata.client_timestamp.timestamp_millis(),
+            1700000000000,
+            "the row is keyed by the edit, not by the message"
+        );
+        assert_eq!(
+            row.received_at_ms, 1700000000001,
+            "the row arrived when the edit did, not when the message did"
+        );
+        match row.content.body {
+            ContentBody::DataMessage(dm) => {
+                assert_eq!(dm.timestamp, Some(1700000000000));
+                assert_eq!(dm.body.as_deref(), Some("edited"));
+            }
+            other => panic!("expected a DataMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn everything_about_an_edited_message_addresses_its_row() {
+        let mut item = edited_item();
+        if let Some(Item::StandardMessage(sm)) = item.item.as_mut() {
+            sm.reactions = vec![backup::Reaction {
+                emoji: "❤️".to_string(),
+                author_id: 1,
+                sent_timestamp: 1700003700000,
+                sort_order: 0,
+            }];
+        }
+        item.pin_details = Some(backup::chat_item::PinDetails {
+            pinned_at_timestamp: 1700003800000,
+            pin_expiry: None,
+        });
+
+        let rows = imported(&item);
+        assert_eq!(rows.len(), 2, "expected the message and its reaction");
+        let target = match &rows[1].content.body {
+            ContentBody::DataMessage(dm) => {
+                dm.reaction.as_ref().and_then(|r| r.target_sent_timestamp)
+            }
+            other => panic!("expected a DataMessage, got {other:?}"),
+        };
+        assert_eq!(target, Some(1700000000000), "the reaction");
+
+        let state =
+            chat_item_backup_state(&item, &sender_recipients(), &sender_chats()).expect("state");
+        assert_eq!(state.ts, 1700000000000, "the restored state");
+        assert_eq!(pin_of(&item).expect("pin").ts, 1700000000000, "the pin");
+
+        let edit = edit_of(&item).expect("edit");
+        assert_eq!(edit.ts, 1700000000000, "the edit");
+        assert_eq!(edit.author, rows[0].content.metadata.sender);
+        assert_eq!(edit.edited_at_ms, item.date_sent);
+    }
+
+    #[test]
+    fn no_edit_without_an_earlier_version() {
+        let mut item = incoming_item();
+        item.item = Some(text_message("hi"));
+        assert!(edit_of(&item).is_none(), "never edited");
+
+        let mut sticker = edited_item();
+        sticker.item = Some(Item::StickerMessage(Default::default()));
+        assert!(
+            edit_of(&sticker).is_none(),
+            "kind that cannot have been edited"
+        );
     }
 
     use backup::chat_item::pin_details::PinExpiry;

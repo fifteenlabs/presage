@@ -2934,6 +2934,16 @@ impl<S: Store> Manager<S, Registered> {
                 warn!(%e, "backup import: failed to restore message state");
             }
         }
+        // Restore the edit the message was last given.
+        if let Some(edit) = convert::chat_item_edit(&item, recipients, chats, aci) {
+            if let Err(e) = self
+                .store
+                .restore_backup_edit(&edit.thread, edit.ts, &edit.author, edit.edited_at_ms)
+                .await
+            {
+                warn!(%e, "backup import: failed to restore edit");
+            }
+        }
         // Restore the pin the primary holds on this message.
         if let Some(pin) = convert::chat_item_pin(&item, recipients, chats, aci) {
             if let Err(e) = self
