@@ -431,6 +431,20 @@ pub trait ContentsStore: Send + Sync {
         async { Ok(()) }
     }
 
+    /// Restore the edit decoded from a backup `ChatItem.revisions`, on the row
+    /// addressed by `thread`, `ts` and `author`. The row already holds the
+    /// message as it was last edited; `edited_at_ms` is when that was.
+    /// Default no-op, like [`Self::restore_backup_message_state`].
+    fn restore_backup_edit(
+        &self,
+        _thread: &Thread,
+        _ts: u64,
+        _author: &ServiceId,
+        _edited_at_ms: u64,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
     /// Look up the canonical call history entry for a given `call_id`.
     /// Returns `None` when no entry exists for this id.
     ///
