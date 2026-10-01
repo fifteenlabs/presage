@@ -71,6 +71,7 @@ use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
 use crate::backup::{
+    convert::BackupEdit,
     convert::{self, RecipientInfo},
     BackupImportProgress, ChatItem, Frame, FrameItem, TransferArchive,
 };
@@ -2591,13 +2592,17 @@ impl<S: Store> Manager<S, Registered> {
 
     /// Download and import a Signal backup after device linking (Link & Sync).
     ///
-    /// The backup's sticker packs are only noted; follow with
-    /// [`Self::download_pending_sticker_packs`] to install them.
+    /// Returns the edits the backup carried, or `None` when there was no
+    /// history to import. A store holds an edited message's latest version
+    /// only; its earlier versions come back here, once the archive has been
+    /// consumed, for the caller to keep. The backup's sticker packs are only
+    /// noted; follow with [`Self::download_pending_sticker_packs`] to install
+    /// them.
     pub async fn download_and_import_backup<F: Fn(BackupImportProgress)>(
         &mut self,
         ephemeral_key: Option<MessageBackupKey>,
         on_progress: F,
-    ) -> Result<bool, Error<S::Error>> {
+    ) -> Result<Option<Vec<BackupEdit>>, Error<S::Error>> {
         let aci = Aci::from_uuid_bytes(self.state.data.service_ids.aci.into_bytes());
 
         let (stream, total_bytes, path, download_offset, message_backup_key) = if let Some(
@@ -2639,7 +2644,7 @@ impl<S: Store> Manager<S, Registered> {
                             error: TransferArchiveError::ContinueWithoutUpload,
                         } => {
                             info!("backup import: the primary chose to continue without uploading history");
-                            return Ok(false);
+                            return Ok(None);
                         }
                     }
                 }
@@ -2665,7 +2670,7 @@ impl<S: Store> Manager<S, Registered> {
             // to Signal Desktop's api.download() with ZKP credentials, not
             // api.downloadEphemeral() which is used for Link & Sync.
             warn!("regular (non-ephemeral) backup restore is not yet implemented");
-            return Ok(false);
+            return Ok(None);
         };
 
         self.write_archive_to_file(&path, stream, total_bytes, download_offset, &on_progress)
@@ -2677,11 +2682,11 @@ impl<S: Store> Manager<S, Registered> {
         if let Err(e) = tokio::fs::remove_file(&path).await {
             warn!(%e, path = %path.display(), "failed to remove backup temp file");
         }
-        import_result?;
+        let edits = import_result?;
 
         self.store.store_transfer_archive(None).await?;
         on_progress(BackupImportProgress::Done);
-        Ok(true)
+        Ok(Some(edits))
     }
 
     /// Streams `stream` into `path` in 64 KB chunks, appending to resume interrupted downloads.
@@ -2744,7 +2749,7 @@ impl<S: Store> Manager<S, Registered> {
         path: &Path,
         message_backup_key: &MessageBackupKey,
         aci: libsignal_service::protocol::Aci,
-    ) -> Result<(), Error<S::Error>> {
+    ) -> Result<Vec<BackupEdit>, Error<S::Error>> {
         let factory = FileReaderFactory {
             path: path.to_owned(),
         };
@@ -2774,6 +2779,7 @@ impl<S: Store> Manager<S, Registered> {
         let mut pending_group_change: Option<ChatItem> = None;
         let mut chat_items = 0usize;
         let mut rows = 0usize;
+        let mut edits = Vec::new();
 
         while let Some(bytes) = reader
             .read_next()
@@ -2850,7 +2856,14 @@ impl<S: Store> Manager<S, Registered> {
                     chat_items += 1;
                     for item in convert::coalesce_group_changes(&mut pending_group_change, ci) {
                         rows += self
-                            .import_chat_item(item, &recipients, &chats, &mut group_ops, aci)
+                            .import_chat_item(
+                                item,
+                                &recipients,
+                                &chats,
+                                &mut group_ops,
+                                aci,
+                                &mut edits,
+                            )
                             .await?;
                     }
                 }
@@ -2870,7 +2883,7 @@ impl<S: Store> Manager<S, Registered> {
         }
         if let Some(item) = pending_group_change.take() {
             rows += self
-                .import_chat_item(item, &recipients, &chats, &mut group_ops, aci)
+                .import_chat_item(item, &recipients, &chats, &mut group_ops, aci, &mut edits)
                 .await?;
         }
         info!(
@@ -2878,13 +2891,15 @@ impl<S: Store> Manager<S, Registered> {
             chats = chats.len(),
             chat_items,
             rows,
+            edits = edits.len(),
             "backup import: frames processed"
         );
-        Ok(())
+        Ok(edits)
     }
 
     /// Stores one backup chat item as the rows the live path would have
-    /// stored for it, and returns how many rows that was.
+    /// stored for it, and returns how many rows that was. The item's edit,
+    /// if any, goes onto `edits` for the caller.
     async fn import_chat_item(
         &mut self,
         item: ChatItem,
@@ -2892,6 +2907,7 @@ impl<S: Store> Manager<S, Registered> {
         chats: &HashMap<u64, Thread>,
         group_ops: &mut HashMap<[u8; 32], GroupOperations>,
         aci: libsignal_service::protocol::Aci,
+        edits: &mut Vec<BackupEdit>,
     ) -> Result<usize, Error<S::Error>> {
         let mut rows = 0;
         for convert::ImportedContent {
@@ -2943,6 +2959,7 @@ impl<S: Store> Manager<S, Registered> {
             {
                 warn!(%e, "backup import: failed to restore edit");
             }
+            edits.push(edit);
         }
         // Restore the pin the primary holds on this message.
         if let Some(pin) = convert::chat_item_pin(&item, recipients, chats, aci) {

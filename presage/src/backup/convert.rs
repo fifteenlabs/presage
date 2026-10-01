@@ -669,8 +669,9 @@ pub fn chat_item_pin(
     })
 }
 
-/// The last edit of a message, addressed like the row the importer stored
-/// for it.
+/// An edited message and the versions it replaced, addressed like the row
+/// the importer stored for it.
+#[derive(Debug, Clone)]
 pub struct BackupEdit {
     pub thread: Thread,
     /// The sent timestamp of the message as it was first sent.
@@ -679,6 +680,16 @@ pub struct BackupEdit {
     pub author: ServiceId,
     /// When the version the row holds was sent.
     pub edited_at_ms: u64,
+    /// Every version before the one the row holds, oldest first.
+    pub earlier: Vec<BackupMessageVersion>,
+}
+
+/// A version an edit replaced: what the message said, and when that
+/// version was sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupMessageVersion {
+    pub sent_ms: u64,
+    pub text: Option<String>,
 }
 
 /// Extract the edit a backup `ChatItem` carries, if any. Only a standard
@@ -697,7 +708,23 @@ pub fn chat_item_edit(
         ts: chat_item_sent_ms(item),
         author: message_sender(item, recipients, our_aci)?,
         edited_at_ms: item.date_sent,
+        earlier: item
+            .revisions
+            .iter()
+            .map(|version| BackupMessageVersion {
+                sent_ms: version.date_sent,
+                text: standard_text(version),
+            })
+            .collect(),
     })
+}
+
+/// The text of a standard message, and nothing for any other kind.
+fn standard_text(item: &ChatItem) -> Option<String> {
+    match item.item.as_ref()? {
+        Item::StandardMessage(sm) => sm.text.as_ref().map(|t| t.body.clone()),
+        _ => None,
+    }
 }
 
 /// Build a `DataMessage` for a backup `StandardMessage` (text + attachments +
@@ -2034,6 +2061,21 @@ mod tests {
         item
     }
 
+    /// `edited_item`, edited once more two hours after it was sent: the
+    /// version it held becomes the second revision, saying "second".
+    fn edited_twice_item() -> ChatItem {
+        let mut item = edited_item();
+        let mut second = item.clone();
+        second.revisions.clear();
+        second.item = Some(text_message("second"));
+        item.revisions.push(second);
+        item.date_sent = 1700007200000;
+        if let Some(DirectionalDetails::Incoming(incoming)) = item.directional_details.as_mut() {
+            incoming.date_received = 1700007200001;
+        }
+        item
+    }
+
     fn edit_of(item: &ChatItem) -> Option<BackupEdit> {
         chat_item_edit(item, &sender_recipients(), &sender_chats(), our_aci())
     }
@@ -2098,6 +2140,29 @@ mod tests {
         assert_eq!(edit.ts, 1700000000000, "the edit");
         assert_eq!(edit.author, rows[0].content.metadata.sender);
         assert_eq!(edit.edited_at_ms, item.date_sent);
+    }
+
+    /// The history dialog shows what a message said before each edit. The
+    /// backup has every version; the row keeps only the last.
+    #[test]
+    fn an_edit_carries_the_versions_it_replaced() {
+        let version = |sent_ms: u64, text: &str| BackupMessageVersion {
+            sent_ms,
+            text: Some(text.to_string()),
+        };
+        let edit = edit_of(&edited_twice_item()).expect("edit");
+        assert_eq!(
+            edit.earlier,
+            vec![
+                version(1700000000000, "first"),
+                version(1700003600000, "second")
+            ],
+            "the earlier versions, oldest first, and not the one the row holds"
+        );
+        assert_eq!(
+            edit.ts, 1700000000000,
+            "the first version dates the message, not the latest revision"
+        );
     }
 
     #[test]
