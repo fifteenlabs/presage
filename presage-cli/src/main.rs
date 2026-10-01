@@ -744,7 +744,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                             }
                         })
                         .await?;
-                    if !imported {
+                    if imported.is_none() {
                         println!("[backup] Primary device skipped upload; continuing without message history.");
                     }
                 }
