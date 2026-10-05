@@ -574,7 +574,9 @@ fn item_author(
 /// reactions, whose row is keyed by their own timestamp rather than the item's.
 pub struct BackupMessageState {
     pub thread: Thread,
-    /// The message's sent timestamp — how the row is addressed.
+    /// The row the state belongs to: the message's own for its read state,
+    /// its latest version's for its delivery state, which is what the
+    /// message shows and what a receipt for that version lands on.
     pub ts: u64,
     /// `Some` for incoming rows, `None` for outgoing.
     pub read: Option<bool>,
@@ -591,11 +593,10 @@ pub fn chat_item_backup_state(
     chats: &HashMap<u64, Thread>,
 ) -> Option<BackupMessageState> {
     let thread = chats.get(&item.chat_id).cloned()?;
-    let ts = chat_item_sent_ms(item);
     match item.directional_details.as_ref()? {
         DirectionalDetails::Incoming(inc) => Some(BackupMessageState {
             thread,
-            ts,
+            ts: chat_item_sent_ms(item),
             read: Some(inc.read),
             send_states: Vec::new(),
         }),
@@ -623,7 +624,7 @@ pub fn chat_item_backup_state(
                 .collect();
             Some(BackupMessageState {
                 thread,
-                ts,
+                ts: item.date_sent,
                 read: None,
                 send_states,
             })
@@ -632,9 +633,9 @@ pub fn chat_item_backup_state(
     }
 }
 
-/// The message's state and, behind it, the read flag of each hidden edit
-/// row: those rows are stored unread, and the backup says whether the
-/// primary had read each version. Delivery state is the message's own.
+/// The message's state and, behind it, one for each hidden edit row of an
+/// incoming message, marking it read: the rows are stored unread, and the
+/// message's own read state is the one that counts, as on Desktop.
 pub fn chat_item_backup_states(
     item: &ChatItem,
     recipients: &HashMap<u64, RecipientInfo>,
@@ -644,13 +645,13 @@ pub fn chat_item_backup_states(
         return vec![];
     };
     let edits = edits(item).filter_map(|(_, version)| {
-        let DirectionalDetails::Incoming(incoming) = version.directional_details.as_ref()? else {
+        let DirectionalDetails::Incoming(_) = version.directional_details.as_ref()? else {
             return None;
         };
         Some(BackupMessageState {
             thread: thread.clone(),
             ts: version.date_sent,
-            read: Some(incoming.read),
+            read: Some(true),
             send_states: Vec::new(),
         })
     });
@@ -2300,7 +2301,7 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_row_carries_the_read_state_of_its_version() {
+    fn an_edit_row_is_imported_read_and_delivery_state_follows_the_latest_version() {
         let mut item = edited_twice_item();
         if let Some(DirectionalDetails::Incoming(incoming)) =
             item.revisions[1].directional_details.as_mut()
@@ -2315,10 +2316,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (1700000000000, Some(true)),
-                (1700003600000, Some(false)),
+                (1700003600000, Some(true)),
                 (1700007200000, Some(true))
             ],
-            "the message's state, then one per edit row with that version's read flag"
+            "the message's own read state, then every edit row read whatever the primary said"
+        );
+
+        let mut outgoing = edited_twice_item();
+        outgoing.directional_details = Some(DirectionalDetails::Outgoing(Default::default()));
+        for version in outgoing.revisions.iter_mut() {
+            version.directional_details = Some(DirectionalDetails::Outgoing(Default::default()));
+        }
+        let states = chat_item_backup_states(&outgoing, &sender_recipients(), &sender_chats());
+        assert_eq!(
+            states.iter().map(|state| state.ts).collect::<Vec<_>>(),
+            vec![1700007200000],
+            "an outgoing message's delivery state sits on its latest version, and nothing else is restored"
         );
 
         let mut unedited = incoming_item();
