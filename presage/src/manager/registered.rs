@@ -2465,20 +2465,25 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
-    /// As a primary device, unlink a secondary device.
+    /// Unlink a secondary device from the account.
+    ///
+    /// A primary device may unlink any secondary; a secondary may only unlink
+    /// itself, which is also the server's rule.
     pub async fn unlink_secondary(
         &self,
         device_id: impl TryInto<DeviceId>,
     ) -> Result<(), Error<S::Error>> {
-        // secondary devices cannot unlink themselves or other devices, it will fail with an unauthorized error
-        if self.registration_type() != RegistrationType::Primary {
+        let device_id = device_id.try_into().map_err(|_| Error::InvalidDeviceId)?;
+        if self.registration_type() != RegistrationType::Primary
+            && device_id != self.state.device_id()
+        {
             return Err(Error::NotPrimaryDevice);
         }
-        self.identified_websocket(false)
+        Ok(self
+            .identified_websocket(false)
             .await?
-            .unlink_device(device_id.try_into().map_err(|_| Error::InvalidDeviceId)?)
-            .await?;
-        Ok(())
+            .unlink_device(device_id)
+            .await?)
     }
 
     /// As a primary device, list all the devices (including the current device).
