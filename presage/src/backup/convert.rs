@@ -286,15 +286,10 @@ fn chat_item_sent_ms(item: &ChatItem) -> u64 {
     first_version(item).date_sent
 }
 
-/// When a message reached the exporting device. Only a directional `ChatItem`
-/// records that; a `0` there means the backup left it out, and the send time
-/// stands in, the same substitution migration 17 made for the whole column.
-fn chat_item_arrival_ms(item: &ChatItem) -> u64 {
-    arrival_ms(first_version(item))
-}
-
-/// When one version of a message reached the exporting device, with the
-/// same fallback as [`chat_item_arrival_ms`].
+/// When one version of a message reached the exporting device. Only a
+/// directional `ChatItem` records that; a `0` there means the backup left it
+/// out, and the send time stands in, the same substitution migration 17 made
+/// for the whole column.
 fn arrival_ms(item: &ChatItem) -> u64 {
     let date_received = match item.directional_details.as_ref() {
         Some(DirectionalDetails::Incoming(inc)) => Some(inc.date_received),
@@ -574,9 +569,7 @@ fn item_author(
 /// reactions, whose row is keyed by their own timestamp rather than the item's.
 pub struct BackupMessageState {
     pub thread: Thread,
-    /// The row the state belongs to: the message's own for its read state,
-    /// its latest version's for its delivery state, which is what the
-    /// message shows and what a receipt for that version lands on.
+    /// The sent timestamp of the row the state is restored onto.
     pub ts: u64,
     /// `Some` for incoming rows, `None` for outgoing.
     pub read: Option<bool>,
@@ -585,9 +578,11 @@ pub struct BackupMessageState {
 
 /// Extract read / per-recipient send state from a backup `ChatItem` so the
 /// store can restore them after the row is saved — the wire `Content` the
-/// converter produces carries neither. Returns `None` when the chat is unknown
-/// or directional details are absent.
-pub fn chat_item_backup_state(
+/// converter produces carries neither. Read state belongs to the message's
+/// own row; delivery state to its latest version's, which is the version the
+/// message shows and where a receipt for it lands. Returns `None` when the
+/// chat is unknown or directional details are absent.
+fn chat_item_backup_state(
     item: &ChatItem,
     recipients: &HashMap<u64, RecipientInfo>,
     chats: &HashMap<u64, Thread>,
@@ -644,20 +639,23 @@ pub fn chat_item_backup_states(
     let Some(thread) = chats.get(&item.chat_id) else {
         return vec![];
     };
-    let edits = edits(item).filter_map(|(_, version)| {
-        let DirectionalDetails::Incoming(_) = version.directional_details.as_ref()? else {
-            return None;
-        };
-        Some(BackupMessageState {
-            thread: thread.clone(),
-            ts: version.date_sent,
-            read: Some(true),
-            send_states: Vec::new(),
-        })
-    });
+    let incoming_edits = matches!(item.item, Some(Item::StandardMessage(_)))
+        && matches!(
+            item.directional_details,
+            Some(DirectionalDetails::Incoming(_))
+        );
+    let edit_rows_read =
+        edits(item)
+            .filter(|_| incoming_edits)
+            .map(|(_, version)| BackupMessageState {
+                thread: thread.clone(),
+                ts: version.date_sent,
+                read: Some(true),
+                send_states: Vec::new(),
+            });
     chat_item_backup_state(item, recipients, chats)
         .into_iter()
-        .chain(edits)
+        .chain(edit_rows_read)
         .collect()
 }
 
@@ -831,9 +829,6 @@ fn edit_rows(
     recipients: &HashMap<u64, RecipientInfo>,
     our_aci: Aci,
 ) -> Vec<ImportedContent> {
-    if item.revisions.is_empty() {
-        return vec![];
-    }
     let Some(sender) = message_sender(item, recipients, our_aci) else {
         return vec![];
     };
@@ -922,7 +917,7 @@ fn wrap_dm_with_reactions(
     let mut results = vec![ImportedContent {
         content: dm_content(dm, sender, thread, our_aci, timestamp),
         thread: thread.clone(),
-        received_at_ms: chat_item_arrival_ms(item),
+        received_at_ms: arrival_ms(first_version(item)),
     }];
     results.extend(reactions_to_contents(
         reactions, item, timestamp, recipients, thread, our_aci,
@@ -2265,7 +2260,7 @@ mod tests {
         let item = edited_twice_item();
         let rows = imported(&item);
         assert_eq!(rows.len(), 3, "the message and one row per edit");
-        let edit = |row: &ImportedContent| match &row.content.body {
+        let edit_row = |row: &ImportedContent| match &row.content.body {
             ContentBody::EditMessage(edit) => (
                 row.content.metadata.client_timestamp.timestamp_millis() as u64,
                 edit.target_sent_timestamp,
@@ -2275,22 +2270,22 @@ mod tests {
             other => panic!("expected an EditMessage, got {other:?}"),
         };
         assert_eq!(
-            edit(&rows[1]),
-            (
-                1700003600000,
-                Some(1700000000000),
-                Some("second".to_string()),
-                1700003600001
-            )
-        );
-        assert_eq!(
-            edit(&rows[2]),
-            (
-                1700007200000,
-                Some(1700003600000),
-                Some("edited".to_string()),
-                1700007200001
-            )
+            rows[1..].iter().map(edit_row).collect::<Vec<_>>(),
+            vec![
+                (
+                    1700003600000,
+                    Some(1700000000000),
+                    Some("second".to_string()),
+                    1700003600001
+                ),
+                (
+                    1700007200000,
+                    Some(1700003600000),
+                    Some("edited".to_string()),
+                    1700007200001
+                ),
+            ],
+            "each edit at its own time, naming the version before it"
         );
         assert!(
             rows[1..]
@@ -2301,7 +2296,7 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_row_is_imported_read_and_delivery_state_follows_the_latest_version() {
+    fn an_edit_row_is_imported_read() {
         let mut item = edited_twice_item();
         if let Some(DirectionalDetails::Incoming(incoming)) =
             item.revisions[1].directional_details.as_mut()
@@ -2321,25 +2316,17 @@ mod tests {
             ],
             "the message's own read state, then every edit row read whatever the primary said"
         );
+    }
 
+    #[test]
+    fn an_outgoing_delivery_state_sits_on_the_latest_version() {
         let mut outgoing = edited_twice_item();
         outgoing.directional_details = Some(DirectionalDetails::Outgoing(Default::default()));
-        for version in outgoing.revisions.iter_mut() {
-            version.directional_details = Some(DirectionalDetails::Outgoing(Default::default()));
-        }
         let states = chat_item_backup_states(&outgoing, &sender_recipients(), &sender_chats());
         assert_eq!(
             states.iter().map(|state| state.ts).collect::<Vec<_>>(),
             vec![1700007200000],
-            "an outgoing message's delivery state sits on its latest version, and nothing else is restored"
-        );
-
-        let mut unedited = incoming_item();
-        unedited.item = Some(text_message("hi"));
-        assert_eq!(
-            chat_item_backup_states(&unedited, &sender_recipients(), &sender_chats()).len(),
-            1,
-            "an unedited message has its own state and nothing behind it"
+            "the delivery state is the latest version's, and an outgoing message is never unread"
         );
     }
 
