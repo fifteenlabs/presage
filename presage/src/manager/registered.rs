@@ -2936,7 +2936,7 @@ impl<S: Store> Manager<S, Registered> {
         // `Content` can carry — so linked history shows correct
         // unread badges and outgoing ticks. Arrival time came in
         // with the row itself, above.
-        if let Some(state) = convert::chat_item_backup_state(&item, recipients, chats) {
+        for state in convert::chat_item_backup_states(&item, recipients, chats) {
             if let Err(e) = self
                 .store
                 .restore_backup_message_state(
