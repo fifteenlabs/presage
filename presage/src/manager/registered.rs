@@ -2469,21 +2469,48 @@ impl<S: Store> Manager<S, Registered> {
     ///
     /// A primary device may unlink any secondary; a secondary may only unlink
     /// itself, which is also the server's rule.
+    ///
+    /// Unlinking this device ends with the server no longer knowing it, and
+    /// the server disconnects a removed device before it answers the request,
+    /// so that request usually ends with the socket closing instead of a
+    /// response. A fresh connection then settles it: the handshake is refused
+    /// for a device that is gone, and a device that is still there sends the
+    /// request again on the new socket.
     pub async fn unlink_secondary(
         &self,
         device_id: impl TryInto<DeviceId>,
     ) -> Result<(), Error<S::Error>> {
+        const SELF_UNLINK_ATTEMPTS: usize = 3;
         let device_id = device_id.try_into().map_err(|_| Error::InvalidDeviceId)?;
-        if self.registration_type() != RegistrationType::Primary
-            && device_id != self.state.device_id()
-        {
+        let unlinking_self = device_id == self.state.device_id();
+        if self.registration_type() != RegistrationType::Primary && !unlinking_self {
             return Err(Error::NotPrimaryDevice);
         }
-        Ok(self
-            .identified_websocket(false)
-            .await?
-            .unlink_device(device_id)
-            .await?)
+        for attempt in 1..=SELF_UNLINK_ATTEMPTS {
+            let mut websocket = match self.identified_websocket(false).await {
+                Err(Error::ServiceError(ServiceError::Unauthorized)) if unlinking_self => {
+                    return Ok(());
+                }
+                other => other?,
+            };
+            match websocket.unlink_device(device_id).await {
+                Ok(()) => return Ok(()),
+                Err(ServiceError::Unauthorized) if unlinking_self => return Ok(()),
+                Err(ServiceError::WsClosing { .. })
+                    if unlinking_self && attempt < SELF_UNLINK_ATTEMPTS =>
+                {
+                    debug!(
+                        attempt,
+                        "socket closed before the unlink was answered, checking on a fresh one"
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(ServiceError::WsClosing {
+            reason: "socket closed before every unlink attempt was answered",
+        }
+        .into())
     }
 
     /// As a primary device, list all the devices (including the current device).
