@@ -752,7 +752,7 @@ impl ContentsStore for SqliteStore {
         )
         .execute(&self.db)
         .await?;
-        Ok(res.rows_affected() == 0)
+        Ok(res.rows_affected() > 0)
     }
 
     async fn profile_key(
@@ -966,5 +966,23 @@ impl BoundExt for Bound<&u64> {
             Bound::Included(x) => (None, Some(*x as i64)),
             Bound::Unbounded => (None, None),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::OnNewIdentity;
+
+    #[tokio::test]
+    async fn upsert_profile_key_reports_the_write() -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let uuid = Uuid::nil();
+        let key = ProfileKey::create([1u8; 32]);
+
+        assert!(store.upsert_profile_key(&uuid, key).await?);
+        assert!(store.upsert_profile_key(&uuid, key).await?);
+
+        Ok(())
     }
 }

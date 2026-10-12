@@ -1174,7 +1174,7 @@ impl<S: Store> Manager<S, Registered> {
                                     }
                                     Some(ServiceId::Pni(pni)) => {
                                         if pni == state.service_ids.pni()
-                                            && envelope.source_service_id.is_none()
+                                            && envelope.parse_source_service_id().is_none()
                                         {
                                             warn!("Got a sealed sender message to our PNI? Invalid message, ignoring.");
                                             continue;
@@ -3723,7 +3723,7 @@ async fn upsert_contact_from_profile<S: Store>(
                 .retrieve_profile_by_id(aci, Some(profile_key))
                 .await?;
             let profile_cipher = ProfileCipher::new(profile_key);
-            let decrypted_profile = profile_cipher.decrypt(encrypted_profile).unwrap();
+            let decrypted_profile = profile_cipher.decrypt(encrypted_profile)?;
 
             let mut contact = existing_contact.unwrap_or(Contact {
                 uuid: sender_uuid,
