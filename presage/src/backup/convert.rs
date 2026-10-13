@@ -582,7 +582,7 @@ pub struct BackupMessageState {
 /// own row; delivery state to its latest version's, which is the version the
 /// message shows and where a receipt for it lands. Returns `None` when the
 /// chat is unknown or directional details are absent.
-fn chat_item_backup_state(
+pub fn chat_item_backup_state(
     item: &ChatItem,
     recipients: &HashMap<u64, RecipientInfo>,
     chats: &HashMap<u64, Thread>,
@@ -626,37 +626,6 @@ fn chat_item_backup_state(
         }
         _ => None, // Directionless
     }
-}
-
-/// The message's state and, behind it, one for each hidden edit row of an
-/// incoming message, marking it read: the rows are stored unread, and the
-/// message's own read state is the one that counts, as on Desktop.
-pub fn chat_item_backup_states(
-    item: &ChatItem,
-    recipients: &HashMap<u64, RecipientInfo>,
-    chats: &HashMap<u64, Thread>,
-) -> Vec<BackupMessageState> {
-    let Some(thread) = chats.get(&item.chat_id) else {
-        return vec![];
-    };
-    let incoming_edits = matches!(item.item, Some(Item::StandardMessage(_)))
-        && matches!(
-            item.directional_details,
-            Some(DirectionalDetails::Incoming(_))
-        );
-    let edit_rows_read =
-        edits(item)
-            .filter(|_| incoming_edits)
-            .map(|(_, version)| BackupMessageState {
-                thread: thread.clone(),
-                ts: version.date_sent,
-                read: Some(true),
-                send_states: Vec::new(),
-            });
-    chat_item_backup_state(item, recipients, chats)
-        .into_iter()
-        .chain(edit_rows_read)
-        .collect()
 }
 
 /// A message that is pinned on the primary device, addressed like the row the
@@ -2296,37 +2265,14 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_row_is_imported_read() {
-        let mut item = edited_twice_item();
-        if let Some(DirectionalDetails::Incoming(incoming)) =
-            item.revisions[1].directional_details.as_mut()
-        {
-            incoming.read = false;
-        }
-        let states = chat_item_backup_states(&item, &sender_recipients(), &sender_chats());
-        assert_eq!(
-            states
-                .iter()
-                .map(|state| (state.ts, state.read))
-                .collect::<Vec<_>>(),
-            vec![
-                (1700000000000, Some(true)),
-                (1700003600000, Some(true)),
-                (1700007200000, Some(true))
-            ],
-            "the message's own read state, then every edit row read whatever the primary said"
-        );
-    }
-
-    #[test]
     fn an_outgoing_delivery_state_sits_on_the_latest_version() {
         let mut outgoing = edited_twice_item();
         outgoing.directional_details = Some(DirectionalDetails::Outgoing(Default::default()));
-        let states = chat_item_backup_states(&outgoing, &sender_recipients(), &sender_chats());
+        let state = chat_item_backup_state(&outgoing, &sender_recipients(), &sender_chats())
+            .expect("an outgoing message has a delivery state");
         assert_eq!(
-            states.iter().map(|state| state.ts).collect::<Vec<_>>(),
-            vec![1700007200000],
-            "the delivery state is the latest version's, and an outgoing message is never unread"
+            state.ts, 1700007200000,
+            "the delivery state is the latest version's"
         );
     }
 

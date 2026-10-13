@@ -2967,7 +2967,7 @@ impl<S: Store> Manager<S, Registered> {
         // `Content` can carry — so linked history shows correct
         // unread badges and outgoing ticks. Arrival time came in
         // with the row itself, above.
-        for state in convert::chat_item_backup_states(&item, recipients, chats) {
+        if let Some(state) = convert::chat_item_backup_state(&item, recipients, chats) {
             if let Err(e) = self
                 .store
                 .restore_backup_message_state(
@@ -2981,15 +2981,9 @@ impl<S: Store> Manager<S, Registered> {
                 warn!(%e, "backup import: failed to restore message state");
             }
         }
-        // Restore the edit the message was last given.
+        // Carry the edit history out for the client; the hidden edit rows
+        // saved above already mark the message as edited.
         if let Some(edit) = convert::chat_item_edit(&item, recipients, chats, aci) {
-            if let Err(e) = self
-                .store
-                .restore_backup_edit(&edit.thread, edit.ts, &edit.author, edit.edited_at_ms)
-                .await
-            {
-                warn!(%e, "backup import: failed to restore edit");
-            }
             edits.push(edit);
         }
         // Restore the pin the primary holds on this message.
