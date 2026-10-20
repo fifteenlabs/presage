@@ -38,8 +38,9 @@ use crate::model::chat_folders::{ChatFolder, ChatFolderType};
 use crate::model::contacts::Contact;
 use crate::model::groups::Group;
 use crate::storage_record::{
-    chat_folder_unknown_fields, contact_blocked, contact_muted_until, encode_chat_folder_record,
-    group_muted_until, set_contact_blocked, set_contact_muted_until, set_group_muted_until,
+    chat_folder_unknown_fields, contact_archived, contact_blocked, contact_muted_until,
+    encode_chat_folder_record, group_archived, group_muted_until, set_contact_archived,
+    set_contact_blocked, set_contact_muted_until, set_group_archived, set_group_muted_until,
     set_sticker_pack_state, sticker_pack_state, StorageRecordEditError,
 };
 use crate::store::{
@@ -602,6 +603,10 @@ impl<S: Store> Manager<S, Registered> {
                         contact.muted_until_timestamp,
                     )?);
                 }
+                if diff.archived {
+                    let current = edited.as_deref().unwrap_or(record);
+                    edited = Some(set_contact_archived(current, contact.archived)?);
+                }
                 Ok(edited)
             })
             .await
@@ -697,13 +702,18 @@ impl<S: Store> Manager<S, Registered> {
                 // a drain that fixed only one could clear a flag another still
                 // needs.
                 let diff = GroupPendingPublish::diff(record, &group)?;
-                if !diff.muted {
+                if !diff.any() {
                     return Ok(None);
                 }
-                Ok(Some(set_group_muted_until(
-                    record,
-                    group.muted_until_timestamp,
-                )?))
+                let mut edited: Option<Vec<u8>> = None;
+                if diff.muted {
+                    edited = Some(set_group_muted_until(record, group.muted_until_timestamp)?);
+                }
+                if diff.archived {
+                    let current = edited.as_deref().unwrap_or(record);
+                    edited = Some(set_group_archived(current, group.archived)?);
+                }
+                Ok(edited)
             })
             .await
         {
@@ -1104,6 +1114,10 @@ pub(super) fn merge_contact_from_snapshot(
         contact.muted_until_timestamp = existing.muted_until_timestamp;
         preserved.push("muted_until_timestamp");
     }
+    if pending.archived && contact.archived != existing.archived {
+        contact.archived = existing.archived;
+        preserved.push("archived");
+    }
     preserved
 }
 
@@ -1121,6 +1135,7 @@ pub(super) fn merge_contact_from_snapshot(
 pub(super) struct PendingPublish {
     pub blocked: bool,
     pub muted: bool,
+    pub archived: bool,
 }
 
 impl PendingPublish {
@@ -1130,6 +1145,7 @@ impl PendingPublish {
         Ok(Self {
             blocked: contact_blocked(record)? != local.blocked,
             muted: contact_muted_until(record)? != local.muted_until_timestamp,
+            archived: contact_archived(record)? != local.archived,
         })
     }
 
@@ -1138,11 +1154,12 @@ impl PendingPublish {
         Self {
             blocked: a.blocked != b.blocked,
             muted: a.muted_until_timestamp != b.muted_until_timestamp,
+            archived: a.archived != b.archived,
         }
     }
 
     fn any(&self) -> bool {
-        self.blocked || self.muted
+        self.blocked || self.muted || self.archived
     }
 }
 
@@ -1156,7 +1173,7 @@ impl PendingPublish {
 /// in the record at all and are simply left alone.
 ///
 /// `pending` is the same exception it is for contacts. A group whose local mute
-/// has not reached the storage service must keep it: the record we are merging
+/// or archive has not reached the storage service must keep it: the record we are merging
 /// *from* is the one we are about to overwrite, and `update_storage_record` calls
 /// `sync_storage_service` whenever it finds itself behind — so the publish path
 /// triggers the very sync that would revert it.
@@ -1167,7 +1184,9 @@ pub(super) fn merge_group_from_snapshot(
 ) {
     existing.blocked = remote.blocked;
     existing.whitelisted = remote.whitelisted;
-    existing.archived = remote.archived;
+    if !pending.archived {
+        existing.archived = remote.archived;
+    }
     existing.marked_unread = remote.marked_unread;
     if !pending.muted {
         existing.muted_until_timestamp = remote.muted_until_timestamp;
@@ -1183,12 +1202,13 @@ pub(super) fn merge_group_from_snapshot(
 /// [`ContentsStore::set_group_needs_storage_sync`] flag is raised *and* the local
 /// row disagrees with the last-published record bytes.
 ///
-/// One field today. `blocked` joins it the way `muted` joined the contact twin:
-/// one field here, one arm in `diff` and `between`, one in the publish closure
-/// next door.
+/// A new publishable field joins it the way `archived` joined `muted`: one
+/// field here, one arm in `diff` and `between`, one in the publish closure next
+/// door.
 #[derive(Clone, Copy, Default)]
 pub(super) struct GroupPendingPublish {
     pub muted: bool,
+    pub archived: bool,
 }
 
 impl GroupPendingPublish {
@@ -1197,6 +1217,7 @@ impl GroupPendingPublish {
     fn diff(record: &[u8], local: &Group) -> Result<Self, StorageRecordEditError> {
         Ok(Self {
             muted: group_muted_until(record)? != local.muted_until_timestamp,
+            archived: group_archived(record)? != local.archived,
         })
     }
 
@@ -1204,11 +1225,12 @@ impl GroupPendingPublish {
     fn between(a: &Group, b: &Group) -> Self {
         Self {
             muted: a.muted_until_timestamp != b.muted_until_timestamp,
+            archived: a.archived != b.archived,
         }
     }
 
     fn any(&self) -> bool {
-        self.muted
+        self.muted || self.archived
     }
 }
 
@@ -1225,7 +1247,10 @@ pub(super) async fn group_pending_publish_intent<S: Store>(
     if !flagged {
         return GroupPendingPublish::default();
     }
-    let all = GroupPendingPublish { muted: true };
+    let all = GroupPendingPublish {
+        muted: true,
+        archived: true,
+    };
     match store.group_storage_identity(master_key).await {
         Ok(Some(identity)) => GroupPendingPublish::diff(&identity.record, local).unwrap_or(all),
         _ => all,
@@ -1250,6 +1275,7 @@ pub(super) async fn pending_publish_intent<S: Store>(
     let all = PendingPublish {
         blocked: true,
         muted: true,
+        archived: true,
     };
     match store.contact_storage_identity(service_id).await {
         Ok(Some(identity)) => PendingPublish::diff(&identity.record, local).unwrap_or(all),
@@ -2055,6 +2081,7 @@ mod tests {
             PendingPublish {
                 blocked: true,
                 muted: false,
+                archived: false,
             },
         );
 
@@ -2096,6 +2123,7 @@ mod tests {
             PendingPublish {
                 blocked: true,
                 muted: false,
+                archived: false,
             },
         );
 
@@ -2122,6 +2150,7 @@ mod tests {
             PendingPublish {
                 blocked: true,
                 muted: false,
+                archived: false,
             },
         );
 
@@ -2179,11 +2208,61 @@ mod tests {
         let mut remote = empty_group_record();
         remote.blocked = true;
         remote.archived = true;
-        merge_group_from_snapshot(&mut local, &remote, GroupPendingPublish { muted: true });
+        merge_group_from_snapshot(
+            &mut local,
+            &remote,
+            GroupPendingPublish {
+                muted: true,
+                archived: false,
+            },
+        );
 
         assert_eq!(local.muted_until_timestamp, i64::MAX as u64);
         assert!(local.blocked, "the remote block was preserved away");
         assert!(local.archived, "the remote archive was preserved away");
+    }
+
+    /// An archive made here must survive the sync the publish path runs when it
+    /// finds itself behind — the record it merges from still says unarchived —
+    /// while a mute made on another device still lands.
+    #[test]
+    fn a_pending_group_archive_survives_but_takes_a_remote_mute() {
+        let mut local = local_group();
+        local.archived = true;
+        local.muted_until_timestamp = 0;
+
+        let mut remote = empty_group_record();
+        remote.archived = false;
+        remote.muted_until_timestamp = i64::MAX as u64;
+        merge_group_from_snapshot(
+            &mut local,
+            &remote,
+            GroupPendingPublish {
+                muted: false,
+                archived: true,
+            },
+        );
+
+        assert!(local.archived, "the pending archive was reverted");
+        assert_eq!(
+            local.muted_until_timestamp,
+            i64::MAX as u64,
+            "the remote mute was preserved away by an unrelated pending archive"
+        );
+    }
+
+    #[test]
+    fn a_group_with_nothing_pending_takes_the_remote_archive() {
+        let mut local = local_group();
+        local.archived = true;
+
+        merge_group_from_snapshot(
+            &mut local,
+            &empty_group_record(),
+            GroupPendingPublish::default(),
+        );
+
+        assert!(!local.archived);
     }
 
     /// The locally-derived fields are not in the record at all, so a merge must
@@ -2240,6 +2319,7 @@ mod tests {
             PendingPublish {
                 blocked: false,
                 muted: true,
+                archived: false,
             },
         );
 
@@ -2251,6 +2331,50 @@ mod tests {
         assert!(incoming.blocked, "the remote block was preserved away");
         assert!(preserved.contains(&"muted_until_timestamp"));
         assert!(!preserved.contains(&"blocked"));
+    }
+
+    #[test]
+    fn a_pending_archive_survives_but_takes_a_remote_block() {
+        let mut local = stored_contact();
+        local.blocked = false;
+        local.archived = true;
+
+        let mut incoming = empty_record_contact();
+        incoming.blocked = true;
+        incoming.archived = false;
+
+        let preserved = merge_contact_from_snapshot(
+            &mut incoming,
+            local,
+            PendingPublish {
+                blocked: false,
+                muted: false,
+                archived: true,
+            },
+        );
+
+        assert!(incoming.archived, "the pending archive was reverted");
+        assert!(incoming.blocked, "the remote block was preserved away");
+        assert!(preserved.contains(&"archived"));
+        assert!(!preserved.contains(&"blocked"));
+    }
+
+    #[test]
+    fn group_publish_intent_diffs_archived_against_the_record() {
+        let mut local = local_group();
+        local.archived = true;
+
+        let record = StorageRecord {
+            record: Some(storage_record::Record::GroupV2(empty_group_record())),
+        }
+        .encode_to_vec();
+
+        let diff = GroupPendingPublish::diff(&record, &local).unwrap();
+        assert!(diff.archived);
+        assert!(!diff.muted);
+
+        local.archived = false;
+        assert!(!GroupPendingPublish::diff(&record, &local).unwrap().any());
     }
 
     #[test]

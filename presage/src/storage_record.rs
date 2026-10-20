@@ -27,8 +27,12 @@ const STORAGE_RECORD_STICKER_PACK: u32 = 6;
 const CHAT_FOLDER_RECORD_KNOWN_FIELDS: std::ops::RangeInclusive<u32> = 1..=11;
 /// `ContactRecord.blocked`.
 const CONTACT_RECORD_BLOCKED: u32 = 9;
+/// `ContactRecord.archived`.
+const CONTACT_RECORD_ARCHIVED: u32 = 11;
 /// `ContactRecord.mutedUntilTimestamp`.
 const CONTACT_RECORD_MUTED_UNTIL: u32 = 13;
+/// `GroupV2Record.archived`.
+const GROUP_V2_RECORD_ARCHIVED: u32 = 4;
 /// `GroupV2Record.mutedUntilTimestamp`.
 const GROUP_V2_RECORD_MUTED_UNTIL: u32 = 6;
 /// `StickerPackRecord.packKey`.
@@ -321,6 +325,39 @@ pub fn set_group_muted_until(record: &[u8], muted_until: u64) -> Result<Vec<u8>,
     )
 }
 
+/// Read `ContactRecord.archived` out of an encoded `StorageRecord`.
+pub fn contact_archived(record: &[u8]) -> Result<bool, EditError> {
+    Ok(record_varint_field(record, STORAGE_RECORD_CONTACT, CONTACT_RECORD_ARCHIVED)? != 0)
+}
+
+/// Set `ContactRecord.archived` on an encoded `StorageRecord`, preserving every
+/// other byte of both messages. `archived = false` removes the field, for the
+/// reason [`set_contact_blocked`] gives.
+pub fn set_contact_archived(record: &[u8], archived: bool) -> Result<Vec<u8>, EditError> {
+    set_varint_field_or_remove(
+        record,
+        STORAGE_RECORD_CONTACT,
+        CONTACT_RECORD_ARCHIVED,
+        u64::from(archived),
+    )
+}
+
+/// Read `GroupV2Record.archived` out of an encoded `StorageRecord`.
+pub fn group_archived(record: &[u8]) -> Result<bool, EditError> {
+    Ok(record_varint_field(record, STORAGE_RECORD_GROUP_V2, GROUP_V2_RECORD_ARCHIVED)? != 0)
+}
+
+/// Set `GroupV2Record.archived` on an encoded `StorageRecord`, preserving every
+/// other byte of both messages. `archived = false` removes the field.
+pub fn set_group_archived(record: &[u8], archived: bool) -> Result<Vec<u8>, EditError> {
+    set_varint_field_or_remove(
+        record,
+        STORAGE_RECORD_GROUP_V2,
+        GROUP_V2_RECORD_ARCHIVED,
+        u64::from(archived),
+    )
+}
+
 /// The raw bytes of every `ChatFolderRecord` field presage does not model,
 /// concatenated in wire order — Signal-Desktop's `storageUnknownFields`.
 ///
@@ -412,7 +449,7 @@ pub fn set_sticker_pack_state(
 }
 
 /// Write a varint into whichever record holds one, where `0` means absent:
-/// a mute expiry, a sticker pack's position or deletion time.
+/// a mute expiry, an archived flag, a sticker pack's position or deletion time.
 ///
 /// `0` **removes** the field rather than writing an explicit zero.
 /// Signal-Desktop, -Android and -iOS all write an explicit `0`; under proto3
@@ -769,6 +806,99 @@ mod tests {
             .expect("dontNotifyForMentionsIfMuted was dropped");
 
         assert_eq!(mentions.wire_type, WIRE_VARINT);
+    }
+
+    #[test]
+    fn archive_then_unarchive_restores_the_original_bytes() {
+        let record = storage_record(&contact_with_unknown_field());
+
+        let archived = set_contact_archived(&record, true).unwrap();
+        assert!(contact_archived(&archived).unwrap());
+
+        let unarchived = set_contact_archived(&archived, false).unwrap();
+        assert_eq!(
+            unarchived, record,
+            "toggling must not accumulate bytes or reorder fields"
+        );
+    }
+
+    #[test]
+    fn unarchiving_removes_the_field_rather_than_zeroing_it() {
+        let mut contact = contact_with_unknown_field();
+        contact.extend_from_slice(&encode_varint_field(CONTACT_RECORD_ARCHIVED, 1));
+        let record = storage_record(&contact);
+
+        let unarchived = set_contact_archived(&record, false).unwrap();
+        let payload = record_payload(&unarchived, STORAGE_RECORD_CONTACT).unwrap();
+        let inner = scan(&unarchived[payload]).unwrap();
+
+        assert!(
+            !inner.iter().any(|s| s.number == CONTACT_RECORD_ARCHIVED),
+            "field 11 should be absent, not present-and-false"
+        );
+        assert!(!contact_archived(&unarchived).unwrap());
+    }
+
+    /// Archive rides the same publish as block and mute, so the three edits
+    /// must stack on one record without disturbing each other.
+    #[test]
+    fn archive_block_and_mute_edits_compose() {
+        let record = storage_record(&contact_with_unknown_field());
+
+        let blocked = set_contact_blocked(&record, true).unwrap();
+        let muted = set_contact_muted_until(&blocked, 42).unwrap();
+        let all = set_contact_archived(&muted, true).unwrap();
+
+        assert!(contact_blocked(&all).unwrap());
+        assert_eq!(contact_muted_until(&all).unwrap(), 42);
+        assert!(contact_archived(&all).unwrap());
+    }
+
+    #[test]
+    fn group_archive_then_unarchive_restores_the_original_bytes() {
+        let record = group_record(&group_with_unknown_field());
+
+        let archived = set_group_archived(&record, true).unwrap();
+        assert!(group_archived(&archived).unwrap());
+
+        let unarchived = set_group_archived(&archived, false).unwrap();
+        assert_eq!(
+            unarchived, record,
+            "toggling must not accumulate bytes or reorder fields"
+        );
+    }
+
+    /// `GroupV2Record.archived` is field 4 inside `StorageRecord` field 3, while
+    /// the contact's is field 11 inside field 1 — one test each, so a swapped
+    /// constant fails here rather than on someone's phone.
+    #[test]
+    fn archiving_a_group_writes_field_four_and_keeps_the_rest() {
+        let record = group_record(&group_with_unknown_field());
+        let archived = set_group_archived(&record, true).unwrap();
+
+        let payload = record_payload(&archived, STORAGE_RECORD_GROUP_V2).unwrap();
+        let group = &archived[payload];
+        let inner = scan(group).unwrap();
+        assert!(inner.iter().any(|s| s.number == GROUP_V2_RECORD_ARCHIVED));
+        assert!(
+            inner.iter().any(|s| s.number == 7),
+            "dontNotifyForMentionsIfMuted was dropped"
+        );
+        assert!(
+            group.windows(15).any(|w| w == b"from the future"),
+            "unknown field was dropped"
+        );
+    }
+
+    #[test]
+    fn group_archive_and_mute_edits_compose() {
+        let record = group_record(&group_with_unknown_field());
+
+        let muted = set_group_muted_until(&record, 42).unwrap();
+        let both = set_group_archived(&muted, true).unwrap();
+
+        assert_eq!(group_muted_until(&both).unwrap(), 42);
+        assert!(group_archived(&both).unwrap());
     }
 
     #[test]

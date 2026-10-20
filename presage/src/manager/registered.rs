@@ -1819,8 +1819,47 @@ impl<S: Store> Manager<S, Registered> {
         master_key: GroupMasterKeyBytes,
         muted_until_timestamp: u64,
     ) -> Result<(), Error<S::Error>> {
+        self.edit_group_for_publish(master_key, |group| {
+            group.muted_until_timestamp = muted_until_timestamp
+        })
+        .await
+    }
+
+    /// Archive or unarchive a contact's chat.
+    ///
+    /// Same shape as [`set_muted_until`](Self::set_muted_until), and for the
+    /// same reason without a sync message: Signal has none for archive, the
+    /// storage service is the only cross-device channel.
+    pub async fn set_archived(
+        &mut self,
+        service_id: ServiceId,
+        archived: bool,
+    ) -> Result<(), Error<S::Error>> {
+        self.edit_contact_for_publish(&service_id, |contact| contact.archived = archived)
+            .await
+    }
+
+    /// The group twin of [`set_archived`](Self::set_archived). A group we have
+    /// never seen is [`Error::UnknownGroup`], as for
+    /// [`set_group_muted_until`](Self::set_group_muted_until).
+    pub async fn set_group_archived(
+        &mut self,
+        master_key: GroupMasterKeyBytes,
+        archived: bool,
+    ) -> Result<(), Error<S::Error>> {
+        self.edit_group_for_publish(master_key, |group| group.archived = archived)
+            .await
+    }
+
+    /// The group twin of [`edit_contact_for_publish`](Self::edit_contact_for_publish):
+    /// the local write and the storage-sync mark are one step.
+    async fn edit_group_for_publish(
+        &mut self,
+        master_key: GroupMasterKeyBytes,
+        edit: impl FnOnce(&mut Group),
+    ) -> Result<(), Error<S::Error>> {
         let mut group = self.stored_group(&master_key).await?;
-        group.muted_until_timestamp = muted_until_timestamp;
+        edit(&mut group);
         self.store.save_group(master_key, group).await?;
         self.store
             .set_group_needs_storage_sync(master_key, true)
