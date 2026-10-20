@@ -2787,7 +2787,7 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     /// Decrypts and parses a Backups v2 file, saving each `ChatItem` frame as a `Content` message.
-    /// Of the first frame (AccountData), only our own profile is kept.
+    /// Of the AccountData frame, only our own profile is kept.
     async fn import_from_file(
         &mut self,
         path: &Path,
@@ -2802,24 +2802,11 @@ impl<S: Store> Manager<S, Registered> {
             .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
         let mut reader = VarintDelimitedReader::new(frames_reader);
 
-        // The first frame is always AccountData: our own profile, and account settings
-        // like read receipts, typing indicators and link previews. The settings are
-        // not kept: presage has no settings storage layer yet.
-        let account = reader
+        // The first record is the BackupInfo header, not a Frame.
+        reader
             .read_next()
             .await
-            .map_err(|e| Error::BackupImportFailed(e.to_string()))?
-            .map(|bytes| Frame::decode_bytes(bytes.as_ref()))
-            .transpose()
-            .map_err(|e| Error::BackupImportFailed(e.to_string()))?
-            .and_then(|frame| match frame.item {
-                Some(FrameItem::Account(account)) => Some(account),
-                _ => None,
-            });
-        match account {
-            Some(account) => self.import_own_profile(&account, aci).await,
-            None => warn!("backup import: the first frame is not AccountData"),
-        }
+            .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
 
         let mut recipients: HashMap<u64, RecipientInfo> = HashMap::new();
         let mut chats: HashMap<u64, Thread> = HashMap::new();
@@ -2837,6 +2824,9 @@ impl<S: Store> Manager<S, Registered> {
             let frame = Frame::decode_bytes(bytes.as_ref())
                 .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
             match frame.item {
+                // Of AccountData only our own profile is kept: presage has no
+                // settings storage layer yet.
+                Some(FrameItem::Account(account)) => self.import_own_profile(&account, aci).await,
                 Some(FrameItem::Recipient(r)) => {
                     if let Some((id, info)) = convert::recipient_info(&r, aci) {
                         recipients.insert(id, info);
