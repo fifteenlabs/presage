@@ -1368,12 +1368,12 @@ pub fn recipient_to_group(
 pub fn account_profile(account: &backup::AccountData) -> libsignal_service::Profile {
     use libsignal_service::profile_name::ProfileName;
 
-    let non_empty = |s: &str| Some(s.to_owned()).filter(|s| !s.is_empty());
-    let name =
-        (!account.given_name.is_empty() || !account.family_name.is_empty()).then(|| ProfileName {
-            given_name: account.given_name.clone(),
-            family_name: non_empty(&account.family_name),
-        });
+    let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_owned());
+    let name = Some(ProfileName {
+        given_name: account.given_name.clone(),
+        family_name: non_empty(&account.family_name),
+    })
+    .filter(|name| !name.is_empty());
     libsignal_service::Profile {
         name,
         about: non_empty(&account.bio_text),

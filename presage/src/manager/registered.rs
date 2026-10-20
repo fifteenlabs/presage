@@ -2787,7 +2787,6 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     /// Decrypts and parses a Backups v2 file, saving each `ChatItem` frame as a `Content` message.
-    /// Of the AccountData frame, only our own profile is kept.
     async fn import_from_file(
         &mut self,
         path: &Path,
@@ -2815,6 +2814,7 @@ impl<S: Store> Manager<S, Registered> {
         let mut chat_items = 0usize;
         let mut rows = 0usize;
         let mut edits = Vec::new();
+        let mut own_avatar_url = None;
 
         while let Some(bytes) = reader
             .read_next()
@@ -2826,7 +2826,9 @@ impl<S: Store> Manager<S, Registered> {
             match frame.item {
                 // Of AccountData only our own profile is kept: presage has no
                 // settings storage layer yet.
-                Some(FrameItem::Account(account)) => self.import_own_profile(&account, aci).await,
+                Some(FrameItem::Account(account)) => {
+                    own_avatar_url = self.import_own_profile(&account, aci).await;
+                }
                 Some(FrameItem::Recipient(r)) => {
                     if let Some((id, info)) = convert::recipient_info(&r, aci) {
                         recipients.insert(id, info);
@@ -2932,35 +2934,45 @@ impl<S: Store> Manager<S, Registered> {
             edits = edits.len(),
             "backup import: frames processed"
         );
+        if let Some(avatar_url) = own_avatar_url {
+            self.import_own_avatar(aci, &avatar_url).await;
+        }
         Ok(edits)
     }
 
     /// Caches our own profile from the backup's `AccountData` where a profile
-    /// fetch would cache it, and its avatar with it, so a linked device can
-    /// show who it belongs to before its first profile fetch. Neither is
-    /// worth failing the import over.
+    /// fetch would cache it, so a linked device can show who it belongs to
+    /// before its first profile fetch, and returns its avatar URL once saved.
+    /// Not worth failing the import over.
     async fn import_own_profile(
         &mut self,
         account: &libsignal_service::proto::backup::AccountData,
         aci: libsignal_service::protocol::Aci,
-    ) {
-        // Avatars are a few hundred KB; a stalled download must not hold up the import.
-        const AVATAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-        let uuid = Uuid::from(aci);
-        let profile_key = self.state.data.profile_key;
+    ) -> Option<String> {
         let profile = convert::account_profile(account);
         let avatar_url = profile.avatar.clone();
-        if let Err(e) = self.store.save_profile(uuid, profile_key, profile).await {
-            warn!(%e, "backup import: failed to save our own profile");
-            return;
+        match self
+            .store
+            .save_profile(Uuid::from(aci), self.state.data.profile_key, profile)
+            .await
+        {
+            Ok(()) => avatar_url,
+            Err(e) => {
+                warn!(%e, "backup import: failed to save our own profile");
+                None
+            }
         }
-        let Some(avatar_url) = avatar_url else {
-            return;
-        };
+    }
+
+    /// Downloads and caches our own avatar once the frames are imported, so
+    /// the network never holds up the import itself.
+    async fn import_own_avatar(&mut self, aci: libsignal_service::protocol::Aci, avatar_url: &str) {
+        // Avatars are a few hundred KB; a stalled download must not hold up the link.
+        const AVATAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
         match tokio::time::timeout(
             AVATAR_TIMEOUT,
-            self.download_profile_avatar(uuid, profile_key, &avatar_url),
+            self.download_profile_avatar(Uuid::from(aci), self.state.data.profile_key, avatar_url),
         )
         .await
         {
