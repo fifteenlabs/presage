@@ -1039,6 +1039,19 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         // URL changed or no cache — download, decrypt, save, and return.
+        self.download_profile_avatar(uuid, profile_key, avatar_url)
+            .await
+            .map(Some)
+    }
+
+    /// Downloads the avatar at `avatar_url`, decrypts it with `profile_key` and
+    /// caches it for `uuid` under that URL.
+    async fn download_profile_avatar(
+        &mut self,
+        uuid: Uuid,
+        profile_key: ProfileKey,
+        avatar_url: &str,
+    ) -> Result<AvatarBytes, Error<S::Error>> {
         let mut websocket = self.unidentified_websocket().await?;
         let mut avatar_stream = websocket.retrieve_profile_avatar(avatar_url).await?;
         // 10MB is what Signal Android allocates
@@ -1052,7 +1065,7 @@ impl<S: Store> Manager<S, Registered> {
             .store
             .save_profile_avatar(uuid, profile_key, &avatar, avatar_url)
             .await;
-        Ok(Some(avatar))
+        Ok(avatar)
     }
 
     async fn groups_manager(&self) -> Result<GroupsManager<GroupCredentials>, Error<S::Error>> {
@@ -2774,7 +2787,7 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     /// Decrypts and parses a Backups v2 file, saving each `ChatItem` frame as a `Content` message.
-    /// The first frame (AccountData) is intentionally skipped — settings are synced via other means.
+    /// Of the first frame (AccountData), only our own profile is kept.
     async fn import_from_file(
         &mut self,
         path: &Path,
@@ -2789,20 +2802,24 @@ impl<S: Store> Manager<S, Registered> {
             .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
         let mut reader = VarintDelimitedReader::new(frames_reader);
 
-        // The first frame is always AccountData (profile name/about/avatar, account
-        // settings like read receipts, typing indicators, link previews, phone number
-        // sharing mode, preferred reaction emoji, etc.). We intentionally skip it for
-        // now: profile data arrives via network fetches on message receipt and storage
-        // service sync, and presage has no settings storage layer yet. This mirrors
-        // Signal Desktop's "no backup" path behaviour.
-        //
-        // TODO: implement AccountData restore — in particular the preferences are
-        // interesting to carry over from the backup rather than waiting for a sync
-        // message from the primary device.
-        reader
+        // The first frame is always AccountData: our own profile, and account settings
+        // like read receipts, typing indicators and link previews. The settings are
+        // not kept: presage has no settings storage layer yet.
+        let account = reader
             .read_next()
             .await
-            .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
+            .map_err(|e| Error::BackupImportFailed(e.to_string()))?
+            .map(|bytes| Frame::decode_bytes(bytes.as_ref()))
+            .transpose()
+            .map_err(|e| Error::BackupImportFailed(e.to_string()))?
+            .and_then(|frame| match frame.item {
+                Some(FrameItem::Account(account)) => Some(account),
+                _ => None,
+            });
+        match account {
+            Some(account) => self.import_own_profile(&account, aci).await,
+            None => warn!("backup import: the first frame is not AccountData"),
+        }
 
         let mut recipients: HashMap<u64, RecipientInfo> = HashMap::new();
         let mut chats: HashMap<u64, Thread> = HashMap::new();
@@ -2926,6 +2943,41 @@ impl<S: Store> Manager<S, Registered> {
             "backup import: frames processed"
         );
         Ok(edits)
+    }
+
+    /// Caches our own profile from the backup's `AccountData` where a profile
+    /// fetch would cache it, and its avatar with it, so a linked device can
+    /// show who it belongs to before its first profile fetch. Neither is
+    /// worth failing the import over.
+    async fn import_own_profile(
+        &mut self,
+        account: &libsignal_service::proto::backup::AccountData,
+        aci: libsignal_service::protocol::Aci,
+    ) {
+        // Avatars are a few hundred KB; a stalled download must not hold up the import.
+        const AVATAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let uuid = Uuid::from(aci);
+        let profile_key = self.state.data.profile_key;
+        let profile = convert::account_profile(account);
+        let avatar_url = profile.avatar.clone();
+        if let Err(e) = self.store.save_profile(uuid, profile_key, profile).await {
+            warn!(%e, "backup import: failed to save our own profile");
+            return;
+        }
+        let Some(avatar_url) = avatar_url else {
+            return;
+        };
+        match tokio::time::timeout(
+            AVATAR_TIMEOUT,
+            self.download_profile_avatar(uuid, profile_key, &avatar_url),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!(%e, "backup import: failed to download our own avatar"),
+            Err(_) => warn!("backup import: downloading our own avatar timed out"),
+        }
     }
 
     /// Stores one backup chat item as the rows the live path would have
