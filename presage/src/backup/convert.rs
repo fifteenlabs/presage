@@ -1358,6 +1358,31 @@ pub fn recipient_to_group(
     Some((master_key, group))
 }
 
+/// Our own profile as the backup's `AccountData` records it, in the shape a
+/// profile fetch returns, so it can be cached where that fetch caches it.
+///
+/// The backup leaves an unset field empty rather than absent; an empty one
+/// becomes `None`, as it would come back decrypted from the server.
+/// `unrestricted_unidentified_access` is not in the backup and stays `false`
+/// until the first fetch.
+pub fn account_profile(account: &backup::AccountData) -> libsignal_service::Profile {
+    use libsignal_service::profile_name::ProfileName;
+
+    let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_owned());
+    let name = Some(ProfileName {
+        given_name: account.given_name.clone(),
+        family_name: non_empty(&account.family_name),
+    })
+    .filter(|name| !name.is_empty());
+    libsignal_service::Profile {
+        name,
+        about: non_empty(&account.bio_text),
+        about_emoji: non_empty(&account.bio_emoji),
+        avatar: non_empty(&account.avatar_url_path),
+        unrestricted_unidentified_access: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2400,5 +2425,43 @@ mod tests {
             pin_of(&poll).is_none(),
             "kind the importer stores no row for"
         );
+    }
+
+    #[test]
+    fn the_account_profile_is_what_a_profile_fetch_would_return() {
+        let profile = account_profile(&backup::AccountData {
+            given_name: "Ada".to_string(),
+            family_name: "Lovelace".to_string(),
+            bio_text: "Analyst".to_string(),
+            bio_emoji: "🧮".to_string(),
+            avatar_url_path: "profiles/abc".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(
+            profile.name.map(|name| name.to_string()).as_deref(),
+            Some("Ada Lovelace")
+        );
+        assert_eq!(profile.about.as_deref(), Some("Analyst"));
+        assert_eq!(profile.about_emoji.as_deref(), Some("🧮"));
+        assert_eq!(profile.avatar.as_deref(), Some("profiles/abc"));
+    }
+
+    #[test]
+    fn empty_account_fields_are_absent_not_empty() {
+        let profile = account_profile(&backup::AccountData {
+            given_name: "Ada".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(
+            profile.name.as_ref().map(|name| name.family_name.clone()),
+            Some(None)
+        );
+        assert_eq!(profile.about, None);
+        assert_eq!(profile.about_emoji, None);
+        assert_eq!(profile.avatar, None, "no avatar to download");
+
+        assert!(account_profile(&backup::AccountData::default())
+            .name
+            .is_none());
     }
 }
