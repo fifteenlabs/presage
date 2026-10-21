@@ -265,25 +265,41 @@ fn set_record_field(
     )
 }
 
-/// Read `ContactRecord.blocked` out of an encoded `StorageRecord`.
-pub fn contact_blocked(record: &[u8]) -> Result<bool, EditError> {
-    Ok(record_varint_field(record, STORAGE_RECORD_CONTACT, CONTACT_RECORD_BLOCKED)? != 0)
+/// A bool field inside the `record_field` payload; absent reads as `false`.
+fn record_bool_field(record: &[u8], record_field: u32, number: u32) -> Result<bool, EditError> {
+    Ok(record_varint_field(record, record_field, number)? != 0)
 }
 
-/// Set `ContactRecord.blocked` on an encoded `StorageRecord`, preserving every
-/// other byte of both messages.
+/// Set a bool field inside the `record_field` payload, preserving every other
+/// byte of both messages.
 ///
-/// `blocked = false` **removes** the field rather than writing an explicit zero.
-/// `blocked` has proto3 implicit presence, so its default is its absence, and
-/// removal is what Signal-Desktop and Signal-Android emit. An explicit zero is
-/// wire-legal and decodes identically, but no official client produces one.
+/// `false` **removes** the field rather than writing an explicit zero. These
+/// fields have proto3 implicit presence, so their default is their absence; an
+/// explicit zero is wire-legal and decodes identically. For `blocked`, removal
+/// is what Signal-Desktop and Signal-Android emit.
+fn set_bool_field(
+    record: &[u8],
+    record_field: u32,
+    number: u32,
+    value: bool,
+) -> Result<Vec<u8>, EditError> {
+    let replacement = value.then(|| encode_varint_field(number, 1));
+    set_record_field(record, record_field, number, replacement.as_deref())
+}
+
+/// Read `ContactRecord.blocked` out of an encoded `StorageRecord`.
+pub fn contact_blocked(record: &[u8]) -> Result<bool, EditError> {
+    record_bool_field(record, STORAGE_RECORD_CONTACT, CONTACT_RECORD_BLOCKED)
+}
+
+/// Set `ContactRecord.blocked` on an encoded `StorageRecord`. See
+/// [`set_bool_field`] for the unblock convention.
 pub fn set_contact_blocked(record: &[u8], blocked: bool) -> Result<Vec<u8>, EditError> {
-    let replacement = blocked.then(|| encode_varint_field(CONTACT_RECORD_BLOCKED, 1));
-    set_record_field(
+    set_bool_field(
         record,
         STORAGE_RECORD_CONTACT,
         CONTACT_RECORD_BLOCKED,
-        replacement.as_deref(),
+        blocked,
     )
 }
 
@@ -327,34 +343,33 @@ pub fn set_group_muted_until(record: &[u8], muted_until: u64) -> Result<Vec<u8>,
 
 /// Read `ContactRecord.archived` out of an encoded `StorageRecord`.
 pub fn contact_archived(record: &[u8]) -> Result<bool, EditError> {
-    Ok(record_varint_field(record, STORAGE_RECORD_CONTACT, CONTACT_RECORD_ARCHIVED)? != 0)
+    record_bool_field(record, STORAGE_RECORD_CONTACT, CONTACT_RECORD_ARCHIVED)
 }
 
-/// Set `ContactRecord.archived` on an encoded `StorageRecord`, preserving every
-/// other byte of both messages. `archived = false` removes the field, for the
-/// reason [`set_contact_blocked`] gives.
+/// Set `ContactRecord.archived` on an encoded `StorageRecord`. See
+/// [`set_bool_field`] for the unarchive convention.
 pub fn set_contact_archived(record: &[u8], archived: bool) -> Result<Vec<u8>, EditError> {
-    set_varint_field_or_remove(
+    set_bool_field(
         record,
         STORAGE_RECORD_CONTACT,
         CONTACT_RECORD_ARCHIVED,
-        u64::from(archived),
+        archived,
     )
 }
 
 /// Read `GroupV2Record.archived` out of an encoded `StorageRecord`.
 pub fn group_archived(record: &[u8]) -> Result<bool, EditError> {
-    Ok(record_varint_field(record, STORAGE_RECORD_GROUP_V2, GROUP_V2_RECORD_ARCHIVED)? != 0)
+    record_bool_field(record, STORAGE_RECORD_GROUP_V2, GROUP_V2_RECORD_ARCHIVED)
 }
 
-/// Set `GroupV2Record.archived` on an encoded `StorageRecord`, preserving every
-/// other byte of both messages. `archived = false` removes the field.
+/// Set `GroupV2Record.archived` on an encoded `StorageRecord`. See
+/// [`set_bool_field`] for the unarchive convention.
 pub fn set_group_archived(record: &[u8], archived: bool) -> Result<Vec<u8>, EditError> {
-    set_varint_field_or_remove(
+    set_bool_field(
         record,
         STORAGE_RECORD_GROUP_V2,
         GROUP_V2_RECORD_ARCHIVED,
-        u64::from(archived),
+        archived,
     )
 }
 
@@ -449,7 +464,7 @@ pub fn set_sticker_pack_state(
 }
 
 /// Write a varint into whichever record holds one, where `0` means absent:
-/// a mute expiry, an archived flag, a sticker pack's position or deletion time.
+/// a mute expiry, a sticker pack's position or deletion time.
 ///
 /// `0` **removes** the field rather than writing an explicit zero.
 /// Signal-Desktop, -Android and -iOS all write an explicit `0`; under proto3
@@ -651,17 +666,19 @@ mod tests {
         assert_eq!(contact_muted_until(&record), Err(EditError::Malformed));
     }
 
-    /// Editing one field must not disturb the other — block and mute share the
-    /// record and the publish path settles both in one write.
+    /// Editing one field must not disturb another — block, mute and archive
+    /// share the record and the publish path settles them in one write.
     #[test]
-    fn block_and_mute_edits_compose() {
+    fn contact_edits_compose() {
         let record = storage_record(&contact_with_unknown_field());
 
         let blocked = set_contact_blocked(&record, true).unwrap();
-        let both = set_contact_muted_until(&blocked, 42).unwrap();
+        let muted = set_contact_muted_until(&blocked, 42).unwrap();
+        let all = set_contact_archived(&muted, true).unwrap();
 
-        assert!(contact_blocked(&both).unwrap());
-        assert_eq!(contact_muted_until(&both).unwrap(), 42);
+        assert!(contact_blocked(&all).unwrap());
+        assert_eq!(contact_muted_until(&all).unwrap(), 42);
+        assert!(contact_archived(&all).unwrap());
     }
 
     #[test]
@@ -839,21 +856,6 @@ mod tests {
         assert!(!contact_archived(&unarchived).unwrap());
     }
 
-    /// Archive rides the same publish as block and mute, so the three edits
-    /// must stack on one record without disturbing each other.
-    #[test]
-    fn archive_block_and_mute_edits_compose() {
-        let record = storage_record(&contact_with_unknown_field());
-
-        let blocked = set_contact_blocked(&record, true).unwrap();
-        let muted = set_contact_muted_until(&blocked, 42).unwrap();
-        let all = set_contact_archived(&muted, true).unwrap();
-
-        assert!(contact_blocked(&all).unwrap());
-        assert_eq!(contact_muted_until(&all).unwrap(), 42);
-        assert!(contact_archived(&all).unwrap());
-    }
-
     #[test]
     fn group_archive_then_unarchive_restores_the_original_bytes() {
         let record = group_record(&group_with_unknown_field());
@@ -868,26 +870,34 @@ mod tests {
         );
     }
 
-    /// `GroupV2Record.archived` is field 4 inside `StorageRecord` field 3, while
-    /// the contact's is field 11 inside field 1 — one test each, so a swapped
-    /// constant fails here rather than on someone's phone.
+    /// A writer and a reader that share a wrong constant agree with each other,
+    /// so only the generated types can pin `archived` to fields 11 and 4.
     #[test]
-    fn archiving_a_group_writes_field_four_and_keeps_the_rest() {
-        let record = group_record(&group_with_unknown_field());
-        let archived = set_group_archived(&record, true).unwrap();
+    fn archived_lands_in_the_generated_records_field() {
+        use libsignal_service::prelude::ProtobufMessage;
+        use libsignal_service::proto::{
+            storage_record::Record, ContactRecord, GroupV2Record, StorageRecord,
+        };
 
-        let payload = record_payload(&archived, STORAGE_RECORD_GROUP_V2).unwrap();
-        let group = &archived[payload];
-        let inner = scan(group).unwrap();
-        assert!(inner.iter().any(|s| s.number == GROUP_V2_RECORD_ARCHIVED));
-        assert!(
-            inner.iter().any(|s| s.number == 7),
-            "dontNotifyForMentionsIfMuted was dropped"
-        );
-        assert!(
-            group.windows(15).any(|w| w == b"from the future"),
-            "unknown field was dropped"
-        );
+        let encode = |record| {
+            StorageRecord {
+                record: Some(record),
+            }
+            .encode_to_vec()
+        };
+        let contact =
+            set_contact_archived(&encode(Record::Contact(ContactRecord::default())), true).unwrap();
+        let group =
+            set_group_archived(&encode(Record::GroupV2(GroupV2Record::default())), true).unwrap();
+
+        match StorageRecord::decode(contact.as_slice()).unwrap().record {
+            Some(Record::Contact(contact)) => assert!(contact.archived),
+            other => panic!("not a contact: {other:?}"),
+        }
+        match StorageRecord::decode(group.as_slice()).unwrap().record {
+            Some(Record::GroupV2(group)) => assert!(group.archived),
+            other => panic!("not a group: {other:?}"),
+        }
     }
 
     #[test]
