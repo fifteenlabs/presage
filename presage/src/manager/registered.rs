@@ -12,7 +12,7 @@ use libsignal_service::protocol::{ProtocolAddress, SessionStore};
 use libsignal_service::session_lock::SessionLocks;
 use libsignal_service::{
     attachment_cipher::decrypt_in_place,
-    backup::{FileReaderFactory, FramesReader, MessageBackupKey, VarintDelimitedReader},
+    backup::MessageBackupKey,
     cipher,
     configuration::{ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, Metadata},
@@ -72,7 +72,7 @@ use url::Url;
 use crate::backup::{
     convert::BackupEdit,
     convert::{self, RecipientInfo},
-    BackupImportProgress, ChatItem, Frame, FrameItem, TransferArchive,
+    BackupImportProgress, ChatItem, FrameItem, TransferArchive,
 };
 use crate::model::calls::{extract_call_event, CallPeer};
 use crate::model::contacts::Contact;
@@ -1024,7 +1024,19 @@ impl<S: Store> Manager<S, Registered> {
         // The server-side URL acts as the version identifier — if it changed, the
         // avatar changed. Mirrors Signal Desktop's existingProfileAvatar.url === avatarUrl check.
         let profile = self.retrieve_profile_by_uuid(uuid, profile_key).await?;
+        self.retrieve_avatar_for_profile(uuid, profile_key, &profile)
+            .await
+    }
 
+    /// The avatar of a profile the caller already fetched: the cached bytes if
+    /// they were cached under the profile's avatar URL, otherwise downloaded,
+    /// decrypted and cached now. `None` when the profile has no avatar.
+    pub async fn retrieve_avatar_for_profile(
+        &mut self,
+        uuid: Uuid,
+        profile_key: ProfileKey,
+        profile: &Profile,
+    ) -> Result<Option<AvatarBytes>, Error<S::Error>> {
         let Some(avatar_url) = profile.avatar.as_deref() else {
             return Ok(None);
         };
@@ -1054,10 +1066,8 @@ impl<S: Store> Manager<S, Registered> {
     ) -> Result<AvatarBytes, Error<S::Error>> {
         let mut websocket = self.unidentified_websocket().await?;
         let mut avatar_stream = websocket.retrieve_profile_avatar(avatar_url).await?;
-        // 10MB is what Signal Android allocates
-        let mut contents = Vec::with_capacity(10 * 1024 * 1024);
-        let len = avatar_stream.read_to_end(&mut contents).await?;
-        contents.truncate(len);
+        let mut contents = Vec::new();
+        avatar_stream.read_to_end(&mut contents).await?;
 
         let cipher = ProfileCipher::new(profile_key);
         let avatar = cipher.decrypt_avatar(&contents)?;
@@ -2819,17 +2829,7 @@ impl<S: Store> Manager<S, Registered> {
         message_backup_key: &MessageBackupKey,
         aci: libsignal_service::protocol::Aci,
     ) -> Result<Vec<BackupEdit>, Error<S::Error>> {
-        let factory = FileReaderFactory {
-            path: path.to_owned(),
-        };
-        let frames_reader = FramesReader::new(message_backup_key, factory)
-            .await
-            .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
-        let mut reader = VarintDelimitedReader::new(frames_reader);
-
-        // The first record is the BackupInfo header, not a Frame.
-        reader
-            .read_next()
+        let mut frames = crate::backup::open_frames(path, message_backup_key)
             .await
             .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
 
@@ -2842,13 +2842,11 @@ impl<S: Store> Manager<S, Registered> {
         let mut edits = Vec::new();
         let mut own_avatar_url = None;
 
-        while let Some(bytes) = reader
-            .read_next()
+        while let Some(frame) = frames
+            .next()
             .await
             .map_err(|e| Error::BackupImportFailed(e.to_string()))?
         {
-            let frame = Frame::decode_bytes(bytes.as_ref())
-                .map_err(|e| Error::BackupImportFailed(e.to_string()))?;
             match frame.item {
                 // Of AccountData only our own profile is kept: presage has no
                 // settings storage layer yet.
