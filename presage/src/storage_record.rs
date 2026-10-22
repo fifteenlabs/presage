@@ -14,6 +14,8 @@
 
 use std::ops::Range;
 
+use crate::model::account::PinnedConversation;
+
 /// `StorageRecord.contact`, from `StorageService.proto`.
 const STORAGE_RECORD_CONTACT: u32 = 1;
 /// `StorageRecord.groupV2`, from `StorageService.proto`.
@@ -22,6 +24,14 @@ const STORAGE_RECORD_GROUP_V2: u32 = 3;
 const STORAGE_RECORD_CHAT_FOLDER: u32 = 8;
 /// `StorageRecord.stickerPack`, from `StorageService.proto`.
 const STORAGE_RECORD_STICKER_PACK: u32 = 6;
+/// `StorageRecord.account`, from `StorageService.proto`.
+const STORAGE_RECORD_ACCOUNT: u32 = 4;
+/// `AccountRecord.noteToSelfArchived`.
+const ACCOUNT_RECORD_NOTE_TO_SELF_ARCHIVED: u32 = 5;
+/// `AccountRecord.pinnedConversations`.
+const ACCOUNT_RECORD_PINNED_CONVERSATIONS: u32 = 14;
+/// `AccountRecord.keepMutedChatsArchived`.
+const ACCOUNT_RECORD_KEEP_MUTED_CHATS_ARCHIVED: u32 = 25;
 /// Every `ChatFolderRecord` field presage models, `identifier` through
 /// `deletedAtTimestampMs`. Anything outside is carried through verbatim.
 const CHAT_FOLDER_RECORD_KNOWN_FIELDS: std::ops::RangeInclusive<u32> = 1..=11;
@@ -147,6 +157,9 @@ fn scan(msg: &[u8]) -> Result<Vec<FieldSpan>, EditError> {
 ///
 /// Every other field keeps its bytes and its position. A field that was absent
 /// is appended, which is where a protobuf encoder would have put it anyway.
+///
+/// `replacement` is written as one block, so for a repeated field it may hold
+/// several encoded occurrences: they land together, in the order given.
 fn set_field(msg: &[u8], number: u32, replacement: Option<&[u8]>) -> Result<Vec<u8>, EditError> {
     let spans = scan(msg)?;
     let mut out = Vec::with_capacity(msg.len() + replacement.map_or(0, <[u8]>::len));
@@ -370,6 +383,116 @@ pub fn set_group_archived(record: &[u8], archived: bool) -> Result<Vec<u8>, Edit
         STORAGE_RECORD_GROUP_V2,
         GROUP_V2_RECORD_ARCHIVED,
         archived,
+    )
+}
+
+/// The payload of every occurrence of length-delimited field `number` in `msg`,
+/// in wire order.
+fn repeated_len_field(msg: &[u8], number: u32) -> Result<Vec<Vec<u8>>, EditError> {
+    scan(msg)?
+        .into_iter()
+        .filter(|span| span.number == number)
+        .map(|span| {
+            if span.wire_type != WIRE_LEN {
+                return Err(EditError::Malformed);
+            }
+            Ok(msg[span.payload].to_vec())
+        })
+        .collect()
+}
+
+fn encode_repeated_len_field<'a>(
+    number: u32,
+    entries: impl IntoIterator<Item = &'a [u8]>,
+) -> Vec<u8> {
+    entries
+        .into_iter()
+        .flat_map(|entry| encode_len_delimited(number, entry))
+        .collect()
+}
+
+/// Read `AccountRecord.noteToSelfArchived` out of an encoded `StorageRecord`.
+pub fn account_note_to_self_archived(record: &[u8]) -> Result<bool, EditError> {
+    record_bool_field(
+        record,
+        STORAGE_RECORD_ACCOUNT,
+        ACCOUNT_RECORD_NOTE_TO_SELF_ARCHIVED,
+    )
+}
+
+/// Set `AccountRecord.noteToSelfArchived` on an encoded `StorageRecord`. See
+/// [`set_bool_field`] for the unarchive convention.
+pub fn set_account_note_to_self_archived(
+    record: &[u8],
+    archived: bool,
+) -> Result<Vec<u8>, EditError> {
+    set_bool_field(
+        record,
+        STORAGE_RECORD_ACCOUNT,
+        ACCOUNT_RECORD_NOTE_TO_SELF_ARCHIVED,
+        archived,
+    )
+}
+
+/// Read `AccountRecord.keepMutedChatsArchived` out of an encoded
+/// `StorageRecord`. Absent reads as `false`, which is also Signal-Desktop's
+/// default for an account that never set it.
+pub fn account_keep_muted_chats_archived(record: &[u8]) -> Result<bool, EditError> {
+    record_bool_field(
+        record,
+        STORAGE_RECORD_ACCOUNT,
+        ACCOUNT_RECORD_KEEP_MUTED_CHATS_ARCHIVED,
+    )
+}
+
+/// Read `AccountRecord.pinnedConversations` out of an encoded `StorageRecord`,
+/// each entry exactly as the record carries it, in pin order.
+pub fn account_pinned_conversations(record: &[u8]) -> Result<Vec<PinnedConversation>, EditError> {
+    let payload = record_payload(record, STORAGE_RECORD_ACCOUNT)?;
+    Ok(
+        repeated_len_field(&record[payload], ACCOUNT_RECORD_PINNED_CONVERSATIONS)?
+            .into_iter()
+            .map(PinnedConversation::from_bytes)
+            .collect(),
+    )
+}
+
+/// Make an encoded `StorageRecord { account }` pin exactly `pinned`, in order,
+/// preserving every other byte of both messages.
+///
+/// The entries are written as one block where the first old one was. An entry
+/// that was already pinned keeps its bytes, so a pin this build cannot read —
+/// the release-notes chat, a legacy group, a contact known only by number —
+/// survives every edit made around it.
+pub fn set_account_pinned_conversations(
+    record: &[u8],
+    pinned: &[PinnedConversation],
+) -> Result<Vec<u8>, EditError> {
+    let entries = encode_pinned_conversations(pinned);
+    set_record_field(
+        record,
+        STORAGE_RECORD_ACCOUNT,
+        ACCOUNT_RECORD_PINNED_CONVERSATIONS,
+        (!pinned.is_empty()).then_some(entries.as_slice()),
+    )
+}
+
+/// `pinned` in the wire form `AccountRecord.pinnedConversations` takes, for a
+/// store to keep the list as one value.
+pub fn encode_pinned_conversations(pinned: &[PinnedConversation]) -> Vec<u8> {
+    encode_repeated_len_field(
+        ACCOUNT_RECORD_PINNED_CONVERSATIONS,
+        pinned.iter().map(PinnedConversation::as_bytes),
+    )
+}
+
+/// The inverse of [`encode_pinned_conversations`].
+pub fn decode_pinned_conversations(bytes: &[u8]) -> Result<Vec<PinnedConversation>, EditError> {
+    Ok(
+        repeated_len_field(bytes, ACCOUNT_RECORD_PINNED_CONVERSATIONS)?
+            .into_iter()
+            .map(PinnedConversation::from_bytes)
+            .collect(),
     )
 }
 
@@ -1151,5 +1274,128 @@ mod sticker_pack_tests {
             set_sticker_pack_state(&record, &removed()),
             Err(EditError::WrongRecordType)
         );
+    }
+
+    /// An `AccountRecord` with a given name (field 2), a pinned release-notes
+    /// chat (field 14), `readReceipts` (field 6) and a field number no version
+    /// of the proto we compile against defines.
+    fn account_with_unknown_field() -> Vec<u8> {
+        let mut account = Vec::new();
+        account.extend_from_slice(&encode_len_delimited(2, b"Ada"));
+        account.extend_from_slice(&encode_len_delimited(
+            ACCOUNT_RECORD_PINNED_CONVERSATIONS,
+            &release_notes_pin(),
+        ));
+        account.extend_from_slice(&encode_varint_field(6, 1));
+        account.extend_from_slice(&encode_len_delimited(252, b"from the future"));
+        account
+    }
+
+    fn account_record(account: &[u8]) -> Vec<u8> {
+        encode_len_delimited(STORAGE_RECORD_ACCOUNT, account)
+    }
+
+    /// `PinnedConversation { releaseNotes {} }`, which presage has no thread for.
+    fn release_notes_pin() -> Vec<u8> {
+        encode_len_delimited(5, &[])
+    }
+
+    fn contact_pin(n: u128) -> PinnedConversation {
+        use libsignal_service::prelude::Uuid;
+        use libsignal_service::protocol::{Aci, ServiceId};
+
+        PinnedConversation::for_thread(&crate::store::Thread::Contact(ServiceId::Aci(Aci::from(
+            Uuid::from_u128(n),
+        ))))
+    }
+
+    #[test]
+    fn note_to_self_archive_then_unarchive_restores_the_original_bytes() {
+        let record = account_record(&account_with_unknown_field());
+
+        let archived = set_account_note_to_self_archived(&record, true).unwrap();
+        assert!(account_note_to_self_archived(&archived).unwrap());
+
+        let unarchived = set_account_note_to_self_archived(&archived, false).unwrap();
+        assert_eq!(unarchived, record);
+    }
+
+    #[test]
+    fn pinning_and_unpinning_keep_every_other_field_and_the_pin_it_cannot_read() {
+        let record = account_record(&account_with_unknown_field());
+        let original = account_pinned_conversations(&record).unwrap();
+        assert_eq!(
+            original,
+            vec![PinnedConversation::from_bytes(release_notes_pin())]
+        );
+
+        let mut pinned = original.clone();
+        pinned.push(contact_pin(1));
+        let edited = set_account_pinned_conversations(&record, &pinned).unwrap();
+        assert_eq!(account_pinned_conversations(&edited).unwrap(), pinned);
+
+        let restored = set_account_pinned_conversations(&edited, &original).unwrap();
+        assert_eq!(
+            restored, record,
+            "pinning and unpinning must not accumulate bytes or reorder fields"
+        );
+    }
+
+    #[test]
+    fn unpinning_everything_removes_the_field() {
+        let record = account_record(&account_with_unknown_field());
+
+        let cleared = set_account_pinned_conversations(&record, &[]).unwrap();
+        assert!(account_pinned_conversations(&cleared).unwrap().is_empty());
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&encode_len_delimited(2, b"Ada"));
+        expected.extend_from_slice(&encode_varint_field(6, 1));
+        expected.extend_from_slice(&encode_len_delimited(252, b"from the future"));
+        assert_eq!(cleared, account_record(&expected));
+    }
+
+    #[test]
+    fn a_stored_pin_list_round_trips() {
+        let pinned = vec![
+            PinnedConversation::from_bytes(release_notes_pin()),
+            contact_pin(2),
+        ];
+        assert_eq!(
+            decode_pinned_conversations(&encode_pinned_conversations(&pinned)).unwrap(),
+            pinned
+        );
+        assert!(decode_pinned_conversations(&[]).unwrap().is_empty());
+    }
+
+    /// As for `archived`: only the generated types can pin the account fields
+    /// to their numbers.
+    #[test]
+    fn account_fields_land_in_the_generated_records_fields() {
+        use libsignal_service::prelude::ProtobufMessage;
+        use libsignal_service::proto::{storage_record::Record, AccountRecord, StorageRecord};
+
+        let encode = |account| {
+            StorageRecord {
+                record: Some(Record::Account(account)),
+            }
+            .encode_to_vec()
+        };
+        let record = set_account_note_to_self_archived(&encode(AccountRecord::default()), true)
+            .and_then(|record| set_account_pinned_conversations(&record, &[contact_pin(3)]))
+            .unwrap();
+
+        match StorageRecord::decode(record.as_slice()).unwrap().record {
+            Some(Record::Account(account)) => {
+                assert!(account.note_to_self_archived);
+                assert_eq!(account.pinned_conversations.len(), 1);
+            }
+            other => panic!("not an account: {other:?}"),
+        }
+
+        let keep_muted = encode(AccountRecord {
+            keep_muted_chats_archived: true,
+            ..Default::default()
+        });
+        assert!(account_keep_muted_chats_archived(&keep_muted).unwrap());
     }
 }

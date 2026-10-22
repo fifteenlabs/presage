@@ -54,6 +54,10 @@ pub enum Error<S: std::error::Error> {
     StorageRecordUnknown,
     #[error("could not edit stored storage record: {0}")]
     StorageRecordEdit(#[from] crate::storage_record::StorageRecordEditError),
+    /// Note to Self has no `ContactRecord`. Its archive state lives in the
+    /// account record, and Signal keeps no mute or block for it anywhere.
+    #[error("Note to Self cannot be muted or blocked")]
+    NoteToSelfHasNoContactRecord,
     /// Empty, or longer than Signal's 32-grapheme limit — the same rule every
     /// official client enforces before a folder reaches the storage service.
     #[error("chat folder name is empty or longer than 32 graphemes")]
