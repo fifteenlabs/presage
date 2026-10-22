@@ -8,8 +8,6 @@ use futures::AsyncRead;
 use libsignal_service::backup::{
     FileReaderFactory, FramesReader, MessageBackupKey, VarintDelimitedReader,
 };
-use libsignal_service::prelude::ProtobufMessage;
-use libsignal_service::proto::backup::BackupInfo;
 
 pub use libsignal_service::proto::backup::{
     frame::Item as FrameItem, Chat, ChatItem, Frame, Recipient,
@@ -55,14 +53,10 @@ pub(crate) async fn open_frames(
         .await
         .map_err(io::Error::other)?;
     let mut reader = VarintDelimitedReader::new(frames);
-    let header = reader.read_next().await?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "backup has no BackupInfo header",
-        )
-    })?;
-    BackupInfo::decode(header.as_ref())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    reader
+        .read_next()
+        .await?
+        .ok_or_else(|| io::Error::other("backup has no BackupInfo header"))?;
     Ok(BackupFrames { reader })
 }
 
@@ -73,7 +67,7 @@ impl<R: AsyncRead + Unpin> BackupFrames<R> {
         };
         Frame::decode_bytes(bytes.as_ref())
             .map(Some)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            .map_err(io::Error::other)
     }
 }
 
