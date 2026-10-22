@@ -1783,44 +1783,70 @@ impl<S: Store> Manager<S, Registered> {
         self.send_blocked_sync().await
     }
 
-    /// Set a contact's mute expiry (ms since epoch; `0` unmutes, `i64::MAX` is
+    /// Set a chat's mute expiry (ms since epoch; `0` unmutes, `i64::MAX` is
     /// "muted always").
     ///
     /// Same shape as [`set_blocked`](Self::set_blocked) — the local write and
     /// the storage-sync mark are one step, publishing is
-    /// [`push_pending_contact_records`](Self::push_pending_contact_records) —
-    /// minus its sync message: Signal has no mute sync message, the storage
-    /// service is the only cross-device channel, and every successful manifest
-    /// write already nudges the other devices via `FetchLatest`.
+    /// [`push_pending_contact_records`](Self::push_pending_contact_records) or
+    /// [`push_pending_group_records`](Self::push_pending_group_records) — minus
+    /// its sync message: Signal has no mute sync message, the storage service is
+    /// the only cross-device channel, and every successful manifest write already
+    /// nudges the other devices via `FetchLatest`.
     pub async fn set_muted_until(
         &mut self,
-        service_id: ServiceId,
+        thread: &Thread,
         muted_until_timestamp: u64,
     ) -> Result<(), Error<S::Error>> {
-        self.edit_contact_for_publish(&service_id, |contact| {
-            contact.muted_until_timestamp = muted_until_timestamp
-        })
-        .await
+        match thread {
+            Thread::Contact(service_id) => {
+                self.edit_contact_for_publish(service_id, |contact| {
+                    contact.muted_until_timestamp = muted_until_timestamp
+                })
+                .await
+            }
+            Thread::Group(master_key) => {
+                self.edit_group_for_publish(*master_key, |group| {
+                    group.muted_until_timestamp = muted_until_timestamp
+                })
+                .await
+            }
+        }
     }
 
-    /// Set a group's mute expiry (ms since epoch; `0` unmutes, `i64::MAX` is
-    /// "muted always").
-    ///
-    /// The group twin of [`set_muted_until`](Self::set_muted_until): the local
-    /// write and the storage-sync mark are one step, publishing is
-    /// [`push_pending_group_records`](Self::push_pending_group_records), and
-    /// there is no sync message because Signal has none for mute.
+    /// Archive or unarchive a chat. Same shape as
+    /// [`set_muted_until`](Self::set_muted_until), and for the same reason
+    /// without a sync message: Signal has none for archive.
+    pub async fn set_archived(
+        &mut self,
+        thread: &Thread,
+        archived: bool,
+    ) -> Result<(), Error<S::Error>> {
+        match thread {
+            Thread::Contact(service_id) => {
+                self.edit_contact_for_publish(service_id, |contact| contact.archived = archived)
+                    .await
+            }
+            Thread::Group(master_key) => {
+                self.edit_group_for_publish(*master_key, |group| group.archived = archived)
+                    .await
+            }
+        }
+    }
+
+    /// The group twin of [`edit_contact_for_publish`](Self::edit_contact_for_publish):
+    /// the local write and the storage-sync mark are one step.
     ///
     /// Unlike the contact path there is no `Group::minimal` to fall back on — a
     /// group has a title, members and a revision that cannot be invented — so a
     /// group we have never seen is [`Error::UnknownGroup`] rather than a stub.
-    pub async fn set_group_muted_until(
+    async fn edit_group_for_publish(
         &mut self,
         master_key: GroupMasterKeyBytes,
-        muted_until_timestamp: u64,
+        edit: impl FnOnce(&mut Group),
     ) -> Result<(), Error<S::Error>> {
         let mut group = self.stored_group(&master_key).await?;
-        group.muted_until_timestamp = muted_until_timestamp;
+        edit(&mut group);
         self.store.save_group(master_key, group).await?;
         self.store
             .set_group_needs_storage_sync(master_key, true)
