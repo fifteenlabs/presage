@@ -34,17 +34,21 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 use tracing::{debug, info, warn};
 
 use super::chat_folders::stage_chat_folder;
+use crate::model::account::AccountChatState;
 use crate::model::chat_folders::{ChatFolder, ChatFolderType};
 use crate::model::contacts::Contact;
 use crate::model::groups::Group;
 use crate::storage_record::{
-    chat_folder_unknown_fields, contact_archived, contact_blocked, contact_muted_until,
-    encode_chat_folder_record, group_archived, group_muted_until, set_contact_archived,
-    set_contact_blocked, set_contact_muted_until, set_group_archived, set_group_muted_until,
-    set_sticker_pack_state, sticker_pack_state, StorageRecordEditError,
+    account_note_to_self_archived, account_pinned_conversations, chat_folder_unknown_fields,
+    contact_archived, contact_blocked, contact_muted_until, encode_chat_folder_record,
+    group_archived, group_muted_until, set_account_note_to_self_archived,
+    set_account_pinned_conversations, set_contact_archived, set_contact_blocked,
+    set_contact_muted_until, set_group_archived, set_group_muted_until, set_sticker_pack_state,
+    sticker_pack_state, StorageRecordEditError,
 };
 use crate::store::{
     StickerPackRecordState, StorageRecordIdentity, StorageRecordKey, StorageSyncCursor, Store,
+    Thread,
 };
 use crate::{Error, Manager};
 
@@ -126,8 +130,8 @@ impl<S: Store> Manager<S, Registered> {
     /// Append one record to the account's storage manifest.
     ///
     /// Every existing identifier is copied through **verbatim**, including record types
-    /// presage does not model (account, story distribution lists, call links, chat
-    /// folders, notification profiles). The server treats the manifest as the complete
+    /// presage does not model (story distribution lists, call links, notification
+    /// profiles). The server treats the manifest as the complete
     /// index of the account, so anything dropped here would be deleted from every device
     /// the user owns — which is why this appends rather than regenerating the way
     /// Signal-Desktop's `generateManifest` does.
@@ -482,6 +486,11 @@ impl<S: Store> Manager<S, Registered> {
                     .set_sticker_pack_needs_storage_sync(id, needs_sync)
                     .await?
             }
+            StorageRecordKey::Account => {
+                self.store
+                    .set_account_needs_storage_sync(needs_sync)
+                    .await?
+            }
         }
         Ok(())
     }
@@ -503,6 +512,7 @@ impl<S: Store> Manager<S, Registered> {
             StorageRecordKey::StickerPack(id) => {
                 self.store.sticker_pack_storage_identity(id).await?
             }
+            StorageRecordKey::Account => self.store.account_storage_identity().await?,
         })
     }
 
@@ -532,6 +542,7 @@ impl<S: Store> Manager<S, Registered> {
                     .save_sticker_pack_storage_identity(id, identity)
                     .await?
             }
+            StorageRecordKey::Account => self.store.save_account_storage_identity(identity).await?,
         }
         Ok(())
     }
@@ -707,6 +718,48 @@ impl<S: Store> Manager<S, Registered> {
                     .set_group_needs_storage_sync(master_key, true)
                     .await?;
             }
+        }
+        Ok(())
+    }
+
+    /// Publish the account's pins and Note to Self archive if they have changed
+    /// here since the storage service last heard.
+    ///
+    /// Same contract as the contact drain: no argument, the work list is the
+    /// store's flag, safe to call at any time. One difference: when the account
+    /// has no record we know of, nothing is appended. Every client expects
+    /// exactly one `AccountRecord`, so the flag stays up until a sync has read
+    /// the one the account already holds.
+    ///
+    /// Callers must hold the storage-service lock.
+    pub async fn push_pending_account_record(&mut self) -> Result<(), Error<S::Error>> {
+        if !self.store.account_needs_storage_sync().await? {
+            return Ok(());
+        }
+        let state = self.store.account_chat_state().await?;
+        debug!("storage manifest: publishing the account record");
+
+        match self
+            .update_storage_record(&StorageRecordKey::Account, |record| {
+                let diff = AccountPendingPublish::diff(record, &state)?;
+                diff.any().then(|| diff.apply(record, &state)).transpose()
+            })
+            .await
+        {
+            Err(Error::StorageRecordUnknown) => {
+                warn!("storage manifest: no account record read yet, keeping the change pending");
+                self.store.set_account_needs_storage_sync(true).await?;
+                return Ok(());
+            }
+            other => other?,
+        }
+
+        // See `push_contact_record`: the user may have pinned again while this
+        // publish was in flight, and the flag it cleared has to go back up.
+        let current = self.store.account_chat_state().await?;
+        if AccountPendingPublish::between(&current, &state).any() {
+            debug!("storage manifest: account changed while publishing, re-flagging");
+            self.store.set_account_needs_storage_sync(true).await?;
         }
         Ok(())
     }
@@ -1255,6 +1308,170 @@ impl GroupPendingPublish {
     }
 }
 
+/// Apply the account's `AccountRecord` over the stored chat state, keeping
+/// whatever this device changed and has not published yet. The account twin
+/// of [`merge_contact_from_snapshot`]: the record we merge from is the one the
+/// pending publish is about to replace.
+///
+/// `keepMutedChatsArchived` is only ever read here, so the record's value
+/// always wins.
+pub(super) fn merge_account_from_snapshot(
+    local: AccountChatState,
+    remote: AccountChatState,
+    pending: AccountPendingPublish,
+) -> AccountChatState {
+    let AccountPendingPublish {
+        note_to_self_archived,
+        pinned,
+    } = pending;
+    AccountChatState {
+        note_to_self_archived: if note_to_self_archived {
+            local.note_to_self_archived
+        } else {
+            remote.note_to_self_archived
+        },
+        keep_muted_chats_archived: remote.keep_muted_chats_archived,
+        pinned: if pinned { local.pinned } else { remote.pinned },
+    }
+}
+
+/// The first `AccountRecord` this device reads. With no earlier copy there is
+/// nothing to diff a pending change against, so the per-field guard cannot
+/// tell an edit from a default. What it can tell: every pin made here before
+/// now was an addition, since a pin this device never heard of cannot have
+/// been removed here. Those are kept after the account's own; everything else
+/// is the record's.
+pub(super) fn adopt_first_account_record(
+    local: AccountChatState,
+    remote: AccountChatState,
+) -> AccountChatState {
+    let mut adopted = remote;
+    for thread in local.pinned_threads() {
+        adopted.pin(&thread);
+    }
+    adopted
+}
+
+/// The publishable fields of the account's chat state, as a "which ones"
+/// bitmap. The account twin of [`PendingPublish`], and the same contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct AccountPendingPublish {
+    pub note_to_self_archived: bool,
+    pub pinned: bool,
+}
+
+impl AccountPendingPublish {
+    const ALL: Self = Self {
+        note_to_self_archived: true,
+        pinned: true,
+    };
+
+    /// The publishable fields on which `local` disagrees with the published
+    /// record bytes.
+    fn diff(record: &[u8], local: &AccountChatState) -> Result<Self, StorageRecordEditError> {
+        Ok(Self {
+            note_to_self_archived: account_note_to_self_archived(record)?
+                != local.note_to_self_archived,
+            pinned: account_pinned_conversations(record)? != local.pinned,
+        })
+    }
+
+    /// The publishable fields on which two stored states disagree.
+    fn between(a: &AccountChatState, b: &AccountChatState) -> Self {
+        Self {
+            note_to_self_archived: a.note_to_self_archived != b.note_to_self_archived,
+            pinned: a.pinned != b.pinned,
+        }
+    }
+
+    fn any(&self) -> bool {
+        *self != Self::default()
+    }
+
+    /// `record` with every pending field set to `local`'s value.
+    fn apply(
+        self,
+        record: &[u8],
+        local: &AccountChatState,
+    ) -> Result<Vec<u8>, StorageRecordEditError> {
+        let Self {
+            note_to_self_archived,
+            pinned,
+        } = self;
+        let mut edited = record.to_vec();
+        if note_to_self_archived {
+            edited = set_account_note_to_self_archived(&edited, local.note_to_self_archived)?;
+        }
+        if pinned {
+            edited = set_account_pinned_conversations(&edited, &local.pinned)?;
+        }
+        Ok(edited)
+    }
+}
+
+/// Compute [`AccountPendingPublish`]. The contact twin's contract applies
+/// unchanged — see [`pending_publish_intent`].
+pub(super) async fn account_pending_publish_intent<S: Store>(
+    store: &S,
+    local: &AccountChatState,
+    flagged: bool,
+) -> AccountPendingPublish {
+    if !flagged {
+        return AccountPendingPublish::default();
+    }
+    match store.account_storage_identity().await {
+        Ok(Some(identity)) => AccountPendingPublish::diff(&identity.record, local)
+            .unwrap_or(AccountPendingPublish::ALL),
+        _ => AccountPendingPublish::ALL,
+    }
+}
+
+/// A pinned chat is never archived: Signal-Desktop clears `isArchived` on every
+/// chat the account record pins. Local only, as there — the chat's own record
+/// is not republished, so nothing is flagged.
+///
+/// A chat with an unpublished change of its own is left alone. That change may
+/// be the archive the user just made, whose unpin this sync has not seen yet.
+async fn unarchive_pinned<S: Store>(
+    store: &mut S,
+    state: &AccountChatState,
+    contact_pending: &std::collections::HashSet<ServiceId>,
+    group_pending: &std::collections::HashSet<GroupMasterKeyBytes>,
+) {
+    for thread in state.pinned_threads() {
+        match thread {
+            Thread::Contact(service_id) => {
+                if contact_pending.contains(&service_id) {
+                    continue;
+                }
+                let Ok(Some(mut contact)) = store.contact_by_id(&service_id).await else {
+                    continue;
+                };
+                if contact.archived {
+                    contact.archived = false;
+                    if let Err(e) = store.save_contact(&contact).await {
+                        warn!(%e, "storage sync: failed to unarchive a pinned contact");
+                    }
+                }
+            }
+            Thread::Group(master_key) => {
+                if group_pending.contains(&master_key) {
+                    continue;
+                }
+                let Ok(Some(mut group)) = store.group(master_key).await else {
+                    continue;
+                };
+                if group.archived {
+                    group.archived = false;
+                    if let Err(e) = store.save_group(master_key, group).await {
+                        warn!(%e, "storage sync: failed to unarchive a pinned group");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Compute [`GroupPendingPublish`] for a group. The contact twin's contract
 /// applies unchanged — see [`pending_publish_intent`], including why this must
 /// run *before* the fresh identity from an in-flight sync overwrites the stored
@@ -1345,6 +1562,7 @@ async fn sync_storage_service<S: Store>(
     let mut group_keys: Vec<Vec<u8>> = Vec::new();
     let mut folder_keys: Vec<Vec<u8>> = Vec::new();
     let mut sticker_pack_keys: Vec<Vec<u8>> = Vec::new();
+    let mut account_keys: Vec<Vec<u8>> = Vec::new();
     let mut manifest_ids: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     for id in &manifest_record.identifiers {
         match id.r#type() {
@@ -1352,9 +1570,19 @@ async fn sync_storage_service<S: Store>(
             StorageType::Groupv2 => group_keys.push(id.raw.clone()),
             StorageType::ChatFolder => folder_keys.push(id.raw.clone()),
             StorageType::StickerPack => sticker_pack_keys.push(id.raw.clone()),
+            StorageType::Account => account_keys.push(id.raw.clone()),
             _ => {}
         }
         manifest_ids.insert(id.raw.clone());
+    }
+    // Every client expects exactly one account record. Should there be more,
+    // read only the last, as Signal-Desktop does; writing never adds one.
+    if account_keys.len() > 1 {
+        warn!(
+            count = account_keys.len(),
+            "storage sync: manifest lists more than one account record, reading the last"
+        );
+        account_keys.drain(..account_keys.len() - 1);
     }
     debug!(
         count = contact_keys.len(),
@@ -1373,6 +1601,7 @@ async fn sync_storage_service<S: Store>(
         && group_keys.is_empty()
         && folder_keys.is_empty()
         && sticker_pack_keys.is_empty()
+        && account_keys.is_empty()
     {
         debug!("storage sync: nothing to sync");
         store
@@ -1385,17 +1614,21 @@ async fn sync_storage_service<S: Store>(
 
     // Folders go in their own batches after every contact and group batch, so
     // by the time one is merged its recipients are already in the store — the
-    // same ordering Signal-Desktop imposes. Keeping the types in separate
-    // batches is what makes that hold under the per-batch resume cursor.
+    // same ordering Signal-Desktop imposes. The account record comes last of
+    // all, for the same reason: its pins name contacts and groups, and a pinned
+    // chat is unarchived only once their records have been merged. Keeping the
+    // types in separate batches is what makes that hold under the per-batch
+    // resume cursor.
     let subject_keys: Vec<Vec<u8>> = contact_keys
         .into_iter()
         .chain(group_keys)
         .chain(sticker_pack_keys)
         .collect();
-    let total = subject_keys.len() + folder_keys.len();
+    let total = subject_keys.len() + folder_keys.len() + account_keys.len();
     let batches: Vec<&[Vec<u8>]> = subject_keys
         .chunks(STORAGE_SERVICE_BATCH_SIZE)
         .chain(folder_keys.chunks(STORAGE_SERVICE_BATCH_SIZE))
+        .chain(account_keys.chunks(STORAGE_SERVICE_BATCH_SIZE))
         .collect();
     debug!(total, "storage sync: fetching storage records in batches");
 
@@ -1427,6 +1660,7 @@ async fn sync_storage_service<S: Store>(
         .unwrap_or_default()
         .into_iter()
         .collect();
+    let account_pending = store.account_needs_storage_sync().await.unwrap_or_default();
     if !contact_pending.is_empty()
         || !group_pending.is_empty()
         || !folder_pending.is_empty()
@@ -1658,6 +1892,43 @@ async fn sync_storage_service<S: Store>(
                     {
                         warn!(%e, "storage sync: failed to save sticker pack storage identity");
                     }
+                }
+                Some(libsignal_service::proto::storage_record::Record::Account(_)) => {
+                    // Read from the plaintext rather than the decoded record:
+                    // the pins are kept as the bytes the record carried.
+                    let remote = match AccountChatState::from_record(&item.plaintext) {
+                        Ok(state) => state,
+                        Err(e) => {
+                            warn!("storage sync: skipping account record: {e}");
+                            continue;
+                        }
+                    };
+                    debug!(
+                        pinned = remote.pinned.len(),
+                        "storage sync: saving account chat state"
+                    );
+                    let local = store.account_chat_state().await.unwrap_or_default();
+                    let merged = match store.account_storage_identity().await {
+                        Ok(None) => adopt_first_account_record(local, remote),
+                        _ => {
+                            let pending =
+                                account_pending_publish_intent(store, &local, account_pending)
+                                    .await;
+                            merge_account_from_snapshot(local, remote, pending)
+                        }
+                    };
+                    if let Err(e) = store.save_account_chat_state(&merged).await {
+                        warn!(%e, "storage sync: failed to save account chat state");
+                    }
+                    let identity = StorageRecordIdentity {
+                        storage_id: item.key,
+                        storage_version: manifest_version,
+                        record: item.plaintext,
+                    };
+                    if let Err(e) = store.save_account_storage_identity(&identity).await {
+                        warn!(%e, "storage sync: failed to save account storage identity");
+                    }
+                    unarchive_pinned(store, &merged, &contact_pending, &group_pending).await;
                 }
                 Some(other) => {
                     debug!(?other, "storage sync: skipping unmodelled record");
@@ -2470,5 +2741,130 @@ mod tests {
 
         assert!(preserved.is_empty());
         assert!(incoming.name.is_empty());
+    }
+
+    fn pinned_contact(n: u128) -> Thread {
+        Thread::Contact(ServiceId::Aci(Aci::from(Uuid::from_u128(n))))
+    }
+
+    fn pins(threads: &[Thread]) -> Vec<crate::model::account::PinnedConversation> {
+        threads
+            .iter()
+            .map(crate::model::account::PinnedConversation::for_thread)
+            .collect()
+    }
+
+    fn empty_account_record() -> Vec<u8> {
+        StorageRecord {
+            record: Some(storage_record::Record::Account(Default::default())),
+        }
+        .encode_to_vec()
+    }
+
+    /// A pin made here and not yet published survives the record it is about
+    /// to replace, while the phone's keep-muted setting still lands.
+    #[test]
+    fn a_pending_pin_survives_but_takes_a_remote_keep_muted() {
+        let local = AccountChatState {
+            pinned: pins(&[pinned_contact(1), pinned_contact(2)]),
+            ..Default::default()
+        };
+        let remote = AccountChatState {
+            pinned: pins(&[pinned_contact(1)]),
+            keep_muted_chats_archived: true,
+            note_to_self_archived: true,
+        };
+
+        let merged = merge_account_from_snapshot(
+            local.clone(),
+            remote,
+            AccountPendingPublish {
+                pinned: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(merged.pinned, local.pinned);
+        assert!(merged.keep_muted_chats_archived);
+        assert!(merged.note_to_self_archived);
+    }
+
+    #[test]
+    fn an_account_with_nothing_pending_takes_the_remote_values() {
+        let local = AccountChatState {
+            pinned: pins(&[pinned_contact(1)]),
+            note_to_self_archived: true,
+            ..Default::default()
+        };
+        let remote = AccountChatState {
+            pinned: pins(&[Thread::Group([5u8; 32])]),
+            keep_muted_chats_archived: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            merge_account_from_snapshot(local, remote.clone(), AccountPendingPublish::default()),
+            remote
+        );
+    }
+
+    #[test]
+    fn account_publish_intent_diffs_against_the_record() {
+        let record =
+            set_account_pinned_conversations(&empty_account_record(), &pins(&[pinned_contact(1)]))
+                .unwrap();
+        let mut local = AccountChatState::from_record(&record).unwrap();
+        assert_eq!(
+            AccountPendingPublish::diff(&record, &local).unwrap(),
+            AccountPendingPublish::default()
+        );
+
+        local.pin(&pinned_contact(2));
+        local.note_to_self_archived = true;
+        assert_eq!(
+            AccountPendingPublish::diff(&record, &local).unwrap(),
+            AccountPendingPublish::ALL
+        );
+    }
+
+    #[test]
+    fn applying_an_account_diff_leaves_nothing_pending() {
+        let record = empty_account_record();
+        let local = AccountChatState {
+            note_to_self_archived: true,
+            pinned: pins(&[pinned_contact(1), Thread::Group([5u8; 32])]),
+            ..Default::default()
+        };
+
+        let diff = AccountPendingPublish::diff(&record, &local).unwrap();
+        assert_eq!(diff, AccountPendingPublish::ALL);
+        let edited = diff.apply(&record, &local).unwrap();
+        assert_eq!(
+            AccountPendingPublish::diff(&edited, &local).unwrap(),
+            AccountPendingPublish::default()
+        );
+        assert_eq!(AccountChatState::from_record(&edited).unwrap(), local);
+    }
+
+    /// A pin made before this device ever read the account record must not
+    /// replace the pins the phone already has.
+    #[test]
+    fn a_pin_made_before_the_first_read_joins_the_accounts_pins() {
+        let local = AccountChatState {
+            pinned: pins(&[pinned_contact(3), pinned_contact(1)]),
+            ..Default::default()
+        };
+        let remote = AccountChatState {
+            pinned: pins(&[pinned_contact(1), pinned_contact(2)]),
+            keep_muted_chats_archived: true,
+            note_to_self_archived: true,
+        };
+
+        let adopted = adopt_first_account_record(local, remote);
+        assert_eq!(
+            adopted.pinned,
+            pins(&[pinned_contact(1), pinned_contact(2), pinned_contact(3)])
+        );
+        assert!(adopted.keep_muted_chats_archived);
+        assert!(adopted.note_to_self_archived);
     }
 }
