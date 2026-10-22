@@ -1,6 +1,7 @@
 use libsignal_service::protocol::ServiceIdKind;
 use serde::{Deserialize, Serialize};
 
+pub mod account;
 pub mod calls;
 pub mod chat_folders;
 pub mod contacts;
