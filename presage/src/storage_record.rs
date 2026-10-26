@@ -386,31 +386,6 @@ pub fn set_group_archived(record: &[u8], archived: bool) -> Result<Vec<u8>, Edit
     )
 }
 
-/// The payload of every occurrence of length-delimited field `number` in `msg`,
-/// in wire order.
-fn repeated_len_field(msg: &[u8], number: u32) -> Result<Vec<Vec<u8>>, EditError> {
-    scan(msg)?
-        .into_iter()
-        .filter(|span| span.number == number)
-        .map(|span| {
-            if span.wire_type != WIRE_LEN {
-                return Err(EditError::Malformed);
-            }
-            Ok(msg[span.payload].to_vec())
-        })
-        .collect()
-}
-
-fn encode_repeated_len_field<'a>(
-    number: u32,
-    entries: impl IntoIterator<Item = &'a [u8]>,
-) -> Vec<u8> {
-    entries
-        .into_iter()
-        .flat_map(|entry| encode_len_delimited(number, entry))
-        .collect()
-}
-
 /// Read `AccountRecord.noteToSelfArchived` out of an encoded `StorageRecord`.
 pub fn account_note_to_self_archived(record: &[u8]) -> Result<bool, EditError> {
     record_bool_field(
@@ -449,21 +424,15 @@ pub fn account_keep_muted_chats_archived(record: &[u8]) -> Result<bool, EditErro
 /// each entry exactly as the record carries it, in pin order.
 pub fn account_pinned_conversations(record: &[u8]) -> Result<Vec<PinnedConversation>, EditError> {
     let payload = record_payload(record, STORAGE_RECORD_ACCOUNT)?;
-    Ok(
-        repeated_len_field(&record[payload], ACCOUNT_RECORD_PINNED_CONVERSATIONS)?
-            .into_iter()
-            .map(PinnedConversation::from_bytes)
-            .collect(),
-    )
+    decode_pinned_conversations(&record[payload])
 }
 
 /// Make an encoded `StorageRecord { account }` pin exactly `pinned`, in order,
 /// preserving every other byte of both messages.
 ///
 /// The entries are written as one block where the first old one was. An entry
-/// that was already pinned keeps its bytes, so a pin this build cannot read —
-/// the release-notes chat, a legacy group, a contact known only by number —
-/// survives every edit made around it.
+/// that was already pinned keeps its bytes, so a pin this build cannot read
+/// (see [`PinnedConversation`]) survives every edit made around it.
 pub fn set_account_pinned_conversations(
     record: &[u8],
     pinned: &[PinnedConversation],
@@ -480,20 +449,23 @@ pub fn set_account_pinned_conversations(
 /// `pinned` in the wire form `AccountRecord.pinnedConversations` takes, for a
 /// store to keep the list as one value.
 pub fn encode_pinned_conversations(pinned: &[PinnedConversation]) -> Vec<u8> {
-    encode_repeated_len_field(
-        ACCOUNT_RECORD_PINNED_CONVERSATIONS,
-        pinned.iter().map(PinnedConversation::as_bytes),
-    )
+    pinned
+        .iter()
+        .flat_map(|pin| encode_len_delimited(ACCOUNT_RECORD_PINNED_CONVERSATIONS, pin.as_bytes()))
+        .collect()
 }
 
-/// The inverse of [`encode_pinned_conversations`].
+/// The inverse of [`encode_pinned_conversations`], and how an `AccountRecord`
+/// payload is read: every occurrence of field 14, in wire order.
 pub fn decode_pinned_conversations(bytes: &[u8]) -> Result<Vec<PinnedConversation>, EditError> {
-    Ok(
-        repeated_len_field(bytes, ACCOUNT_RECORD_PINNED_CONVERSATIONS)?
-            .into_iter()
-            .map(PinnedConversation::from_bytes)
-            .collect(),
-    )
+    scan(bytes)?
+        .into_iter()
+        .filter(|span| span.number == ACCOUNT_RECORD_PINNED_CONVERSATIONS)
+        .map(|span| match span.wire_type {
+            WIRE_LEN => Ok(PinnedConversation::from_bytes(bytes[span.payload].to_vec())),
+            _ => Err(EditError::Malformed),
+        })
+        .collect()
 }
 
 /// The raw bytes of every `ChatFolderRecord` field presage does not model,
@@ -1275,6 +1247,11 @@ mod sticker_pack_tests {
             Err(EditError::WrongRecordType)
         );
     }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
 
     /// An `AccountRecord` with a given name (field 2), a pinned release-notes
     /// chat (field 14), `readReceipts` (field 6) and a field number no version

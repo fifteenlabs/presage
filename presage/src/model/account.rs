@@ -115,22 +115,17 @@ impl AccountChatState {
         self.pinned_threads().any(|pinned| &pinned == thread)
     }
 
-    /// Pin `thread` after the chats already pinned. `false` if it already was.
-    pub fn pin(&mut self, thread: &Thread) -> bool {
-        if self.is_pinned(thread) {
-            return false;
+    /// Pin `thread` after the chats already pinned, unless it already is.
+    pub fn pin(&mut self, thread: &Thread) {
+        if !self.is_pinned(thread) {
+            self.pinned.push(PinnedConversation::for_thread(thread));
         }
-        self.pinned.push(PinnedConversation::for_thread(thread));
-        true
     }
 
-    /// Unpin `thread`, leaving every other entry as it was. `false` if it was
-    /// not pinned.
-    pub fn unpin(&mut self, thread: &Thread) -> bool {
-        let before = self.pinned.len();
+    /// Unpin `thread`, leaving every other entry as it was.
+    pub fn unpin(&mut self, thread: &Thread) {
         self.pinned
             .retain(|entry| entry.thread().as_ref() != Some(thread));
-        self.pinned.len() != before
     }
 }
 
@@ -193,16 +188,17 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(state.pin(&contact(1)));
-        assert!(!state.pin(&contact(1)), "already pinned");
-        assert!(state.pin(&Thread::Group([3u8; 32])));
+        state.pin(&contact(1));
+        state.pin(&contact(1));
+        state.pin(&Thread::Group([3u8; 32]));
         assert_eq!(
             state.pinned_threads().collect::<Vec<_>>(),
-            vec![contact(1), Thread::Group([3u8; 32])]
+            vec![contact(1), Thread::Group([3u8; 32])],
+            "pinning twice pins once"
         );
 
-        assert!(state.unpin(&contact(1)));
-        assert!(!state.unpin(&contact(1)), "already unpinned");
+        state.unpin(&contact(1));
+        state.unpin(&contact(1));
         assert_eq!(
             state.pinned,
             vec![

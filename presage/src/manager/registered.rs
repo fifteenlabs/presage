@@ -1794,9 +1794,6 @@ impl<S: Store> Manager<S, Registered> {
         service_id: ServiceId,
         blocked: bool,
     ) -> Result<(), Error<S::Error>> {
-        if self.is_note_to_self(&service_id) {
-            return Err(Error::NoteToSelfHasNoContactRecord);
-        }
         self.edit_contact_for_publish(&service_id, |contact| contact.blocked = blocked)
             .await?;
         self.send_blocked_sync().await
@@ -1818,9 +1815,6 @@ impl<S: Store> Manager<S, Registered> {
         muted_until_timestamp: u64,
     ) -> Result<(), Error<S::Error>> {
         match thread {
-            Thread::Contact(service_id) if self.is_note_to_self(service_id) => {
-                Err(Error::NoteToSelfHasNoContactRecord)
-            }
             Thread::Contact(service_id) => {
                 self.edit_contact_for_publish(service_id, |contact| {
                     contact.muted_until_timestamp = muted_until_timestamp
@@ -1849,10 +1843,8 @@ impl<S: Store> Manager<S, Registered> {
         archived: bool,
     ) -> Result<(), Error<S::Error>> {
         if archived {
-            self.edit_account_for_publish(|state| {
-                state.unpin(thread);
-            })
-            .await?;
+            self.edit_account_for_publish(|state| state.unpin(thread))
+                .await?;
         }
         match thread {
             Thread::Contact(service_id) if self.is_note_to_self(service_id) => {
@@ -1965,11 +1957,18 @@ impl<S: Store> Manager<S, Registered> {
     /// minimal record so the edit still takes effect. The write and the mark
     /// are one step on purpose — a change and the record it is owed must not
     /// be able to disagree (see [`set_blocked`](Self::set_blocked)'s doc).
+    ///
+    /// Note to Self has no `ContactRecord`: Android flags one for its own
+    /// account as invalid, so editing it is
+    /// [`Error::NoteToSelfHasNoContactRecord`].
     async fn edit_contact_for_publish(
         &mut self,
         service_id: &ServiceId,
         edit: impl FnOnce(&mut Contact),
     ) -> Result<(), Error<S::Error>> {
+        if self.is_note_to_self(service_id) {
+            return Err(Error::NoteToSelfHasNoContactRecord);
+        }
         let mut contact = match self.store.contact_by_id(service_id).await? {
             Some(contact) => contact,
             None => Contact::minimal(service_id.raw_uuid()),

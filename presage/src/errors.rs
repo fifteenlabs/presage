@@ -48,9 +48,10 @@ pub enum Error<S: std::error::Error> {
     /// Recoverable by re-syncing and rebuilding the edit from what comes back.
     #[error("storage record is no longer at the identifier we hold")]
     StorageRecordMoved,
-    /// We have never read this contact's storage record, so there is nothing to edit. Not a
-    /// failure on its own — the caller decides between syncing first and writing a new record.
-    #[error("no storage record stored for this contact")]
+    /// We have never read this record from the storage service, so there is nothing to edit.
+    /// Not a failure on its own — the caller decides between syncing first and writing a new
+    /// record.
+    #[error("no storage record stored for this chat or account")]
     StorageRecordUnknown,
     #[error("could not edit stored storage record: {0}")]
     StorageRecordEdit(#[from] crate::storage_record::StorageRecordEditError),

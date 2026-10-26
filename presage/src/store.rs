@@ -757,9 +757,8 @@ pub trait ContentsStore: Send + Sync {
     }
 
     /// Where the account's `AccountRecord` lives, if we have ever read it. Same
-    /// contract as the contact twin, with one difference: a missing identity
-    /// is never a reason to append one, since every client expects exactly one
-    /// account record.
+    /// contract as the contact twin, except that a missing identity is never a
+    /// reason to append one (see [`StorageRecordKey::Account`]).
     fn account_storage_identity(
         &self,
     ) -> impl Future<Output = Result<Option<StorageRecordIdentity>, Self::ContentsStoreError>> + Send
