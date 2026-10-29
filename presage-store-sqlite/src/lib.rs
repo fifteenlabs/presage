@@ -11,7 +11,7 @@ use presage::{
 use protocol::{IdentityType, SqliteProtocolStore};
 use sqlx::{
     SqlitePool, query, query_scalar,
-    sqlite::{SqliteJournalMode, SqliteSynchronous},
+    sqlite::{SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 
 mod content;
@@ -32,6 +32,15 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// Begins a transaction that writes, taking the write lock at once. A deferred transaction
+    /// that reads before it writes fails with `SQLITE_BUSY`, which no busy timeout waits out,
+    /// when another connection to the database writes in between.
+    pub(crate) async fn begin_write(
+        &self,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, sqlx::Error> {
+        self.db.begin_with("BEGIN IMMEDIATE").await
+    }
+
     pub async fn open(
         url: &str,
         trust_new_identities: OnNewIdentity,
@@ -64,7 +73,11 @@ impl SqliteStore {
         let options = options
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full);
-        let db = SqlitePool::connect_with(options).await?;
+        // Each connection carries its own page cache; sqlx's default of 10 is more than we need.
+        let db = SqlitePoolOptions::new()
+            .max_connections(3)
+            .connect_with(options)
+            .await?;
 
         sqlx::migrate!().run(&db).await?;
         Ok(Self {
@@ -124,6 +137,12 @@ impl SqliteStore {
         tx.commit().await?;
 
         Ok(count)
+    }
+
+    /// Closes the pool, waiting for all connections to close.
+    /// Call before exit: SQLCipher's atexit cleanup races connections still closing.
+    pub async fn close(&self) {
+        self.db.close().await;
     }
 }
 
@@ -187,7 +206,7 @@ impl StateStore for SqliteStore {
     }
 
     async fn clear_registration(&mut self) -> Result<(), Self::StateStoreError> {
-        let mut transaction = self.db.begin().await.into_protocol_error()?;
+        let mut transaction = self.begin_write().await.into_protocol_error()?;
         query!("DELETE FROM kv WHERE key = 'registration'")
             .execute(&mut *transaction)
             .await?;
@@ -425,5 +444,22 @@ impl StateStore for SqliteStore {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn close_closes_the_pool() {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Trust)
+            .await
+            .unwrap();
+        let clone = store.clone();
+
+        store.close().await;
+
+        assert!(clone.db.is_closed());
     }
 }
