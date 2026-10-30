@@ -11,8 +11,8 @@ use libsignal_service::{
     proto::{
         manifest_record,
         sync_message::{self, Content as SyncContent, Sent},
-        verified, DataMessage, EditMessage, GroupContextV2, StickerPackRecord, SyncMessage,
-        Verified,
+        verified, DataMessage, EditMessage, GroupContextV2, StickerPackRecord, StoryMessage,
+        SyncMessage, Verified,
     },
     protocol::{
         IdentityKey, IdentityKeyPair, ProtocolAddress, ProtocolStore, SenderCertificate,
@@ -1090,6 +1090,15 @@ impl TryFrom<&Content> for Thread {
                                 master_key: Some(key),
                                 ..
                             }),
+                        ..
+                    }),
+                ..
+            })
+            // [Group] Story posted to a group by somebody else
+            | ContentBody::StoryMessage(StoryMessage {
+                group:
+                    Some(GroupContextV2 {
+                        master_key: Some(key),
                         ..
                     }),
                 ..

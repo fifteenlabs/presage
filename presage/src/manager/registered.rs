@@ -285,7 +285,7 @@ impl<S: Store> Manager<S, Registered> {
         {
             Some(ws) => Ok(ws.clone()),
             None => {
-                let headers = &[("X-Signal-Receive-Stories", "false")];
+                let headers = &[("X-Signal-Receive-Stories", "true")];
                 let ws = self
                     .identified_push_service()
                     .ws(
