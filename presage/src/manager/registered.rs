@@ -75,6 +75,7 @@ use crate::backup::{
     convert::{self, RecipientInfo},
     BackupImportProgress, ChatItem, FrameItem, TransferArchive,
 };
+use crate::model::account::AccountChatState;
 use crate::model::calls::{extract_call_event, CallPeer};
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
@@ -1832,12 +1833,24 @@ impl<S: Store> Manager<S, Registered> {
     /// Archive or unarchive a chat. Same shape as
     /// [`set_muted_until`](Self::set_muted_until), and for the same reason
     /// without a sync message: Signal has none for archive.
+    ///
+    /// Archiving also unpins the chat, as Signal-Desktop does. Note to Self has
+    /// no `ContactRecord`, so its archive state goes to the account record's
+    /// `noteToSelfArchived` instead.
     pub async fn set_archived(
         &mut self,
         thread: &Thread,
         archived: bool,
     ) -> Result<(), Error<S::Error>> {
+        if archived {
+            self.edit_account_for_publish(|state| state.unpin(thread))
+                .await?;
+        }
         match thread {
+            Thread::Contact(service_id) if self.is_note_to_self(service_id) => {
+                self.edit_account_for_publish(|state| state.note_to_self_archived = archived)
+                    .await
+            }
             Thread::Contact(service_id) => {
                 self.edit_contact_for_publish(service_id, |contact| contact.archived = archived)
                     .await
@@ -1847,6 +1860,76 @@ impl<S: Store> Manager<S, Registered> {
                     .await
             }
         }
+    }
+
+    /// Pin or unpin a chat on every device. Pins live in the account record's
+    /// `pinnedConversations`, published by
+    /// [`push_pending_account_record`](Self::push_pending_account_record).
+    ///
+    /// A pinned chat is never archived, so pinning an archived chat also
+    /// unarchives it. Signal-Desktop does that locally only; here the unarchive
+    /// is published with the chat's own record, so every device agrees.
+    ///
+    /// No limit is enforced: Signal-Desktop's four-pin cap is a rule of its UI,
+    /// and a list pinned elsewhere is taken as it is.
+    pub async fn set_pinned(
+        &mut self,
+        thread: &Thread,
+        pinned: bool,
+    ) -> Result<(), Error<S::Error>> {
+        self.edit_account_for_publish(|state| {
+            if pinned {
+                state.pin(thread);
+            } else {
+                state.unpin(thread);
+            }
+        })
+        .await?;
+        if pinned && self.is_archived(thread).await? {
+            self.set_archived(thread, false).await?;
+        }
+        Ok(())
+    }
+
+    fn is_note_to_self(&self, service_id: &ServiceId) -> bool {
+        *service_id == ServiceId::from(self.state.data.service_ids.aci())
+    }
+
+    async fn is_archived(&self, thread: &Thread) -> Result<bool, Error<S::Error>> {
+        Ok(match thread {
+            Thread::Contact(service_id) if self.is_note_to_self(service_id) => {
+                self.store.account_chat_state().await?.note_to_self_archived
+            }
+            Thread::Contact(service_id) => self
+                .store
+                .contact_by_id(service_id)
+                .await?
+                .is_some_and(|contact| contact.archived),
+            Thread::Group(master_key) => self
+                .store
+                .group(*master_key)
+                .await?
+                .is_some_and(|group| group.archived),
+        })
+    }
+
+    /// The account-record twin of
+    /// [`edit_contact_for_publish`](Self::edit_contact_for_publish). An edit
+    /// that changes nothing raises no flag, so archiving an unpinned chat costs
+    /// no account-record write.
+    async fn edit_account_for_publish(
+        &mut self,
+        edit: impl FnOnce(&mut AccountChatState),
+    ) -> Result<(), Error<S::Error>> {
+        let mut state = self.store.account_chat_state().await?;
+        let before = state.clone();
+        edit(&mut state);
+        if state == before {
+            return Ok(());
+        }
+        self.store.save_account_chat_state(&state).await?;
+        self.store.set_account_needs_storage_sync(true).await?;
+        Ok(())
     }
 
     /// The group twin of [`edit_contact_for_publish`](Self::edit_contact_for_publish):
@@ -1874,11 +1957,18 @@ impl<S: Store> Manager<S, Registered> {
     /// minimal record so the edit still takes effect. The write and the mark
     /// are one step on purpose — a change and the record it is owed must not
     /// be able to disagree (see [`set_blocked`](Self::set_blocked)'s doc).
+    ///
+    /// Note to Self has no `ContactRecord`: Android flags one for its own
+    /// account as invalid, so editing it is
+    /// [`Error::NoteToSelfHasNoContactRecord`].
     async fn edit_contact_for_publish(
         &mut self,
         service_id: &ServiceId,
         edit: impl FnOnce(&mut Contact),
     ) -> Result<(), Error<S::Error>> {
+        if self.is_note_to_self(service_id) {
+            return Err(Error::NoteToSelfHasNoContactRecord);
+        }
         let mut contact = match self.store.contact_by_id(service_id).await? {
             Some(contact) => contact,
             None => Contact::minimal(service_id.raw_uuid()),

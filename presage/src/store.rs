@@ -29,6 +29,7 @@ use tracing::trace;
 use crate::{
     manager::RegistrationData,
     model::{
+        account::AccountChatState,
         calls::{transition_call_history, CallEventInfo, CallHistoryEntry, CallPeer},
         chat_folders::ChatFolder,
         contacts::Contact,
@@ -58,14 +59,17 @@ pub struct StorageSyncCursor {
 
 /// Which storage-service record an update targets.
 ///
-/// The account record gets its own variant when something needs it. Adding one
-/// is a compile error at every site that has to care, which is the point.
+/// Adding a variant is a compile error at every site that has to care, which
+/// is the point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageRecordKey {
     Contact(ServiceId),
     GroupV2(GroupMasterKeyBytes),
     ChatFolder(Uuid),
     StickerPack(Vec<u8>),
+    /// The account's one `AccountRecord`. Every client expects exactly one, so
+    /// it is only ever replaced, never appended.
+    Account,
 }
 
 impl StorageRecordKey {
@@ -76,6 +80,7 @@ impl StorageRecordKey {
             Self::GroupV2(_) => manifest_record::identifier::Type::Groupv2,
             Self::ChatFolder(_) => manifest_record::identifier::Type::ChatFolder,
             Self::StickerPack(_) => manifest_record::identifier::Type::StickerPack,
+            Self::Account => manifest_record::identifier::Type::Account,
         }
     }
 }
@@ -731,6 +736,55 @@ pub trait ContentsStore: Send + Sync {
         &self,
     ) -> impl Future<Output = Result<Vec<Uuid>, Self::ContentsStoreError>> + Send {
         async { Ok(Vec::new()) }
+    }
+
+    /// The chat-list part of the account's `AccountRecord`, as last read or
+    /// edited here. The default is an account that pins nothing.
+    fn account_chat_state(
+        &self,
+    ) -> impl Future<Output = Result<AccountChatState, Self::ContentsStoreError>> + Send {
+        async { Ok(AccountChatState::default()) }
+    }
+
+    /// Replace the stored [`AccountChatState`]. The storage-service columns
+    /// behind [`account_storage_identity`](Self::account_storage_identity) are
+    /// not touched.
+    fn save_account_chat_state(
+        &mut self,
+        _state: &AccountChatState,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Where the account's `AccountRecord` lives, if we have ever read it. Same
+    /// contract as the contact twin, except that a missing identity is never a
+    /// reason to append one (see [`StorageRecordKey::Account`]).
+    fn account_storage_identity(
+        &self,
+    ) -> impl Future<Output = Result<Option<StorageRecordIdentity>, Self::ContentsStoreError>> + Send
+    {
+        async { Ok(None) }
+    }
+
+    fn save_account_storage_identity(
+        &mut self,
+        _identity: &StorageRecordIdentity,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// The durable half of an account-record publish, as for contacts.
+    fn set_account_needs_storage_sync(
+        &mut self,
+        _needs_sync: bool,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
+        async { Ok(()) }
+    }
+
+    fn account_needs_storage_sync(
+        &self,
+    ) -> impl Future<Output = Result<bool, Self::ContentsStoreError>> + Send {
+        async { Ok(false) }
     }
 
     /// Delete all cached group data
