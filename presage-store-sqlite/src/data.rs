@@ -315,6 +315,7 @@ impl TryInto<Content> for SqlMessage {
                 .timestamp_millis_opt(server_ts.unwrap_or(ts) as i64)
                 .unwrap(),
             server_delivered_timestamp: None,
+            urgent: true,
             needs_receipt,
             unidentified_sender,
             server_guid: None,

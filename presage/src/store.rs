@@ -1284,6 +1284,7 @@ pub async fn save_trusted_identity_message<S: Store>(
             // No messages were sent, just use the current time as the server timestamp.
             server_timestamp: chrono::Utc::now(),
             server_delivered_timestamp: None,
+            urgent: true,
             needs_receipt: false,
             unidentified_sender: false,
             was_plaintext: false,

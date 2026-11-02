@@ -151,6 +151,7 @@ impl ContentsStore for SqliteStore {
             was_plaintext,
             server_timestamp: _,
             server_delivered_timestamp: _,
+            urgent: _,
             report_spam_token: _,
             pni_verified,
         } = metadata;

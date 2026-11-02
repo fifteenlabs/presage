@@ -1764,6 +1764,7 @@ impl<S: Store> Manager<S, Registered> {
                 // Note: Currently no way to get the timestamp the server received the message; just use our timestamp as a fallback.
                 server_timestamp: chrono::Utc.timestamp_millis_opt(timestamp as i64).unwrap(),
                 server_delivered_timestamp: None,
+                urgent: true,
                 needs_receipt: false,
                 unidentified_sender: false,
                 was_plaintext: false,
@@ -2180,6 +2181,7 @@ impl<S: Store> Manager<S, Registered> {
                 // Note: Currently no way to get the timestamp the server received the message; just use our timestamp as a fallback.
                 server_timestamp: chrono::Utc.timestamp_millis_opt(timestamp as i64).unwrap(),
                 server_delivered_timestamp: None,
+                urgent: true,
                 needs_receipt: false, // TODO: this is just wrong
                 unidentified_sender: false,
                 was_plaintext: false,
@@ -2532,6 +2534,7 @@ impl<S: Store> Manager<S, Registered> {
                 client_timestamp: timestamp,
                 server_timestamp: timestamp,
                 server_delivered_timestamp: None,
+                urgent: true,
                 needs_receipt: false,
                 unidentified_sender: false,
                 was_plaintext: false,
