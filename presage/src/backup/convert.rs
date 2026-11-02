@@ -979,6 +979,7 @@ fn imported_metadata(sender: ServiceId, destination: ServiceId, timestamp: u64) 
         server_guid: None,
         client_timestamp: at,
         server_timestamp: at,
+        server_delivered_timestamp: None,
         needs_receipt: false,
         unidentified_sender: false,
         was_plaintext: false,

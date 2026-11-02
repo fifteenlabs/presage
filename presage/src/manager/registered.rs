@@ -15,7 +15,7 @@ use libsignal_service::{
     backup::MessageBackupKey,
     cipher,
     configuration::{ServiceConfiguration, SignalServers},
-    content::{Content, ContentBody, Metadata},
+    content::{CallMessage, Content, ContentBody, Metadata},
     encrypt_device_name,
     groups_v2::{
         decrypt_group, AccessControl, AccessRequired, CredentialsCache, CredentialsCacheError,
@@ -1186,7 +1186,10 @@ impl<S: Store> Manager<S, Registered> {
             async move {
                 loop {
                     match state.encrypted_messages.next().await {
-                        Some(Ok(Incoming::Envelope(envelope))) => {
+                        Some(Ok(Incoming::Envelope {
+                            envelope,
+                            server_delivered_timestamp,
+                        })) => {
                             let failed_timestamp = envelope.client_timestamp();
                             let opened = {
                                 // the permit is released at the end of the block (impl Drop)
@@ -1198,7 +1201,11 @@ impl<S: Store> Manager<S, Registered> {
                                     Some(ServiceId::Aci(_)) => {
                                         state
                                             .service_cipher_aci
-                                            .open_envelope(&envelope, &mut rand::rng())
+                                            .open_envelope(
+                                                &envelope,
+                                                server_delivered_timestamp,
+                                                &mut rand::rng(),
+                                            )
                                             .await
                                     }
                                     Some(ServiceId::Pni(pni)) => {
@@ -1210,7 +1217,11 @@ impl<S: Store> Manager<S, Registered> {
                                         }
                                         state
                                             .service_cipher_pni
-                                            .open_envelope(&envelope, &mut rng())
+                                            .open_envelope(
+                                                &envelope,
+                                                server_delivered_timestamp,
+                                                &mut rng(),
+                                            )
                                             .await
                                     }
                                 }
@@ -1738,6 +1749,7 @@ impl<S: Store> Manager<S, Registered> {
                 timestamp,
                 include_pni_signature,
                 online_only,
+                true,
             )
             .await?;
 
@@ -1751,6 +1763,7 @@ impl<S: Store> Manager<S, Registered> {
                 client_timestamp: chrono::Utc.timestamp_millis_opt(timestamp as i64).unwrap(),
                 // Note: Currently no way to get the timestamp the server received the message; just use our timestamp as a fallback.
                 server_timestamp: chrono::Utc.timestamp_millis_opt(timestamp as i64).unwrap(),
+                server_delivered_timestamp: None,
                 needs_receipt: false,
                 unidentified_sender: false,
                 was_plaintext: false,
@@ -2127,7 +2140,13 @@ impl<S: Store> Manager<S, Registered> {
 
         let online_only = false;
         let results = sender
-            .send_message_to_group(&recipients, content_body.clone(), timestamp, online_only)
+            .send_message_to_group(
+                &recipients,
+                content_body.clone(),
+                timestamp,
+                online_only,
+                true,
+            )
             .await;
 
         // TODO: Handle the NotFound error in the future by removing all sessions to this UUID and marking it as unregistered, not sending any messages to this contact anymore.
@@ -2160,6 +2179,7 @@ impl<S: Store> Manager<S, Registered> {
                 client_timestamp: chrono::Utc.timestamp_millis_opt(timestamp as i64).unwrap(),
                 // Note: Currently no way to get the timestamp the server received the message; just use our timestamp as a fallback.
                 server_timestamp: chrono::Utc.timestamp_millis_opt(timestamp as i64).unwrap(),
+                server_delivered_timestamp: None,
                 needs_receipt: false, // TODO: this is just wrong
                 unidentified_sender: false,
                 was_plaintext: false,
@@ -2511,6 +2531,7 @@ impl<S: Store> Manager<S, Registered> {
                 report_spam_token: None,
                 client_timestamp: timestamp,
                 server_timestamp: timestamp,
+                server_delivered_timestamp: None,
                 needs_receipt: false,
                 unidentified_sender: false,
                 was_plaintext: false,
@@ -2528,6 +2549,44 @@ impl<S: Store> Manager<S, Registered> {
         )
         .await?;
         Ok(content)
+    }
+
+    /// Sends live call signalling to every device of `recipient`. Unlike
+    /// [`send_message`](Self::send_message) this stores nothing: a call message is
+    /// transient, the call log comes from [`send_call_event`](Self::send_call_event).
+    /// Sealed sender is used when the recipient's profile key is known, like any
+    /// other send. `urgent` follows the official clients: offers and hangups wake
+    /// the peer's phone, ICE updates do not.
+    pub async fn send_call_message(
+        &mut self,
+        recipient: impl Into<ServiceId>,
+        message: CallMessage,
+        urgent: bool,
+    ) -> Result<(), Error<S::Error>> {
+        let recipient = recipient.into();
+        let sender_certificate = self.sender_certificate().await?;
+        let unidentified_access = self
+            .store
+            .profile_key(&recipient)
+            .await?
+            .map(|profile_key| UnidentifiedAccess {
+                key: profile_key.derive_access_key().to_vec(),
+                certificate: sender_certificate.clone(),
+            });
+        let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+        self.new_message_sender()
+            .await?
+            .send_message(
+                &recipient,
+                unidentified_access.as_ref(),
+                ContentBody::CallMessage(message),
+                timestamp,
+                false,
+                false,
+                urgent,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Fetches short-lived TURN credentials for 1:1 calls.
