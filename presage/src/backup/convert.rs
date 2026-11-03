@@ -1284,7 +1284,7 @@ pub fn recipient_to_contact(r: &backup::Recipient) -> Option<crate::model::conta
         pni,
         username: c.username.clone().filter(|s| !s.is_empty()),
         blocked: c.blocked,
-        whitelisted: false,
+        whitelisted: c.profile_sharing,
         archived: false,
         marked_unread: false,
         muted_until_timestamp: 0,
@@ -1397,6 +1397,7 @@ mod tests {
                 e164: Some(15551234567),
                 profile_given_name: Some("Ada".to_string()),
                 profile_family_name: Some("Lovelace".to_string()),
+                profile_sharing: true,
                 ..Default::default()
             })),
         }
@@ -1426,6 +1427,7 @@ mod tests {
         assert_eq!(contact.uuid, Uuid::from_bytes([1u8; 16]));
         assert_eq!(contact.name, "Ada Lovelace");
         assert!(contact.phone_number.is_some());
+        assert!(contact.whitelisted);
     }
 
     #[test]
