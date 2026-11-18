@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::TimeZone;
-use futures::{future, AsyncReadExt, Stream, StreamExt};
+use futures::{future, AsyncReadExt, FutureExt, Stream, StreamExt};
 use libsignal_service::prelude::SessionStoreExt;
 use libsignal_service::protocol::{ProtocolAddress, SessionStore};
 use libsignal_service::session_lock::SessionLocks;
@@ -1110,8 +1110,9 @@ impl<S: Store> Manager<S, Registered> {
     ///
     /// Returns a [futures::Stream] of messages to consume. Messages will also be stored by the implementation of the [Store].
     ///
-    /// Must be called inside a [tokio::task::LocalSet]: it spawns a local task that refreshes the
-    /// account attributes and pre-keys, aborted when the stream is dropped.
+    /// Must be called inside a [tokio::task::LocalSet] that keeps running while the stream is
+    /// consumed: it spawns a local task that refreshes the account attributes and pre-keys, and
+    /// cancels it when the stream ends or is dropped.
     pub async fn receive_messages(
         &mut self,
     ) -> Result<impl Stream<Item = Received>, Error<S::Error>> {
@@ -1129,6 +1130,7 @@ impl<S: Store> Manager<S, Registered> {
             master_key: Option<MasterKey>,
             account_entropy_pool: Option<AccountEntropyPool>,
             registration_type: RegistrationType,
+            _refresh_registration: future::RemoteHandle<()>,
         }
 
         let identified_push_service = self.identified_push_service();
@@ -1145,7 +1147,9 @@ impl<S: Store> Manager<S, Registered> {
         let registration_data_inner = self.registration_data().clone();
 
         // Updates the account attributes and refreshes the pre-keys on every connect, as a local
-        // task of its own that is aborted when the returned stream is dropped.
+        // task of its own. It is spawned only once the stream is built, so a failed or cancelled
+        // `receive_messages` never starts it, and the stream state holds its handle, so it is
+        // cancelled when the stream ends or is dropped.
         //
         // It must not be polled from inside the stream, as it was when it was the stream's
         // `take_until` stop future. It reads the store, and a store behind a fair async lock (a
@@ -1154,24 +1158,20 @@ impl<S: Store> Manager<S, Registered> {
         // the next time the stream was polled. If the stream yielded an item in the same poll, the
         // consumer asked the store for that item on the same task and never polled the stream
         // again: the receive loop and every other store user waited for ever.
-        let refresh_registration = tokio::task::spawn_local(
-            async move {
-                if let Err(error) = set_account_attributes(
-                    &mut account_manager,
-                    &store_inner,
-                    &registration_data_inner,
-                )
-                .await
-                {
-                    error!(%error, "failed to set account attributes, this is problematic and should never happen!");
-                }
-
-                if let Err(error) = register_pre_keys(&store_inner, &mut account_manager).await {
-                    error!(%error, "failed to register pre-keys, this is problematic and should never happen!");
-                }
+        let (refresh_registration, refresh_registration_handle) = async move {
+            if let Err(error) =
+                set_account_attributes(&mut account_manager, &store_inner, &registration_data_inner)
+                    .await
+            {
+                error!(%error, "failed to set account attributes, this is problematic and should never happen!");
             }
-            .in_current_span(),
-        );
+
+            if let Err(error) = register_pre_keys(&store_inner, &mut account_manager).await {
+                error!(%error, "failed to register pre-keys, this is problematic and should never happen!");
+            }
+        }
+        .in_current_span()
+        .remote_handle();
 
         let encrypted_messages = MessagePipe::from_socket(identified_websocket.clone());
 
@@ -1189,7 +1189,10 @@ impl<S: Store> Manager<S, Registered> {
             master_key: self.master_key().await?,
             account_entropy_pool: self.account_entropy_pool().await?,
             registration_type: self.registration_type(),
+            _refresh_registration: refresh_registration_handle,
         };
+
+        tokio::task::spawn_local(refresh_registration);
 
         debug!("starting to consume incoming message stream");
 
@@ -1655,10 +1658,7 @@ impl<S: Store> Manager<S, Registered> {
             }
         });
 
-        Ok(AbortingOnDrop {
-            stream: Box::pin(incoming_messages_stream),
-            task: refresh_registration.abort_handle(),
-        })
+        Ok(Box::pin(incoming_messages_stream.fuse()))
     }
 
     /// Uses Signal's SGX contact discovery service to resolve a phone number to its matching account identity
@@ -4153,34 +4153,6 @@ async fn upsert_contact_from_profile<S: Store>(
     Ok(())
 }
 
-/// A stream that aborts a task when it is dropped, so the task lives exactly as long as the
-/// stream that spawned it.
-struct AbortingOnDrop<St> {
-    stream: St,
-    task: tokio::task::AbortHandle,
-}
-
-impl<St: Stream + Unpin> Stream for AbortingOnDrop<St> {
-    type Item = St::Item;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.stream.poll_next_unpin(cx)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.stream.size_hint()
-    }
-}
-
-impl<St> Drop for AbortingOnDrop<St> {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 async fn set_account_attributes<S: Store>(
     account_manager: &mut AccountManager,
     store: &S,
@@ -4761,31 +4733,5 @@ mod tests {
         assert!(group.is_member(other));
         assert_eq!(group.revision, 7);
         assert_eq!(group.title.as_deref(), Some("Book club"));
-    }
-
-    #[tokio::test]
-    async fn the_task_runs_without_the_stream_being_polled_and_ends_with_it() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let (ran_tx, ran_rx) = tokio::sync::oneshot::channel();
-                let task = tokio::task::spawn_local(async move {
-                    let _ = ran_tx.send(());
-                    future::pending::<()>().await
-                });
-                let stream = AbortingOnDrop {
-                    stream: futures::stream::iter([1, 2, 3]),
-                    task: task.abort_handle(),
-                };
-
-                ran_rx
-                    .await
-                    .expect("the task ran before the stream was polled");
-                assert_eq!(stream.collect::<Vec<_>>().await, [1, 2, 3]);
-
-                let ended = task.await.expect_err("dropping the stream aborts the task");
-                assert!(ended.is_cancelled());
-            })
-            .await;
     }
 }
