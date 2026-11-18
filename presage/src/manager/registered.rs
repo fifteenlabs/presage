@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::TimeZone;
-use futures::{future, AsyncReadExt, Stream, StreamExt};
+use futures::{future, AsyncReadExt, FutureExt, Stream, StreamExt};
 use libsignal_service::prelude::SessionStoreExt;
 use libsignal_service::protocol::{ProtocolAddress, SessionStore};
 use libsignal_service::session_lock::SessionLocks;
@@ -67,7 +67,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn, Instrument};
 use url::Url;
 
 use crate::backup::{
@@ -1109,6 +1109,10 @@ impl<S: Store> Manager<S, Registered> {
     /// are processed _before_ trying to encrypt and send messages, which might get rejected by recipients otherwise.
     ///
     /// Returns a [futures::Stream] of messages to consume. Messages will also be stored by the implementation of the [Store].
+    ///
+    /// Must be called inside a [tokio::task::LocalSet] that keeps running while the stream is
+    /// consumed: it spawns a local task that refreshes the account attributes and pre-keys, and
+    /// cancels it when the stream ends or is dropped.
     pub async fn receive_messages(
         &mut self,
     ) -> Result<impl Stream<Item = Received>, Error<S::Error>> {
@@ -1126,6 +1130,7 @@ impl<S: Store> Manager<S, Registered> {
             master_key: Option<MasterKey>,
             account_entropy_pool: Option<AccountEntropyPool>,
             registration_type: RegistrationType,
+            _refresh_registration: future::RemoteHandle<()>,
         }
 
         let identified_push_service = self.identified_push_service();
@@ -1141,12 +1146,19 @@ impl<S: Store> Manager<S, Registered> {
         let store_inner = self.store.clone();
         let registration_data_inner = self.registration_data().clone();
 
-        // We make a task to update the account attributes and refresh pre keys as needed that will
-        // only yield a value if one of the two operations fail (stop signal).
+        // Updates the account attributes and refreshes the pre-keys on every connect, as a local
+        // task of its own. It is spawned only once the stream is built, so a failed or cancelled
+        // `receive_messages` never starts it, and the stream state holds its handle, so it is
+        // cancelled when the stream ends or is dropped.
         //
-        // This is necessary because in this context, we can't do the classic tokio::spawn with a
-        // oneshot::channel() or CancellationToken because of !Send constraints in the Store.
-        let refresh_registration_task = async move {
+        // It must not be polled from inside the stream, as it was when it was the stream's
+        // `take_until` stop future. It reads the store, and a store behind a fair async lock (a
+        // tokio Mutex) hands the lock to the oldest waiter on release. When the refresh queued
+        // behind a store user on another thread, the lock went to the refresh, which only took it
+        // the next time the stream was polled. If the stream yielded an item in the same poll, the
+        // consumer asked the store for that item on the same task and never polled the stream
+        // again: the receive loop and every other store user waited for ever.
+        let (refresh_registration, refresh_registration_handle) = async move {
             if let Err(error) =
                 set_account_attributes(&mut account_manager, &store_inner, &registration_data_inner)
                     .await
@@ -1157,10 +1169,9 @@ impl<S: Store> Manager<S, Registered> {
             if let Err(error) = register_pre_keys(&store_inner, &mut account_manager).await {
                 error!(%error, "failed to register pre-keys, this is problematic and should never happen!");
             }
-
-            // Never return, which keeps the messages stream alive.
-            future::pending::<()>().await
-        };
+        }
+        .in_current_span()
+        .remote_handle();
 
         let encrypted_messages = MessagePipe::from_socket(identified_websocket.clone());
 
@@ -1178,7 +1189,10 @@ impl<S: Store> Manager<S, Registered> {
             master_key: self.master_key().await?,
             account_entropy_pool: self.account_entropy_pool().await?,
             registration_type: self.registration_type(),
+            _refresh_registration: refresh_registration_handle,
         };
+
+        tokio::task::spawn_local(refresh_registration);
 
         debug!("starting to consume incoming message stream");
 
@@ -1644,11 +1658,7 @@ impl<S: Store> Manager<S, Registered> {
             }
         });
 
-        Ok(Box::pin(
-            // We use the returning of the async closure in take_until as a stop signal
-            // if the future resolves *anything* the stream will end.
-            incoming_messages_stream.take_until(refresh_registration_task),
-        ))
+        Ok(Box::pin(incoming_messages_stream.fuse()))
     }
 
     /// Uses Signal's SGX contact discovery service to resolve a phone number to its matching account identity
