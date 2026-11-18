@@ -312,8 +312,8 @@ pub trait ContentsStore: Send + Sync {
     /// Each items is a tuple consisting of the group master key and its corresponding data.
     type GroupsIter: Iterator<Item = Result<(GroupMasterKeyBytes, Group), Self::ContentsStoreError>>;
 
-    /// Iterator over all stored messages
-    type MessagesIter: Iterator<Item = Result<Content, Self::ContentsStoreError>>;
+    /// Iterator over stored messages, newest first
+    type MessagesIter: DoubleEndedIterator<Item = Result<Content, Self::ContentsStoreError>>;
 
     /// Iterator over all stored sticker packs
     type StickerPacksIter: Iterator<Item = Result<StickerPack, Self::ContentsStoreError>>;
@@ -908,6 +908,26 @@ pub trait ContentsStore: Send + Sync {
         &self,
         id: &[u8],
     ) -> impl Future<Output = Result<Option<StickerPack>, Self::ContentsStoreError>>;
+
+    /// Whether a sticker pack is installed
+    fn has_sticker_pack(
+        &self,
+        id: &[u8],
+    ) -> impl Future<Output = Result<bool, Self::ContentsStoreError>> {
+        async move { Ok(self.sticker_pack(id).await?.is_some()) }
+    }
+
+    /// The ids of the installed sticker packs
+    fn sticker_pack_ids(
+        &self,
+    ) -> impl Future<Output = Result<Vec<Vec<u8>>, Self::ContentsStoreError>> {
+        async move {
+            self.sticker_packs()
+                .await?
+                .map(|p| p.map(|p| p.id))
+                .collect()
+        }
+    }
 
     /// Removes a sticker pack, including one that was only noted with
     /// [`Self::note_installed_sticker_pack`] and has no manifest yet — otherwise

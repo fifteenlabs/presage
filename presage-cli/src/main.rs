@@ -348,14 +348,14 @@ async fn send<S: Store>(
             manager
                 .send_message(ServiceId::Aci(uuid.into()), content_body, timestamp)
                 .await
-                .expect("failed to send message")
+                .expect("failed to send message");
         }
         Recipient::Group(master_key) => {
             info!("sending message to group");
             manager
                 .send_message_to_group(&master_key, content_body, timestamp)
                 .await
-                .expect("failed to send message to group!")
+                .expect("failed to send message to group!");
         }
     }
 
@@ -629,7 +629,7 @@ async fn receive<S: Store>(
                     break;
                 }
             }
-            Received::Contacts => println!("got contacts synchronization"),
+            Received::Contacts { .. } => println!("got contacts synchronization"),
             Received::Content(content) => {
                 process_incoming_message(
                     &mut manager,
@@ -1030,7 +1030,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                             // Backlog is drained; keep the stream open and wait for the phone's
                             // contacts response — it arrives after the queue is empty.
                         }
-                        Received::Contacts => {
+                        Received::Contacts { .. } => {
                             println!("got contacts! thank you, come again.");
                             return true;
                         }
@@ -1188,7 +1188,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 .send_message_to_group(&master_key, announcement, timestamp)
                 .await
             {
-                Ok(()) => println!("announced the group to its members"),
+                Ok(_) => println!("announced the group to its members"),
                 Err(e) => println!("WARNING: announcing the group to its members failed: {e}"),
             }
         }
