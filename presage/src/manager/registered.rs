@@ -1121,7 +1121,6 @@ impl<S: Store> Manager<S, Registered> {
             service_cipher_pni: ServiceCipher<PniStore>,
             groups_manager: GroupsManager<GroupCredentials>,
             service_ids: ServiceIds,
-            device_id: DeviceId,
             message_sender: MessageSender<AciStore>,
             master_key: Option<MasterKey>,
             account_entropy_pool: Option<AccountEntropyPool>,
@@ -1173,7 +1172,6 @@ impl<S: Store> Manager<S, Registered> {
             service_cipher_pni: self.new_service_cipher_pni(),
             groups_manager: Box::pin(self.groups_manager()).await?,
             service_ids: self.state.data.service_ids.clone(),
-            device_id: self.state.device_id(),
             message_sender: self.new_message_sender().await?,
             master_key: self.master_key().await?,
             account_entropy_pool: self.account_entropy_pool().await?,
@@ -1250,14 +1248,15 @@ impl<S: Store> Manager<S, Registered> {
 
                                         match request.r#type() {
                                             RequestType::Contacts => {
-                                                // Ignore contacts requests that originated from
-                                                // our own device — these are echoes of the sync
-                                                // request we just sent to ourselves. Responding
-                                                // with our local (possibly empty) store would
-                                                // overwrite the real contacts on all devices.
-                                                if content.metadata.sender_device == state.device_id
+                                                // Only the primary answers; Signal-Desktop, also
+                                                // a linked device, drops these requests. The
+                                                // requester replaces its contact list with the
+                                                // answer, and a linked device's store holds only
+                                                // what the storage service gave it.
+                                                if state.registration_type
+                                                    != RegistrationType::Primary
                                                 {
-                                                    trace!("ignoring contacts request echoed from our own device");
+                                                    trace!("ignoring contacts request: only the primary device answers it");
                                                 } else {
                                                     let contacts = state
                                                         .store
