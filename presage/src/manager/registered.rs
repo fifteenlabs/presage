@@ -1282,10 +1282,8 @@ impl<S: Store> Manager<S, Registered> {
                                                                 aci: Some(c.uuid.to_string()),
                                                                 aci_binary: Some(c.uuid.into_bytes().into()),
                                                                 name: Some(c.name),
-                                                                avatar: c.avatar.map(|a| libsignal_service::proto::contact_details::Avatar {
-                                                                    content_type: Some(a.content_type),
-                                                                    length: a.reader.len().try_into().ok(),
-                                                                }),
+                                                                // send_contact_details doesn't write avatar data yet.
+                                                                avatar: None,
                                                                 expire_timer: Some(c.expire_timer),
                                                                 expire_timer_version: Some(c.expire_timer_version),
                                                                 inbox_position: None,
@@ -1361,7 +1359,18 @@ impl<S: Store> Manager<S, Registered> {
                                             contacts.blob.is_some(),
                                             contacts.complete
                                         );
-                                        return Some((Received::Contacts, state));
+                                        // Contacts come from the storage service, which carries
+                                        // fields the blob lacks (profile key, blocked, accepted
+                                        // message requests, system names); saving the blob's
+                                        // entries over those would erase them. Nothing is saved,
+                                        // so `saved` is `None`: clients must not prune on it.
+                                        return Some((
+                                            Received::Contacts {
+                                                complete: contacts.complete(),
+                                                saved: None,
+                                            },
+                                            state,
+                                        ));
                                     }
 
                                     // sticker pack operations
@@ -1373,6 +1382,25 @@ impl<S: Store> Manager<S, Registered> {
                                         for operation in sticker_pack_operation {
                                             match operation.r#type() {
                                                 sticker_pack_operation::Type::Install => {
+                                                    // the primary resends every installed pack on
+                                                    // a configuration request
+                                                    match state
+                                                        .store
+                                                        .has_sticker_pack(operation.pack_id())
+                                                        .await
+                                                    {
+                                                        Ok(true) => {
+                                                            debug!(
+                                                                "sticker pack already installed"
+                                                            );
+                                                            continue;
+                                                        }
+                                                        Ok(false) => {}
+                                                        Err(error) => warn!(
+                                                            %error,
+                                                            "failed to look up sticker pack, downloading it"
+                                                        ),
+                                                    }
                                                     let store = state.store.clone();
                                                     let unidentified_websocket =
                                                         state.unidentified_websocket.clone();
@@ -1701,13 +1729,14 @@ impl<S: Store> Manager<S, Registered> {
     ///
     /// This method will automatically update the [DataMessage::expire_timer] if it is set to
     /// [None] such that the chat will keep the current expire timer. If the expire timer is set,
-    /// it will be used as is, and the expire timer version will be incremented.
+    /// it will be used as is, and the expire timer version will be incremented. It will also
+    /// potentially attach link previews. The actually sent message is returned.
     pub async fn send_message(
         &mut self,
         recipient: impl Into<ServiceId>,
         message: impl Into<ContentBody>,
         timestamp: u64,
-    ) -> Result<(), Error<S::Error>> {
+    ) -> Result<Content, Error<S::Error>> {
         let mut sender = self.new_message_sender().await?;
         let recipient = recipient.into();
 
@@ -1778,12 +1807,12 @@ impl<S: Store> Manager<S, Registered> {
         save_message(
             &mut self.store,
             &mut identified_websocket,
-            content,
+            content.clone(),
             Some(thread),
         )
         .await?;
 
-        Ok(())
+        Ok(content)
     }
 
     /// Block or unblock a recipient.
@@ -2032,7 +2061,9 @@ impl<S: Store> Manager<S, Registered> {
             ..SyncMessage::with_padding(&mut rand::rng())
         };
         self.send_message(self.state.data.service_ids.aci(), sync_message, timestamp)
-            .await
+            .await?;
+
+        Ok(())
     }
 
     /// Report a received message as spam to the Signal servers. `server_guid`
@@ -2082,13 +2113,14 @@ impl<S: Store> Manager<S, Registered> {
     /// Sends one message in a group (v2). The `master_key_bytes` is required to have 32 elements.
     ///
     /// This method will automatically update the [DataMessage::expire_timer] if it is set to
-    /// [None] such that the chat will keep the current expire timer.
+    /// [None] such that the chat will keep the current expire timer, as well as potentially attach
+    /// link previews. The actually sent message is returned.
     pub async fn send_message_to_group(
         &mut self,
         master_key_bytes: &[u8],
         message: impl Into<ContentBody>,
         timestamp: u64,
-    ) -> Result<(), Error<S::Error>> {
+    ) -> Result<Content, Error<S::Error>> {
         let mut content_body = message.into();
         let master_key_bytes = master_key_bytes
             .try_into()
@@ -2195,12 +2227,12 @@ impl<S: Store> Manager<S, Registered> {
         save_message(
             &mut self.store,
             &mut identified_websocket,
-            content,
+            content.clone(),
             Some(thread),
         )
         .await?;
 
-        Ok(())
+        Ok(content)
     }
 
     async fn restore_thread_timer(&mut self, thread: &Thread, content_body: &mut ContentBody) {
@@ -2321,12 +2353,9 @@ impl<S: Store> Manager<S, Registered> {
         }))
     }
 
-    /// Downloads and decrypts a single sticker's image bytes straight from the
-    /// sticker CDN (`/stickers/{pack_id}/full/{sticker_id}`) — no manifest, no
-    /// whole-pack download, and no "install" sync to other devices. Only
-    /// `pack_id`/`pack_key`/`sticker_id` are needed, so this can render a
-    /// received sticker whose per-message `data` attachment is unavailable
-    /// (e.g. dropped on backup import).
+    /// Downloads and decrypts one sticker of a pack, without installing the pack.
+    ///
+    /// A sticker message's attachment expires on the attachment CDN; the pack's copy doesn't.
     pub async fn download_sticker(
         &self,
         pack_id: &[u8],
@@ -3853,6 +3882,7 @@ async fn save_message<S: Store>(
     // ask the store to translate it back to a Thread::Group via the master_key
     // index. Falls back to Thread::try_from for non-call content and for
     // unresolved/adhoc cases (which still land in sync-self for now).
+    let received = override_thread.is_none();
     let thread = match override_thread {
         Some(t) => t,
         None => match crate::model::calls::resolve_call_thread(&message, store).await? {
@@ -3991,7 +4021,12 @@ async fn save_message<S: Store>(
                 None
             }
         }
-        // Call signaling is transient; calls are recorded by `CallEvent`s instead.
+        // Received offers and hangups start and end a call; the rest of the signaling is transient.
+        // Our own calls are recorded by `CallEvent`s.
+        ContentBody::CallMessage(CallMessage { offer: Some(_), .. })
+        | ContentBody::CallMessage(CallMessage {
+            hangup: Some(_), ..
+        }) if received => Some(message),
         ContentBody::CallMessage(_) => None,
         ContentBody::SynchronizeMessage(SyncMessage {
             content: Some(SyncContent::CallEvent(_)),

@@ -1,5 +1,5 @@
 use libsignal_service::{
-    prelude::Content,
+    prelude::{Content, Uuid},
     protocol::{CiphertextMessageType, DeviceId, ServiceId},
 };
 
@@ -11,7 +11,13 @@ pub enum Received {
 
     /// Got contacts (only applies if linked to a primary device
     /// Contacts can be later queried in the store.
-    Contacts,
+    Contacts {
+        /// Whether the primary device sent all its contacts.
+        complete: bool,
+        /// The contacts saved, or `None` if the list couldn't be read, parsed or saved in full.
+        /// Entries without an ACI are skipped.
+        saved: Option<Vec<Uuid>>,
+    },
 
     /// We failed to decrypt a message from the specified service ID.
     ///
