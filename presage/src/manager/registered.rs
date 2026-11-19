@@ -132,6 +132,10 @@ pub struct Registered {
     pub(crate) session_locks: SessionLocks,
 
     pub(crate) data: Arc<RegistrationData>,
+    /// Our profile key: `data`'s, until the account record carries one the
+    /// primary rotated. `data` is shared and immutable and goes stale then, so
+    /// read the key through [`Registered::profile_key`], never from `data`.
+    profile_key: Arc<std::sync::RwLock<ProfileKey>>,
 }
 
 impl fmt::Debug for Registered {
@@ -149,8 +153,17 @@ impl Registered {
             unidentified_websocket: Default::default(),
             unidentified_sender_certificate: Default::default(),
             session_locks: Default::default(),
+            profile_key: Arc::new(std::sync::RwLock::new(data.profile_key)),
             data: Arc::new(data),
         }
+    }
+
+    pub(crate) fn profile_key(&self) -> ProfileKey {
+        *self.profile_key.read().expect("profile key lock poisoned")
+    }
+
+    pub(crate) fn set_profile_key(&self, key: ProfileKey) {
+        *self.profile_key.write().expect("profile key lock poisoned") = key;
     }
 
     fn servers(&self) -> SignalServers {
@@ -207,11 +220,6 @@ pub struct RegistrationData {
 }
 
 impl RegistrationData {
-    /// Our own profile key
-    pub fn profile_key(&self) -> ProfileKey {
-        self.profile_key
-    }
-
     /// The name of the device (if linked as secondary)
     pub fn device_name(&self) -> Option<&str> {
         self.device_name.as_deref()
@@ -252,6 +260,12 @@ impl<S: Store> Manager<S, Registered> {
     /// Returns a handle on the [RegistrationData].
     pub fn registration_data(&self) -> &RegistrationData {
         &self.state.data
+    }
+
+    /// Our profile key: the one we linked with, or a rotated one adopted since
+    /// from the account record.
+    pub fn profile_key(&self) -> ProfileKey {
+        self.state.profile_key()
     }
 
     /// Returns a clone of a cached push service (with credentials).
@@ -442,7 +456,7 @@ impl<S: Store> Manager<S, Registered> {
 
     /// Fetches the profile (name, about, status emoji) of the registered user.
     pub async fn retrieve_profile(&mut self) -> Result<Profile, Error<S::Error>> {
-        self.retrieve_profile_by_uuid(self.state.data.service_ids.aci, self.state.data.profile_key)
+        self.retrieve_profile_by_uuid(self.state.data.service_ids.aci, self.state.profile_key())
             .await
     }
 
@@ -479,7 +493,7 @@ impl<S: Store> Manager<S, Registered> {
         &mut self,
     ) -> Result<ExpiringProfileKeyCredential, Error<S::Error>> {
         let aci = self.state.data.service_ids.aci();
-        let profile_key = self.state.data.profile_key;
+        let profile_key = self.state.profile_key();
         let server_public_params = self
             .state
             .service_configuration()
@@ -924,7 +938,7 @@ impl<S: Store> Manager<S, Registered> {
         let mut account_manager = AccountManager::new(
             self.identified_push_service(),
             self.identified_websocket(false).await?,
-            Some(self.state.data.profile_key),
+            Some(self.state.profile_key()),
         );
 
         account_manager
@@ -942,7 +956,7 @@ impl<S: Store> Manager<S, Registered> {
         let profile = account_manager.retrieve_profile(aci).await?;
         let _ = self
             .store
-            .save_profile(aci.into(), self.state.data.profile_key, profile)
+            .save_profile(aci.into(), self.state.profile_key(), profile)
             .await;
 
         Ok(())
@@ -1144,6 +1158,7 @@ impl<S: Store> Manager<S, Registered> {
 
         let store_inner = self.store.clone();
         let registration_data_inner = self.registration_data().clone();
+        let profile_key = self.state.profile_key();
 
         // Updates the account attributes and refreshes the pre-keys on every connect, as a local
         // task of its own. It is spawned only once the stream is built, so a failed or cancelled
@@ -1158,9 +1173,13 @@ impl<S: Store> Manager<S, Registered> {
         // consumer asked the store for that item on the same task and never polled the stream
         // again: the receive loop and every other store user waited for ever.
         let (refresh_registration, refresh_registration_handle) = async move {
-            if let Err(error) =
-                set_account_attributes(&mut account_manager, &store_inner, &registration_data_inner)
-                    .await
+            if let Err(error) = set_account_attributes(
+                &mut account_manager,
+                &store_inner,
+                &registration_data_inner,
+                profile_key,
+            )
+            .await
             {
                 error!(%error, "failed to set account attributes, this is problematic and should never happen!");
             }
@@ -1773,7 +1792,7 @@ impl<S: Store> Manager<S, Registered> {
         if let ContentBody::DataMessage(message) = &mut content_body {
             message
                 .profile_key
-                .get_or_insert(self.state.data.profile_key().get_bytes().to_vec());
+                .get_or_insert(self.state.profile_key().get_bytes().to_vec());
             message.required_protocol_version = Some(0);
         }
 
@@ -2743,7 +2762,7 @@ impl<S: Store> Manager<S, Registered> {
         let mut account_manager = AccountManager::new(
             self.identified_push_service(),
             self.identified_websocket(false).await?,
-            Some(self.state.data.profile_key),
+            Some(self.state.profile_key()),
         );
 
         account_manager
@@ -2820,7 +2839,7 @@ impl<S: Store> Manager<S, Registered> {
         let mut account_manager = AccountManager::new(
             self.identified_push_service(),
             self.identified_websocket(false).await?,
-            Some(self.state.data.profile_key),
+            Some(self.state.profile_key()),
         );
 
         Ok(account_manager.linked_devices(&aci_protocol_store).await?)
@@ -2841,7 +2860,7 @@ impl<S: Store> Manager<S, Registered> {
         let mut account_manager = AccountManager::new(
             self.identified_push_service(),
             self.identified_websocket(false).await?,
-            Some(self.state.data.profile_key),
+            Some(self.state.profile_key()),
         );
         account_manager
             .update_device_name(
@@ -3259,7 +3278,7 @@ impl<S: Store> Manager<S, Registered> {
         let avatar_url = profile.avatar.clone();
         match self
             .store
-            .save_profile(Uuid::from(aci), self.state.data.profile_key, profile)
+            .save_profile(Uuid::from(aci), self.state.profile_key(), profile)
             .await
         {
             Ok(()) => avatar_url,
@@ -3278,7 +3297,7 @@ impl<S: Store> Manager<S, Registered> {
 
         match tokio::time::timeout(
             AVATAR_TIMEOUT,
-            self.download_profile_avatar(Uuid::from(aci), self.state.data.profile_key, avatar_url),
+            self.download_profile_avatar(Uuid::from(aci), self.state.profile_key(), avatar_url),
         )
         .await
         {
@@ -4152,10 +4171,13 @@ async fn upsert_contact_from_profile<S: Store>(
     Ok(())
 }
 
+/// `profile_key` is the live key, not `data`'s: the unidentified access key is
+/// derived from it, and the primary sets the one for a rotated key.
 async fn set_account_attributes<S: Store>(
     account_manager: &mut AccountManager,
     store: &S,
     data: &RegistrationData,
+    profile_key: ProfileKey,
 ) -> Result<(), Error<S::Error>> {
     trace!("setting account attributes");
 
@@ -4180,7 +4202,7 @@ async fn set_account_attributes<S: Store>(
             pni_registration_id,
             name,
             registration_lock: None,
-            unidentified_access_key: Some(data.profile_key.derive_access_key().to_vec()),
+            unidentified_access_key: Some(profile_key.derive_access_key().to_vec()),
             unrestricted_unidentified_access: false,
             capabilities: Some(DeviceCapabilities {
                 storage: true,

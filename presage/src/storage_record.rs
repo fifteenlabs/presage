@@ -26,6 +26,8 @@ const STORAGE_RECORD_CHAT_FOLDER: u32 = 8;
 const STORAGE_RECORD_STICKER_PACK: u32 = 6;
 /// `StorageRecord.account`, from `StorageService.proto`.
 const STORAGE_RECORD_ACCOUNT: u32 = 4;
+/// `AccountRecord.profileKey`.
+const ACCOUNT_RECORD_PROFILE_KEY: u32 = 1;
 /// `AccountRecord.noteToSelfArchived`.
 const ACCOUNT_RECORD_NOTE_TO_SELF_ARCHIVED: u32 = 5;
 /// `AccountRecord.pinnedConversations`.
@@ -255,6 +257,26 @@ fn record_varint_field(record: &[u8], record_field: u32, number: u32) -> Result<
     read_varint(inner, &mut pos)
 }
 
+/// The last-wins bytes of length-delimited field `number` inside the
+/// `record_field` payload, or `None` when the field is absent.
+fn record_bytes_field(
+    record: &[u8],
+    record_field: u32,
+    number: u32,
+) -> Result<Option<&[u8]>, EditError> {
+    let payload = record_payload(record, record_field)?;
+    let inner = &record[payload];
+    let spans = scan(inner)?;
+
+    let Some(span) = spans.iter().rev().find(|s| s.number == number) else {
+        return Ok(None);
+    };
+    if span.wire_type != WIRE_LEN {
+        return Err(EditError::Malformed);
+    }
+    Ok(Some(&inner[span.payload.clone()]))
+}
+
 /// Replace — or, with `None`, remove — one field inside the `record_field`
 /// payload, preserving every other byte of both messages.
 fn set_record_field(
@@ -417,6 +439,15 @@ pub fn account_keep_muted_chats_archived(record: &[u8]) -> Result<bool, EditErro
         record,
         STORAGE_RECORD_ACCOUNT,
         ACCOUNT_RECORD_KEEP_MUTED_CHATS_ARCHIVED,
+    )
+}
+
+/// Read `AccountRecord.profileKey` out of an encoded `StorageRecord`: the key
+/// the primary publishes, rotated or not. `None` unless it is 32 bytes.
+pub fn account_profile_key(record: &[u8]) -> Result<Option<[u8; 32]>, EditError> {
+    Ok(
+        record_bytes_field(record, STORAGE_RECORD_ACCOUNT, ACCOUNT_RECORD_PROFILE_KEY)?
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()),
     )
 }
 
@@ -1374,5 +1405,21 @@ mod account_tests {
             ..Default::default()
         });
         assert!(account_keep_muted_chats_archived(&keep_muted).unwrap());
+
+        let key = encode(AccountRecord {
+            profile_key: vec![7; 32],
+            ..Default::default()
+        });
+        assert_eq!(account_profile_key(&key).unwrap(), Some([7; 32]));
+    }
+
+    #[test]
+    fn a_profile_key_that_is_not_32_bytes_reads_as_absent() {
+        let short = account_record(&encode_len_delimited(ACCOUNT_RECORD_PROFILE_KEY, &[7; 31]));
+        assert_eq!(account_profile_key(&short).unwrap(), None);
+        assert_eq!(
+            account_profile_key(&account_record(&account_with_unknown_field())).unwrap(),
+            None
+        );
     }
 }

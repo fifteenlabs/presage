@@ -39,8 +39,8 @@ use crate::model::chat_folders::{ChatFolder, ChatFolderType};
 use crate::model::contacts::Contact;
 use crate::model::groups::Group;
 use crate::storage_record::{
-    chat_folder_unknown_fields, contact_archived, contact_blocked, contact_muted_until,
-    encode_chat_folder_record, group_archived, group_muted_until,
+    account_profile_key, chat_folder_unknown_fields, contact_archived, contact_blocked,
+    contact_muted_until, encode_chat_folder_record, group_archived, group_muted_until,
     set_account_note_to_self_archived, set_account_pinned_conversations, set_contact_archived,
     set_contact_blocked, set_contact_muted_until, set_group_archived, set_group_muted_until,
     set_sticker_pack_state, sticker_pack_state, StorageRecordEditError,
@@ -111,6 +111,30 @@ impl<S: Store> Manager<S, Registered> {
         {
             warn!(%e, "storage manifest written but notifying other devices failed");
         }
+    }
+
+    /// Take the profile key the account record carries when it isn't ours.
+    ///
+    /// The primary rotates the key (Signal-Android does when you block someone)
+    /// and publishes the new one here. Every device has to encrypt our profile
+    /// with it, or a write lands under a version no contact reads.
+    async fn adopt_account_profile_key(&mut self) -> Result<(), Error<S::Error>> {
+        let Some(identity) = self.storage_identity(&StorageRecordKey::Account).await? else {
+            return Ok(());
+        };
+        let Some(bytes) = account_profile_key(&identity.record)? else {
+            return Ok(());
+        };
+        let remote = ProfileKey::create(bytes);
+        if remote.get_bytes() == self.state.profile_key().get_bytes() {
+            return Ok(());
+        }
+        info!("storage sync: adopting the rotated profile key from the account record");
+        let mut data = (*self.state.data).clone();
+        data.profile_key = remote;
+        self.store.save_registration_data(&data).await?;
+        self.state.set_profile_key(remote);
+        Ok(())
     }
 
     /// An authenticated storage-service handle for this account.
@@ -1042,6 +1066,8 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// Pull the manifest down, then adopt the profile key the account record
+    /// carries if the primary rotated it.
     pub async fn sync_storage_service(&mut self) -> Result<(), Error<S::Error>> {
         let master_key = self
             .master_key()
@@ -1049,7 +1075,8 @@ impl<S: Store> Manager<S, Registered> {
             .ok_or_else(|| Error::MissingKeyError("master_key".into()))?;
         let storage_key = StorageServiceKey::from_master_key(&master_key);
         let push_service = self.identified_push_service();
-        sync_storage_service(&mut self.store, &push_service, storage_key).await
+        sync_storage_service(&mut self.store, &push_service, storage_key).await?;
+        self.adopt_account_profile_key().await
     }
 }
 
