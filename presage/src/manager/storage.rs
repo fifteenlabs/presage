@@ -28,7 +28,7 @@ use libsignal_service::{
     protocol::{Aci, ServiceId},
     push_service::PushService,
     zkgroup::GroupMasterKeyBytes,
-    StorageService,
+    Profile, StorageService,
 };
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use tracing::{debug, info, warn};
@@ -41,9 +41,9 @@ use crate::model::groups::Group;
 use crate::storage_record::{
     account_profile_key, chat_folder_unknown_fields, contact_archived, contact_blocked,
     contact_muted_until, encode_chat_folder_record, group_archived, group_muted_until,
-    set_account_note_to_self_archived, set_account_pinned_conversations, set_contact_archived,
-    set_contact_blocked, set_contact_muted_until, set_group_archived, set_group_muted_until,
-    set_sticker_pack_state, sticker_pack_state, StorageRecordEditError,
+    set_account_note_to_self_archived, set_account_pinned_conversations, set_account_profile,
+    set_contact_archived, set_contact_blocked, set_contact_muted_until, set_group_archived,
+    set_group_muted_until, set_sticker_pack_state, sticker_pack_state, StorageRecordEditError,
 };
 use crate::store::{
     StickerPackRecordState, StorageRecordIdentity, StorageRecordKey, StorageSyncCursor, Store,
@@ -86,16 +86,17 @@ const MANIFEST_WRITE_BACKOFF: [Duration; MANIFEST_WRITE_ATTEMPTS - 1] =
     [Duration::from_secs(1), Duration::from_secs(4)];
 
 impl<S: Store> Manager<S, Registered> {
-    /// Tell our other devices to re-read the manifest — the same `FetchLatest`
+    /// Tell our other devices to re-read something — the manifest after a
+    /// record write, our own profile after we change it. The same `FetchLatest`
     /// the app listens for.
     ///
-    /// Best-effort by design: the record is already written, so a failure here
-    /// costs propagation delay, not correctness.
-    async fn notify_storage_manifest_written(&mut self) {
+    /// Best-effort by design: what changed is already written, so a failure
+    /// here costs propagation delay, not correctness.
+    pub(super) async fn notify_fetch_latest(&mut self, kind: sync_message::fetch_latest::Type) {
         let mut sender = match self.new_message_sender().await {
             Ok(sender) => sender,
             Err(e) => {
-                warn!(%e, "storage manifest written but building the sync sender failed");
+                warn!(%e, ?kind, "building the sync sender to notify other devices failed");
                 return;
             }
         };
@@ -103,14 +104,37 @@ impl<S: Store> Manager<S, Registered> {
         if let Err(e) = sender
             .send_sync_message(SyncMessage {
                 content: Some(SyncContent::FetchLatest(sync_message::FetchLatest {
-                    r#type: Some(sync_message::fetch_latest::Type::StorageManifest.into()),
+                    r#type: Some(kind.into()),
                 })),
                 ..SyncMessage::with_padding(&mut rand::rng())
             })
             .await
         {
-            warn!(%e, "storage manifest written but notifying other devices failed");
+            warn!(%e, ?kind, "notifying other devices failed");
         }
+    }
+
+    /// Publish our name and avatar path to the account record, as Signal-Desktop
+    /// does after a profile write. `profileKey` is left alone: ours may be the
+    /// stale one.
+    ///
+    /// Callers must hold the storage-service lock.
+    pub(super) async fn publish_account_profile(
+        &mut self,
+        profile: &Profile,
+    ) -> Result<(), Error<S::Error>> {
+        let (given_name, family_name) = profile.name.as_ref().map_or(("", ""), |name| {
+            (
+                name.given_name.as_str(),
+                name.family_name.as_deref().unwrap_or(""),
+            )
+        });
+        let avatar_url_path = profile.avatar.as_deref().unwrap_or("");
+        self.update_storage_record(&StorageRecordKey::Account, |record| {
+            let edited = set_account_profile(record, given_name, family_name, avatar_url_path)?;
+            Ok((edited != record).then_some(edited))
+        })
+        .await
     }
 
     /// Take the profile key the account record carries when it isn't ours.
@@ -210,7 +234,8 @@ impl<S: Store> Manager<S, Registered> {
                     self.store.store_storage_manifest_version(version).await?;
                     debug!(version, "storage manifest: appended record");
 
-                    self.notify_storage_manifest_written().await;
+                    self.notify_fetch_latest(sync_message::fetch_latest::Type::StorageManifest)
+                        .await;
                     return Ok(raw_id);
                 }
                 // A conflict means another device wrote in between; the next iteration
@@ -453,7 +478,8 @@ impl<S: Store> Manager<S, Registered> {
                     .await?;
                     self.set_needs_storage_sync(key, false).await?;
                     debug!(version, "storage manifest: replaced storage record");
-                    self.notify_storage_manifest_written().await;
+                    self.notify_fetch_latest(sync_message::fetch_latest::Type::StorageManifest)
+                        .await;
                     return Ok(());
                 }
                 Err(Error::StorageManifestConflict) | Err(Error::StorageRecordMoved) => {
@@ -971,7 +997,8 @@ impl<S: Store> Manager<S, Registered> {
                     }
                     self.purge_chat_folders(&expired).await?;
                     debug!(version, "storage manifest: published chat folders");
-                    self.notify_storage_manifest_written().await;
+                    self.notify_fetch_latest(sync_message::fetch_latest::Type::StorageManifest)
+                        .await;
                     return Ok(());
                 }
                 Err(Error::StorageManifestConflict) | Err(Error::StorageRecordMoved) => {

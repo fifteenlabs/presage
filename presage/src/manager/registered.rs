@@ -43,7 +43,7 @@ use libsignal_service::{
     },
     provisioning::{ProvisioningError, ProvisioningSecrets},
     push_service::linking::{TransferArchiveError, TransferArchiveResult},
-    push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
+    push_service::{AvatarWrite, PushService, ServiceIds, DEFAULT_DEVICE_ID},
     sender::{AttachmentSpec, AttachmentUploadError},
     sticker_cipher::derive_key,
     unidentified_access::UnidentifiedAccess,
@@ -78,6 +78,7 @@ use crate::backup::{
 use crate::model::account::AccountChatState;
 use crate::model::calls::{extract_call_event, CallPeer};
 use crate::model::contacts::Contact;
+use crate::model::profile::{AvatarEdit, ProfileEdit};
 use crate::serde::serde_profile_key;
 // Imported by name because `storage_record` in this module already refers to
 // the protobuf module of the same name.
@@ -927,39 +928,60 @@ impl<S: Store> Manager<S, Registered> {
         }
     }
 
-    /// Updates the user's profile information.
-    pub async fn update_profile(
-        &mut self,
-        name: libsignal_service::profile_name::ProfileName<String>,
-        about: Option<String>,
-        emoji: Option<String>,
-    ) -> Result<(), Error<S::Error>> {
+    /// Rewrites our profile, then tells our other devices, as Signal-Desktop does:
+    /// the name and avatar go to the account record, and a `FetchLatest` asks
+    /// them to fetch the profile again.
+    ///
+    /// `edit` is the whole profile (see [`ProfileEdit`]). Sync the storage service
+    /// first, so a profile key the primary rotated is adopted before this
+    /// encrypts with it.
+    ///
+    /// Callers must hold the storage-service lock.
+    pub async fn update_profile(&mut self, edit: ProfileEdit) -> Result<Profile, Error<S::Error>> {
         let aci = self.state.data.service_ids.aci();
+        let profile_key = self.state.profile_key();
         let mut account_manager = AccountManager::new(
             self.identified_push_service(),
             self.identified_websocket(false).await?,
-            Some(self.state.profile_key()),
+            Some(profile_key),
         );
 
+        let ProfileEdit {
+            name,
+            about,
+            about_emoji,
+            avatar,
+        } = edit;
+        let mut new_avatar;
+        let write = match &avatar {
+            AvatarEdit::Keep => AvatarWrite::RetainAvatar,
+            AvatarEdit::Remove => AvatarWrite::NoAvatar,
+            AvatarEdit::Set(bytes) => {
+                new_avatar = std::io::Cursor::new(bytes.as_slice());
+                AvatarWrite::NewAvatar(&mut new_avatar)
+            }
+        };
         account_manager
-            .upload_versioned_profile_without_avatar::<_, String>(
-                aci,
-                name,
-                about,
-                emoji,
-                true, // retain_avatar
-                &mut rand::rng(),
-            )
+            .upload_versioned_profile(aci, name, about, about_emoji, write, &mut rand::rng())
             .await?;
 
-        // Retrieve and save locally so we have the updated version
+        // Read back what the server now holds, avatar path included.
         let profile = account_manager.retrieve_profile(aci).await?;
-        let _ = self
-            .store
-            .save_profile(aci.into(), self.state.profile_key(), profile)
-            .await;
+        self.store
+            .save_profile(aci.into(), profile_key, profile.clone())
+            .await?;
+        if let (AvatarEdit::Set(bytes), Some(url)) = (&avatar, profile.avatar.as_deref()) {
+            self.store
+                .save_profile_avatar(aci.into(), profile_key, bytes, url)
+                .await?;
+        }
 
-        Ok(())
+        if let Err(e) = self.publish_account_profile(&profile).await {
+            warn!(%e, "profile written but publishing it to the account record failed");
+        }
+        self.notify_fetch_latest(sync_message::fetch_latest::Type::LocalProfile)
+            .await;
+        Ok(profile)
     }
 
     pub async fn retrieve_group_avatar(
