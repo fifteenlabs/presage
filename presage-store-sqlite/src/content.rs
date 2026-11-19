@@ -1031,4 +1031,42 @@ mod test {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn a_call_event_that_changes_nothing_is_not_applied_again()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use presage::model::calls::{CallEventInfo, CallEventKind, CallPeer};
+
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let peer = CallPeer::Direct(Uuid::from_u128(1));
+        let missed = CallEventInfo {
+            call_id: 42,
+            conversation_id: vec![0; 16],
+            timestamp_ms: 1_000,
+            mode: CallMode::Direct,
+            call_type: CallType::Video,
+            direction: CallDirection::Incoming,
+            event: CallEventKind::NotAccepted,
+        };
+
+        let logged = store.ingest_call_event(&missed, &peer).await?;
+        assert!(logged.is_some());
+        let synced_later = CallEventInfo {
+            timestamp_ms: 5_000,
+            ..missed.clone()
+        };
+        assert_eq!(store.ingest_call_event(&synced_later, &peer).await?, None);
+        assert_eq!(store.get_call_history(42).await?, logged);
+
+        let accepted = CallEventInfo {
+            event: CallEventKind::Accepted,
+            ..missed
+        };
+        let changed = store.ingest_call_event(&accepted, &peer).await?;
+        assert!(changed.is_some());
+        assert_ne!(changed, logged);
+        assert_eq!(store.get_call_history(42).await?, changed);
+
+        Ok(())
+    }
 }

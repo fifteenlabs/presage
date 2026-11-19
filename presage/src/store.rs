@@ -465,8 +465,12 @@ pub trait ContentsStore: Send + Sync {
 
     /// Merge a freshly-decoded sync `call_event` into the canonical call
     /// history: load any prior entry, run the state machine, save the
-    /// result. Returns the merged entry, or `None` when the state machine
-    /// rejects the event (currently Adhoc / Unknown mode).
+    /// result. Returns the merged entry, or `None` when there is nothing to
+    /// apply: the state machine rejects the event (currently Adhoc /
+    /// Unknown mode), or the event merges into exactly the entry already
+    /// stored. The second is common: a call this device logged itself
+    /// arrives again as another device's sync, and a caller acting on the
+    /// result would otherwise announce the same call twice.
     ///
     /// Default impl chains `get_call_history` → `transition_call_history` →
     /// `save_call_history`, so any store overriding the two underlying
@@ -482,6 +486,9 @@ pub trait ContentsStore: Send + Sync {
             let Some(entry) = transition_call_history(prev.as_ref(), info, peer.peer_id()) else {
                 return Ok(None);
             };
+            if prev.as_ref() == Some(&entry) {
+                return Ok(None);
+            }
             self.save_call_history(&entry).await?;
             Ok(Some(entry))
         }

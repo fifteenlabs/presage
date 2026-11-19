@@ -250,7 +250,7 @@ pub struct CallEventInfo {
 }
 
 /// Canonical merged call log entry — one per `(call_id, peer_id)`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallHistoryEntry {
     pub call_id: u64,
     /// Peer identity: UUID string for `Direct` mode (1:1). Group/Adhoc use
