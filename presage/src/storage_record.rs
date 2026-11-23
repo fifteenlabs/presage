@@ -26,6 +26,14 @@ const STORAGE_RECORD_CHAT_FOLDER: u32 = 8;
 const STORAGE_RECORD_STICKER_PACK: u32 = 6;
 /// `StorageRecord.account`, from `StorageService.proto`.
 const STORAGE_RECORD_ACCOUNT: u32 = 4;
+/// `AccountRecord.profileKey`.
+const ACCOUNT_RECORD_PROFILE_KEY: u32 = 1;
+/// `AccountRecord.givenName`.
+const ACCOUNT_RECORD_GIVEN_NAME: u32 = 2;
+/// `AccountRecord.familyName`.
+const ACCOUNT_RECORD_FAMILY_NAME: u32 = 3;
+/// `AccountRecord.avatarUrlPath`.
+const ACCOUNT_RECORD_AVATAR_URL_PATH: u32 = 4;
 /// `AccountRecord.noteToSelfArchived`.
 const ACCOUNT_RECORD_NOTE_TO_SELF_ARCHIVED: u32 = 5;
 /// `AccountRecord.pinnedConversations`.
@@ -255,6 +263,26 @@ fn record_varint_field(record: &[u8], record_field: u32, number: u32) -> Result<
     read_varint(inner, &mut pos)
 }
 
+/// The last-wins bytes of length-delimited field `number` inside the
+/// `record_field` payload, or `None` when the field is absent.
+fn record_bytes_field(
+    record: &[u8],
+    record_field: u32,
+    number: u32,
+) -> Result<Option<&[u8]>, EditError> {
+    let payload = record_payload(record, record_field)?;
+    let inner = &record[payload];
+    let spans = scan(inner)?;
+
+    let Some(span) = spans.iter().rev().find(|s| s.number == number) else {
+        return Ok(None);
+    };
+    if span.wire_type != WIRE_LEN {
+        return Err(EditError::Malformed);
+    }
+    Ok(Some(&inner[span.payload.clone()]))
+}
+
 /// Replace — or, with `None`, remove — one field inside the `record_field`
 /// payload, preserving every other byte of both messages.
 fn set_record_field(
@@ -418,6 +446,37 @@ pub fn account_keep_muted_chats_archived(record: &[u8]) -> Result<bool, EditErro
         STORAGE_RECORD_ACCOUNT,
         ACCOUNT_RECORD_KEEP_MUTED_CHATS_ARCHIVED,
     )
+}
+
+/// Read `AccountRecord.profileKey` out of an encoded `StorageRecord`: the key
+/// the primary publishes, rotated or not. `None` unless it is 32 bytes.
+pub fn account_profile_key(record: &[u8]) -> Result<Option<[u8; 32]>, EditError> {
+    Ok(
+        record_bytes_field(record, STORAGE_RECORD_ACCOUNT, ACCOUNT_RECORD_PROFILE_KEY)?
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()),
+    )
+}
+
+/// Set `AccountRecord.givenName`, `familyName` and `avatarUrlPath` on an
+/// encoded `StorageRecord`, preserving every other byte of both messages.
+///
+/// An empty string removes its field: proto3 strings default to absent.
+pub fn set_account_profile(
+    record: &[u8],
+    given_name: &str,
+    family_name: &str,
+    avatar_url_path: &str,
+) -> Result<Vec<u8>, EditError> {
+    [
+        (ACCOUNT_RECORD_GIVEN_NAME, given_name),
+        (ACCOUNT_RECORD_FAMILY_NAME, family_name),
+        (ACCOUNT_RECORD_AVATAR_URL_PATH, avatar_url_path),
+    ]
+    .into_iter()
+    .try_fold(record.to_vec(), |edited, (number, value)| {
+        let field = (!value.is_empty()).then(|| encode_len_delimited(number, value.as_bytes()));
+        set_record_field(&edited, STORAGE_RECORD_ACCOUNT, number, field.as_deref())
+    })
 }
 
 /// Read `AccountRecord.pinnedConversations` out of an encoded `StorageRecord`,
@@ -1374,5 +1433,72 @@ mod account_tests {
             ..Default::default()
         });
         assert!(account_keep_muted_chats_archived(&keep_muted).unwrap());
+
+        let profile = set_account_profile(
+            &encode(AccountRecord::default()),
+            "Grace",
+            "Hopper",
+            "profiles/abc",
+        )
+        .unwrap();
+        match StorageRecord::decode(profile.as_slice()).unwrap().record {
+            Some(Record::Account(account)) => {
+                assert_eq!(account.given_name, "Grace");
+                assert_eq!(account.family_name, "Hopper");
+                assert_eq!(account.avatar_url_path, "profiles/abc");
+            }
+            other => panic!("not an account: {other:?}"),
+        }
+
+        let key = encode(AccountRecord {
+            profile_key: vec![7; 32],
+            ..Default::default()
+        });
+        assert_eq!(account_profile_key(&key).unwrap(), Some([7; 32]));
+    }
+
+    #[test]
+    fn setting_the_profile_keeps_every_other_field() {
+        let record = account_record(&account_with_unknown_field());
+
+        let edited = set_account_profile(&record, "Grace", "Hopper", "profiles/abc").unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&encode_len_delimited(2, b"Grace"));
+        expected.extend_from_slice(&encode_len_delimited(
+            ACCOUNT_RECORD_PINNED_CONVERSATIONS,
+            &release_notes_pin(),
+        ));
+        expected.extend_from_slice(&encode_varint_field(6, 1));
+        expected.extend_from_slice(&encode_len_delimited(252, b"from the future"));
+        expected.extend_from_slice(&encode_len_delimited(3, b"Hopper"));
+        expected.extend_from_slice(&encode_len_delimited(4, b"profiles/abc"));
+        assert_eq!(edited, account_record(&expected));
+    }
+
+    #[test]
+    fn an_empty_profile_field_is_removed() {
+        let record = account_record(&account_with_unknown_field());
+
+        let cleared = set_account_profile(&record, "", "", "").unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&encode_len_delimited(
+            ACCOUNT_RECORD_PINNED_CONVERSATIONS,
+            &release_notes_pin(),
+        ));
+        expected.extend_from_slice(&encode_varint_field(6, 1));
+        expected.extend_from_slice(&encode_len_delimited(252, b"from the future"));
+        assert_eq!(cleared, account_record(&expected));
+    }
+
+    #[test]
+    fn a_profile_key_that_is_not_32_bytes_reads_as_absent() {
+        let short = account_record(&encode_len_delimited(ACCOUNT_RECORD_PROFILE_KEY, &[7; 31]));
+        assert_eq!(account_profile_key(&short).unwrap(), None);
+        assert_eq!(
+            account_profile_key(&account_record(&account_with_unknown_field())).unwrap(),
+            None
+        );
     }
 }

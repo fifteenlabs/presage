@@ -27,6 +27,7 @@ use presage::model::contacts::Contact;
 use presage::model::groups::Group;
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
+use presage::model::profile::{AvatarEdit, ProfileEdit};
 use presage::proto::receipt_message;
 use presage::proto::EditMessage;
 use presage::proto::ReceiptMessage;
@@ -884,7 +885,14 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                     given_name,
                     family_name,
                 };
-                manager.update_profile(profile_name, about, emoji).await?;
+                manager
+                    .update_profile(ProfileEdit {
+                        name: profile_name,
+                        about,
+                        about_emoji: emoji,
+                        avatar: AvatarEdit::Keep,
+                    })
+                    .await?;
                 println!("Profile updated.");
             } else if family_name.is_some() || about.is_some() || emoji.is_some() {
                 bail!("The --given-name parameter is required when updating the profile fields (--family-name, --about or --emoji)");
