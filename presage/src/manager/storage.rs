@@ -129,6 +129,13 @@ impl<S: Store> Manager<S, Registered> {
                 name.family_name.as_deref().unwrap_or(""),
             )
         });
+        if given_name.is_empty() {
+            // A profile always has a given name. Without one this is a version
+            // nothing was written under yet, and publishing it would erase
+            // the name the record holds.
+            debug!("storage manifest: profile has no name, leaving the account record alone");
+            return Ok(());
+        }
         let avatar_url_path = profile.avatar.as_deref().unwrap_or("");
         self.update_storage_record(&StorageRecordKey::Account, |record| {
             let edited = set_account_profile(record, given_name, family_name, avatar_url_path)?;
@@ -158,6 +165,9 @@ impl<S: Store> Manager<S, Registered> {
         data.profile_key = remote;
         self.store.save_registration_data(&data).await?;
         self.state.set_profile_key(remote);
+        if let Err(e) = self.refresh_account_attributes().await {
+            warn!(%e, "adopted a rotated profile key but resending the account attributes failed");
+        }
         Ok(())
     }
 
@@ -1103,7 +1113,13 @@ impl<S: Store> Manager<S, Registered> {
         let storage_key = StorageServiceKey::from_master_key(&master_key);
         let push_service = self.identified_push_service();
         sync_storage_service(&mut self.store, &push_service, storage_key).await?;
-        self.adopt_account_profile_key().await
+        // The sync itself worked. A record we can't read the key from must not
+        // turn it into a failure, or every storage write that catches up
+        // through here would fail with it.
+        if let Err(e) = self.adopt_account_profile_key().await {
+            warn!(%e, "storage sync: could not adopt the account record's profile key");
+        }
+        Ok(())
     }
 }
 

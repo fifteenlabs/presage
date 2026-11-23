@@ -19,6 +19,8 @@ pub struct ProfileEdit {
 pub enum AvatarEdit {
     Keep,
     Remove,
-    /// The image to show, as uploaded: the caller sizes and encodes it.
+    /// The image to show, as uploaded: the caller sizes and encodes it, as
+    /// JPEG or PNG. It goes up unpadded and readers strip trailing zero bytes,
+    /// so a format that can end in one would come back truncated.
     Set(Vec<u8>),
 }

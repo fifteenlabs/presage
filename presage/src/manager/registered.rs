@@ -269,6 +269,24 @@ impl<S: Store> Manager<S, Registered> {
         self.state.profile_key()
     }
 
+    /// Set the account attributes again, so the server holds the unidentified
+    /// access key our live profile key derives. Connecting does this too, but
+    /// only with the key it started with.
+    pub(super) async fn refresh_account_attributes(&mut self) -> Result<(), Error<S::Error>> {
+        let mut account_manager = AccountManager::new(
+            self.identified_push_service(),
+            self.identified_websocket(false).await?,
+            None,
+        );
+        set_account_attributes(
+            &mut account_manager,
+            &self.store,
+            &self.state.data,
+            self.state.profile_key(),
+        )
+        .await
+    }
+
     /// Returns a clone of a cached push service (with credentials).
     ///
     /// If no service is yet cached, it will create and cache one.
@@ -965,15 +983,26 @@ impl<S: Store> Manager<S, Registered> {
             .upload_versioned_profile(aci, name, about, about_emoji, write, &mut rand::rng())
             .await?;
 
-        // Read back what the server now holds, avatar path included.
+        // Read back what the server now holds, avatar path included. The
+        // write has landed: a failure to cache it locally costs a download
+        // later, not the write, so it must not stop the account record and
+        // our other devices from hearing about it.
         let profile = account_manager.retrieve_profile(aci).await?;
-        self.store
+        if let Err(e) = self
+            .store
             .save_profile(aci.into(), profile_key, profile.clone())
-            .await?;
+            .await
+        {
+            warn!(%e, "profile written but caching it locally failed");
+        }
         if let (AvatarEdit::Set(bytes), Some(url)) = (&avatar, profile.avatar.as_deref()) {
-            self.store
+            if let Err(e) = self
+                .store
                 .save_profile_avatar(aci.into(), profile_key, bytes, url)
-                .await?;
+                .await
+            {
+                warn!(%e, "avatar uploaded but caching it locally failed");
+            }
         }
 
         if let Err(e) = self.publish_account_profile(&profile).await {
