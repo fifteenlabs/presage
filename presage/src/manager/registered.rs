@@ -607,9 +607,12 @@ impl<S: Store> Manager<S, Registered> {
 
         // The response carries the group as the server stored it, revision 0, so the local
         // copy is canonically the server's without a second request that could fail after
-        // the group already exists.
-        let stored = response.group.ok_or(Error::CreatedGroupNotReturned)?;
-        let group = decrypt_group(&master_key_bytes, stored)?;
+        // the group already exists. A reply without it still created the group, so read it
+        // back: failing here would have the caller create a second one.
+        let group = match response.group {
+            Some(stored) => decrypt_group(&master_key_bytes, stored)?,
+            None => fetch_group(&mut groups_manager, &mut csprng, &master_key_bytes).await?,
+        };
         self.store.save_group(master_key_bytes, group).await?;
 
         // Our own linked devices learn about the group from the storage manifest, not from

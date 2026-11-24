@@ -94,8 +94,6 @@ pub enum Error<S: std::error::Error> {
     AttachmentCipherError(#[from] libsignal_service::attachment_cipher::AttachmentCipherError),
     #[error("unknown group")]
     UnknownGroup,
-    #[error("the group server created the group but did not return it")]
-    CreatedGroupNotReturned,
     #[error("group update carries no change")]
     EmptyGroupUpdate,
     #[error("group membership update carries no change")]
