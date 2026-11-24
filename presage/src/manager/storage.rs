@@ -148,7 +148,8 @@ impl<S: Store> Manager<S, Registered> {
     ///
     /// The primary rotates the key (Signal-Android does when you block someone)
     /// and publishes the new one here. Every device has to encrypt our profile
-    /// with it, or a write lands under a version no contact reads.
+    /// with it, or a write lands under a version no contact reads. The account's
+    /// unidentified access key is the primary's to set, which it does as it rotates.
     async fn adopt_account_profile_key(&mut self) -> Result<(), Error<S::Error>> {
         let Some(identity) = self.storage_identity(&StorageRecordKey::Account).await? else {
             return Ok(());
@@ -165,9 +166,6 @@ impl<S: Store> Manager<S, Registered> {
         data.profile_key = remote;
         self.store.save_registration_data(&data).await?;
         self.state.set_profile_key(remote);
-        if let Err(e) = self.refresh_account_attributes().await {
-            warn!(%e, "adopted a rotated profile key but resending the account attributes failed");
-        }
         Ok(())
     }
 

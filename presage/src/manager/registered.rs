@@ -269,24 +269,6 @@ impl<S: Store> Manager<S, Registered> {
         self.state.profile_key()
     }
 
-    /// Set the account attributes again, so the server holds the unidentified
-    /// access key our live profile key derives. Connecting does this too, but
-    /// only with the key it started with.
-    pub(super) async fn refresh_account_attributes(&mut self) -> Result<(), Error<S::Error>> {
-        let mut account_manager = AccountManager::new(
-            self.identified_push_service(),
-            self.identified_websocket(false).await?,
-            None,
-        );
-        set_account_attributes(
-            &mut account_manager,
-            &self.store,
-            &self.state.data,
-            self.state.profile_key(),
-        )
-        .await
-    }
-
     /// Returns a clone of a cached push service (with credentials).
     ///
     /// If no service is yet cached, it will create and cache one.
@@ -1176,7 +1158,7 @@ impl<S: Store> Manager<S, Registered> {
     /// Returns a [futures::Stream] of messages to consume. Messages will also be stored by the implementation of the [Store].
     ///
     /// Must be called inside a [tokio::task::LocalSet] that keeps running while the stream is
-    /// consumed: it spawns a local task that refreshes the account attributes and pre-keys, and
+    /// consumed: it spawns a local task that registers this device and refreshes the pre-keys, and
     /// cancels it when the stream ends or is dropped.
     pub async fn receive_messages(
         &mut self,
@@ -1209,9 +1191,9 @@ impl<S: Store> Manager<S, Registered> {
 
         let store_inner = self.store.clone();
         let registration_data_inner = self.registration_data().clone();
-        let profile_key = self.state.profile_key();
+        let registration_type = self.registration_type();
 
-        // Updates the account attributes and refreshes the pre-keys on every connect, as a local
+        // Registers this device and refreshes the pre-keys on every connect, as a local
         // task of its own. It is spawned only once the stream is built, so a failed or cancelled
         // `receive_messages` never starts it, and the stream state holds its handle, so it is
         // cancelled when the stream ends or is dropped.
@@ -1224,15 +1206,15 @@ impl<S: Store> Manager<S, Registered> {
         // consumer asked the store for that item on the same task and never polled the stream
         // again: the receive loop and every other store user waited for ever.
         let (refresh_registration, refresh_registration_handle) = async move {
-            if let Err(error) = set_account_attributes(
+            if let Err(error) = register_device(
                 &mut account_manager,
                 &store_inner,
                 &registration_data_inner,
-                profile_key,
+                registration_type,
             )
             .await
             {
-                error!(%error, "failed to set account attributes, this is problematic and should never happen!");
+                error!(%error, "failed to register this device with the server, this is problematic and should never happen!");
             }
 
             if let Err(error) = register_pre_keys(&store_inner, &mut account_manager).await {
@@ -4223,13 +4205,48 @@ async fn upsert_contact_from_profile<S: Store>(
     Ok(())
 }
 
-/// `profile_key` is the live key, not `data`'s: the unidentified access key is
-/// derived from it, and the primary sets the one for a rotated key.
+/// What this device can do, as the server records it for each device.
+fn device_capabilities() -> DeviceCapabilities {
+    DeviceCapabilities {
+        storage: true,
+        transfer: false,
+        attachment_backfill: false,
+        spqr: true,
+        profiles_v2: false,
+        username_change_sync_message: true,
+    }
+}
+
+/// Tells the server about this device, on every connect.
+///
+/// A linked device sends only its capabilities, as Signal-Desktop does after each connect. The
+/// account attributes also carry the registration lock, phone-number discoverability, sealed
+/// sender access and the unidentified access key, which the server applies to the whole account
+/// whichever device sends them: from a linked device they switched the registration lock off and
+/// overrode the privacy settings the primary had set. Those belong to the primary, which also
+/// sets the access key whenever it rotates the profile key.
+async fn register_device<S: Store>(
+    account_manager: &mut AccountManager,
+    store: &S,
+    data: &RegistrationData,
+    registration_type: RegistrationType,
+) -> Result<(), Error<S::Error>> {
+    match registration_type {
+        RegistrationType::Secondary => {
+            trace!("setting device capabilities");
+            account_manager
+                .set_device_capabilities(&device_capabilities())
+                .await?;
+            Ok(())
+        }
+        RegistrationType::Primary => set_account_attributes(account_manager, store, data).await,
+    }
+}
+
 async fn set_account_attributes<S: Store>(
     account_manager: &mut AccountManager,
     store: &S,
     data: &RegistrationData,
-    profile_key: ProfileKey,
 ) -> Result<(), Error<S::Error>> {
     trace!("setting account attributes");
 
@@ -4254,16 +4271,9 @@ async fn set_account_attributes<S: Store>(
             pni_registration_id,
             name,
             registration_lock: None,
-            unidentified_access_key: Some(profile_key.derive_access_key().to_vec()),
+            unidentified_access_key: Some(data.profile_key.derive_access_key().to_vec()),
             unrestricted_unidentified_access: false,
-            capabilities: Some(DeviceCapabilities {
-                storage: true,
-                transfer: false,
-                attachment_backfill: false,
-                spqr: true,
-                profiles_v2: false,
-                username_change_sync_message: true,
-            }),
+            capabilities: Some(device_capabilities()),
             discoverable_by_phone_number: true,
             recovery_password: None,
             video: false,
