@@ -2830,6 +2830,7 @@ impl<S: Store> Manager<S, Registered> {
                         .expect("Primary device to always have an account entropy pool"),
                     ephemeral_backup_key: None,
                     media_root_backup_key: None,
+                    read_receipts: None,
                 },
             )
             .await?;
