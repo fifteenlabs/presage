@@ -601,14 +601,15 @@ impl<S: Store> Manager<S, Registered> {
             )?;
 
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
-        groups_manager
+        let response = groups_manager
             .create_group(&mut csprng, &master_key_bytes, encrypted_group)
             .await?;
 
-        // Read back rather than trusting the write's response body, whose shape differs
-        // between endpoint versions. This also makes the local copy canonically the
-        // server's, revision included.
-        let group = fetch_group(&mut groups_manager, &mut csprng, &master_key_bytes).await?;
+        // The response carries the group as the server stored it, revision 0, so the local
+        // copy is canonically the server's without a second request that could fail after
+        // the group already exists.
+        let stored = response.group.ok_or(Error::CreatedGroupNotReturned)?;
+        let group = decrypt_group(&master_key_bytes, stored)?;
         self.store.save_group(master_key_bytes, group).await?;
 
         // Our own linked devices learn about the group from the storage manifest, not from
