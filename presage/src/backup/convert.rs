@@ -408,6 +408,9 @@ pub fn chat_item_to_contents(
         Some(Item::StickerMessage(sm)) => {
             sticker_message_to_contents(sm, item, &thread, recipients, our_aci, timestamp)
         }
+        Some(Item::ViewOnceMessage(vo)) => {
+            view_once_message_to_contents(vo, item, &thread, recipients, our_aci, timestamp)
+        }
         Some(Item::UpdateMessage(cu)) => match cu.update.as_ref() {
             Some(Update::IndividualCall(_)) => {
                 individual_call_to_contents(cu, &thread, our_aci, timestamp)
@@ -687,7 +690,7 @@ pub fn chat_item_pin(
     let pin = item.pin_details.as_ref()?;
     if !matches!(
         item.item,
-        Some(Item::StandardMessage(_) | Item::StickerMessage(_))
+        Some(Item::StandardMessage(_) | Item::StickerMessage(_) | Item::ViewOnceMessage(_))
     ) {
         return None;
     }
@@ -874,6 +877,41 @@ fn sticker_message_to_contents(
     wrap_dm_with_reactions(
         dm,
         &sm.reactions,
+        item,
+        thread,
+        recipients,
+        our_aci,
+        timestamp,
+    )
+}
+
+/// Build a view-once `DataMessage` for a backup `ViewOnceMessage`, then hand
+/// off to the shared envelope/reactions wrapper. The primary exports the
+/// attachment only into a link-and-sync archive and only while the message is
+/// unopened, so an opened one (or one from any other backup) still imports as
+/// a view-once row, just without media — the way Signal Desktop imports it.
+fn view_once_message_to_contents(
+    vo: &backup::ViewOnceMessage,
+    item: &ChatItem,
+    thread: &Thread,
+    recipients: &HashMap<u64, RecipientInfo>,
+    our_aci: Aci,
+    timestamp: u64,
+) -> Vec<ImportedContent> {
+    let dm = DataMessage {
+        attachments: vo
+            .attachment
+            .as_ref()
+            .and_then(message_attachment_to_pointer)
+            .into_iter()
+            .collect(),
+        is_view_once: Some(true),
+        timestamp: Some(timestamp),
+        ..Default::default()
+    };
+    wrap_dm_with_reactions(
+        dm,
+        &vo.reactions,
         item,
         thread,
         recipients,
@@ -2429,6 +2467,105 @@ mod tests {
             pin_of(&poll).is_none(),
             "kind the importer stores no row for"
         );
+    }
+
+    fn transit_photo(cdn_key: &str) -> backup::MessageAttachment {
+        backup::MessageAttachment {
+            pointer: Some(backup::FilePointer {
+                content_type: Some("image/jpeg".to_string()),
+                locator_info: Some(backup::file_pointer::LocatorInfo {
+                    key: vec![1; 64],
+                    size: 1024,
+                    transit_cdn_key: Some(cdn_key.to_string()),
+                    transit_cdn_number: Some(3),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn view_once_item(attachment: Option<backup::MessageAttachment>) -> ChatItem {
+        let mut item = incoming_item();
+        item.item = Some(Item::ViewOnceMessage(backup::ViewOnceMessage {
+            attachment,
+            reactions: Vec::new(),
+        }));
+        item
+    }
+
+    /// A link-and-sync archive carries the photo of a view-once the phone has
+    /// not opened yet, so it arrives fetchable, as Signal Desktop imports it.
+    #[test]
+    fn an_unopened_view_once_imports_with_its_media() {
+        let (sender, dm) = imported_update(&view_once_item(Some(transit_photo("k-1"))));
+        assert_eq!(
+            sender,
+            ServiceId::Aci(Aci::from(Uuid::from_bytes([9u8; 16])))
+        );
+        assert_eq!(dm.is_view_once, Some(true));
+        let [photo] = dm.attachments.as_slice() else {
+            panic!("expected the one photo, got {:?}", dm.attachments);
+        };
+        assert_eq!(
+            photo.attachment_identifier,
+            Some(AttachmentIdentifier::CdnKey("k-1".to_string()))
+        );
+        assert_eq!(photo.content_type.as_deref(), Some("image/jpeg"));
+    }
+
+    /// Once opened on the phone the backup drops the attachment, but the
+    /// message itself must survive: dropping the item left a gap where the
+    /// conversation had a view-once.
+    #[test]
+    fn an_opened_view_once_still_imports_as_a_view_once_without_media() {
+        let (_, dm) = imported_update(&view_once_item(None));
+        assert_eq!(dm.is_view_once, Some(true));
+        assert!(dm.attachments.is_empty());
+    }
+
+    #[test]
+    fn a_view_once_we_sent_is_a_sync_transcript() {
+        let mut item = view_once_item(Some(transit_photo("k-1")));
+        item.directional_details = Some(DirectionalDetails::Outgoing(Default::default()));
+        assert!(matches!(
+            imported_row(&item).content.body,
+            ContentBody::SynchronizeMessage(_)
+        ));
+        let (sender, dm) = imported_update(&item);
+        assert_eq!(sender, ServiceId::Aci(our_aci()));
+        assert_eq!(dm.is_view_once, Some(true));
+        assert_eq!(dm.attachments.len(), 1);
+    }
+
+    #[test]
+    fn a_view_once_keeps_its_reactions_and_its_pin() {
+        let mut item = view_once_item(None);
+        item.item = Some(Item::ViewOnceMessage(backup::ViewOnceMessage {
+            attachment: None,
+            reactions: vec![backup::Reaction {
+                emoji: "❤️".to_string(),
+                author_id: 1,
+                sent_timestamp: 1700000500000,
+                sort_order: 0,
+            }],
+        }));
+        assert_eq!(
+            imported(&item).len(),
+            2,
+            "expected the view-once and its reaction"
+        );
+
+        let mut pinned = view_once_item(None);
+        pinned.pin_details = Some(backup::chat_item::PinDetails {
+            pinned_at_timestamp: 1700000005000,
+            pin_expiry: None,
+        });
+        let pin = pin_of(&pinned).expect("pin");
+        let row = imported_row(&pinned);
+        assert_eq!(pin.ts, pinned.date_sent);
+        assert_eq!(pin.author, row.content.metadata.sender);
     }
 
     #[test]
