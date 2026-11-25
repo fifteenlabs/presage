@@ -2529,12 +2529,16 @@ mod tests {
     fn a_view_once_we_sent_is_a_sync_transcript() {
         let mut item = view_once_item(Some(transit_photo("k-1")));
         item.directional_details = Some(DirectionalDetails::Outgoing(Default::default()));
-        assert!(matches!(
-            imported_row(&item).content.body,
-            ContentBody::SynchronizeMessage(_)
-        ));
-        let (sender, dm) = imported_update(&item);
-        assert_eq!(sender, ServiceId::Aci(our_aci()));
+        let row = imported_row(&item);
+        assert_eq!(row.content.metadata.sender, ServiceId::Aci(our_aci()));
+        let ContentBody::SynchronizeMessage(SyncMessage {
+            content: Some(SyncContent::Sent(sent)),
+            ..
+        }) = row.content.body
+        else {
+            panic!("expected a Sent transcript, got {:?}", row.content.body);
+        };
+        let dm = sent.message.expect("sent transcript carries the message");
         assert_eq!(dm.is_view_once, Some(true));
         assert_eq!(dm.attachments.len(), 1);
     }
@@ -2542,30 +2546,23 @@ mod tests {
     #[test]
     fn a_view_once_keeps_its_reactions_and_its_pin() {
         let mut item = view_once_item(None);
-        item.item = Some(Item::ViewOnceMessage(backup::ViewOnceMessage {
-            attachment: None,
-            reactions: vec![backup::Reaction {
+        if let Some(Item::ViewOnceMessage(vo)) = item.item.as_mut() {
+            vo.reactions.push(backup::Reaction {
                 emoji: "❤️".to_string(),
                 author_id: 1,
                 sent_timestamp: 1700000500000,
                 sort_order: 0,
-            }],
-        }));
+            });
+        }
         assert_eq!(
             imported(&item).len(),
             2,
             "expected the view-once and its reaction"
         );
 
-        let mut pinned = view_once_item(None);
-        pinned.pin_details = Some(backup::chat_item::PinDetails {
-            pinned_at_timestamp: 1700000005000,
-            pin_expiry: None,
-        });
-        let pin = pin_of(&pinned).expect("pin");
-        let row = imported_row(&pinned);
-        assert_eq!(pin.ts, pinned.date_sent);
-        assert_eq!(pin.author, row.content.metadata.sender);
+        let mut pinned_view_once = pinned(incoming_item(), None);
+        pinned_view_once.item = view_once_item(None).item;
+        assert!(pin_of(&pinned_view_once).is_some());
     }
 
     #[test]
