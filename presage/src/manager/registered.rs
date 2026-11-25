@@ -289,7 +289,7 @@ impl<S: Store> Manager<S, Registered> {
     /// Returns the current identified websocket, or creates a new one
     ///
     /// A new one is created if the current websocket is closed, or if there is none yet.
-    async fn identified_websocket(
+    pub(super) async fn identified_websocket(
         &self,
         require_unused: bool,
     ) -> Result<SignalWebSocket<websocket::Identified>, Error<S::Error>> {
