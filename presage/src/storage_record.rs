@@ -36,6 +36,24 @@ const ACCOUNT_RECORD_FAMILY_NAME: u32 = 3;
 const ACCOUNT_RECORD_AVATAR_URL_PATH: u32 = 4;
 /// `AccountRecord.noteToSelfArchived`.
 const ACCOUNT_RECORD_NOTE_TO_SELF_ARCHIVED: u32 = 5;
+/// `AccountRecord.readReceipts`.
+const ACCOUNT_RECORD_READ_RECEIPTS: u32 = 6;
+/// `AccountRecord.typingIndicators`.
+const ACCOUNT_RECORD_TYPING_INDICATORS: u32 = 8;
+/// `AccountRecord.phoneNumberSharingMode`.
+const ACCOUNT_RECORD_PHONE_NUMBER_SHARING_MODE: u32 = 12;
+/// `AccountRecord.unlistedPhoneNumber`.
+const ACCOUNT_RECORD_UNLISTED_PHONE_NUMBER: u32 = 13;
+/// `AccountRecord.storyViewReceiptsEnabled`.
+const ACCOUNT_RECORD_STORY_VIEW_RECEIPTS: u32 = 30;
+/// `OptionalBool.ENABLED`.
+const OPTIONAL_BOOL_ENABLED: u64 = 1;
+/// `OptionalBool.DISABLED`.
+const OPTIONAL_BOOL_DISABLED: u64 = 2;
+/// `AccountRecord.PhoneNumberSharingMode.EVERYBODY`.
+const PHONE_NUMBER_SHARING_EVERYBODY: u64 = 1;
+/// `AccountRecord.PhoneNumberSharingMode.NOBODY`.
+const PHONE_NUMBER_SHARING_NOBODY: u64 = 2;
 /// `AccountRecord.pinnedConversations`.
 const ACCOUNT_RECORD_PINNED_CONVERSATIONS: u32 = 14;
 /// `AccountRecord.keepMutedChatsArchived`.
@@ -445,6 +463,117 @@ pub fn account_keep_muted_chats_archived(record: &[u8]) -> Result<bool, EditErro
         record,
         STORAGE_RECORD_ACCOUNT,
         ACCOUNT_RECORD_KEEP_MUTED_CHATS_ARCHIVED,
+    )
+}
+
+/// Read `AccountRecord.readReceipts` out of an encoded `StorageRecord`.
+pub fn account_read_receipts(record: &[u8]) -> Result<bool, EditError> {
+    record_bool_field(record, STORAGE_RECORD_ACCOUNT, ACCOUNT_RECORD_READ_RECEIPTS)
+}
+
+/// Set `AccountRecord.readReceipts` on an encoded `StorageRecord`. See
+/// [`set_bool_field`] for how `false` is written.
+pub fn set_account_read_receipts(record: &[u8], on: bool) -> Result<Vec<u8>, EditError> {
+    set_bool_field(
+        record,
+        STORAGE_RECORD_ACCOUNT,
+        ACCOUNT_RECORD_READ_RECEIPTS,
+        on,
+    )
+}
+
+/// Read `AccountRecord.typingIndicators` out of an encoded `StorageRecord`.
+pub fn account_typing_indicators(record: &[u8]) -> Result<bool, EditError> {
+    record_bool_field(
+        record,
+        STORAGE_RECORD_ACCOUNT,
+        ACCOUNT_RECORD_TYPING_INDICATORS,
+    )
+}
+
+/// Set `AccountRecord.typingIndicators` on an encoded `StorageRecord`. See
+/// [`set_bool_field`] for how `false` is written.
+pub fn set_account_typing_indicators(record: &[u8], on: bool) -> Result<Vec<u8>, EditError> {
+    set_bool_field(
+        record,
+        STORAGE_RECORD_ACCOUNT,
+        ACCOUNT_RECORD_TYPING_INDICATORS,
+        on,
+    )
+}
+
+/// Whether `AccountRecord.phoneNumberSharingMode` shares the number with
+/// everybody. `UNKNOWN`, which an account that never chose carries, reads as
+/// not sharing, as Signal-Android's `isPhoneNumberSharingEnabled` reads it.
+pub fn account_phone_number_sharing(record: &[u8]) -> Result<bool, EditError> {
+    Ok(record_varint_field(
+        record,
+        STORAGE_RECORD_ACCOUNT,
+        ACCOUNT_RECORD_PHONE_NUMBER_SHARING_MODE,
+    )? == PHONE_NUMBER_SHARING_EVERYBODY)
+}
+
+/// Set `AccountRecord.phoneNumberSharingMode` to `EVERYBODY` or `NOBODY`,
+/// both written explicitly as Signal-Desktop writes them: once chosen, the
+/// mode is no longer `UNKNOWN`.
+pub fn set_account_phone_number_sharing(
+    record: &[u8],
+    everybody: bool,
+) -> Result<Vec<u8>, EditError> {
+    let mode = if everybody {
+        PHONE_NUMBER_SHARING_EVERYBODY
+    } else {
+        PHONE_NUMBER_SHARING_NOBODY
+    };
+    set_record_field(
+        record,
+        STORAGE_RECORD_ACCOUNT,
+        ACCOUNT_RECORD_PHONE_NUMBER_SHARING_MODE,
+        Some(&encode_varint_field(
+            ACCOUNT_RECORD_PHONE_NUMBER_SHARING_MODE,
+            mode,
+        )),
+    )
+}
+
+/// Read `AccountRecord.unlistedPhoneNumber`: `true` when nobody can find the
+/// account by its number.
+pub fn account_unlisted_phone_number(record: &[u8]) -> Result<bool, EditError> {
+    record_bool_field(
+        record,
+        STORAGE_RECORD_ACCOUNT,
+        ACCOUNT_RECORD_UNLISTED_PHONE_NUMBER,
+    )
+}
+
+/// Set `AccountRecord.unlistedPhoneNumber` on an encoded `StorageRecord`. See
+/// [`set_bool_field`] for how `false` is written.
+pub fn set_account_unlisted_phone_number(
+    record: &[u8],
+    unlisted: bool,
+) -> Result<Vec<u8>, EditError> {
+    set_bool_field(
+        record,
+        STORAGE_RECORD_ACCOUNT,
+        ACCOUNT_RECORD_UNLISTED_PHONE_NUMBER,
+        unlisted,
+    )
+}
+
+/// Read `AccountRecord.storyViewReceiptsEnabled`: `None` while it is
+/// `UNSET`, which is how an account that never touched the story setting
+/// reads.
+pub fn account_story_view_receipts(record: &[u8]) -> Result<Option<bool>, EditError> {
+    Ok(
+        match record_varint_field(
+            record,
+            STORAGE_RECORD_ACCOUNT,
+            ACCOUNT_RECORD_STORY_VIEW_RECEIPTS,
+        )? {
+            OPTIONAL_BOOL_ENABLED => Some(true),
+            OPTIONAL_BOOL_DISABLED => Some(false),
+            _ => None,
+        },
     )
 }
 
@@ -1490,6 +1619,126 @@ mod account_tests {
         expected.extend_from_slice(&encode_varint_field(6, 1));
         expected.extend_from_slice(&encode_len_delimited(252, b"from the future"));
         assert_eq!(cleared, account_record(&expected));
+    }
+
+    #[test]
+    fn privacy_settings_round_trip_and_keep_every_other_field() {
+        let record = account_record(&account_with_unknown_field());
+        assert!(account_read_receipts(&record).unwrap());
+        assert!(!account_typing_indicators(&record).unwrap());
+        assert!(!account_unlisted_phone_number(&record).unwrap());
+
+        let edited = set_account_read_receipts(&record, false)
+            .and_then(|r| set_account_typing_indicators(&r, true))
+            .and_then(|r| set_account_unlisted_phone_number(&r, true))
+            .unwrap();
+        assert!(!account_read_receipts(&edited).unwrap());
+        assert!(account_typing_indicators(&edited).unwrap());
+        assert!(account_unlisted_phone_number(&edited).unwrap());
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&encode_len_delimited(2, b"Ada"));
+        expected.extend_from_slice(&encode_len_delimited(
+            ACCOUNT_RECORD_PINNED_CONVERSATIONS,
+            &release_notes_pin(),
+        ));
+        expected.extend_from_slice(&encode_len_delimited(252, b"from the future"));
+        expected.extend_from_slice(&encode_varint_field(ACCOUNT_RECORD_TYPING_INDICATORS, 1));
+        expected.extend_from_slice(&encode_varint_field(
+            ACCOUNT_RECORD_UNLISTED_PHONE_NUMBER,
+            1,
+        ));
+        assert_eq!(edited, account_record(&expected));
+
+        let restored = set_account_read_receipts(&edited, true)
+            .and_then(|r| set_account_typing_indicators(&r, false))
+            .and_then(|r| set_account_unlisted_phone_number(&r, false))
+            .unwrap();
+        assert!(account_read_receipts(&restored).unwrap());
+        assert!(!account_typing_indicators(&restored).unwrap());
+        assert!(!account_unlisted_phone_number(&restored).unwrap());
+    }
+
+    #[test]
+    fn only_everybody_shares_the_phone_number() {
+        let unknown = account_record(&account_with_unknown_field());
+        assert!(!account_phone_number_sharing(&unknown).unwrap());
+
+        let everybody = set_account_phone_number_sharing(&unknown, true).unwrap();
+        assert!(account_phone_number_sharing(&everybody).unwrap());
+
+        let nobody = set_account_phone_number_sharing(&everybody, false).unwrap();
+        assert!(!account_phone_number_sharing(&nobody).unwrap());
+        assert_eq!(
+            record_varint_field(
+                &nobody,
+                STORAGE_RECORD_ACCOUNT,
+                ACCOUNT_RECORD_PHONE_NUMBER_SHARING_MODE
+            )
+            .unwrap(),
+            PHONE_NUMBER_SHARING_NOBODY,
+            "a chosen Nobody is written, not left as UNKNOWN"
+        );
+    }
+
+    /// As for `archived`: only the generated types can pin the privacy fields
+    /// and the sharing mode's values to their numbers.
+    #[test]
+    fn privacy_fields_land_in_the_generated_records_fields() {
+        use libsignal_service::prelude::ProtobufMessage;
+        use libsignal_service::proto::account_record::PhoneNumberSharingMode;
+        use libsignal_service::proto::{
+            storage_record::Record, AccountRecord, OptionalBool, StorageRecord,
+        };
+
+        let decode =
+            |record: Vec<u8>| match StorageRecord::decode(record.as_slice()).unwrap().record {
+                Some(Record::Account(account)) => account,
+                other => panic!("not an account: {other:?}"),
+            };
+        let empty = StorageRecord {
+            record: Some(Record::Account(AccountRecord::default())),
+        }
+        .encode_to_vec();
+
+        let on = set_account_read_receipts(&empty, true)
+            .and_then(|r| set_account_typing_indicators(&r, true))
+            .and_then(|r| set_account_unlisted_phone_number(&r, true))
+            .and_then(|r| set_account_phone_number_sharing(&r, true))
+            .unwrap();
+        let account = decode(on.clone());
+        assert!(account.read_receipts);
+        assert!(account.typing_indicators);
+        assert!(account.unlisted_phone_number);
+        assert_eq!(
+            account.phone_number_sharing_mode(),
+            PhoneNumberSharingMode::Everybody
+        );
+
+        let nobody = set_account_phone_number_sharing(&on, false).unwrap();
+        assert_eq!(
+            decode(nobody).phone_number_sharing_mode(),
+            PhoneNumberSharingMode::Nobody
+        );
+
+        let story = |value: OptionalBool| {
+            StorageRecord {
+                record: Some(Record::Account(AccountRecord {
+                    story_view_receipts_enabled: value.into(),
+                    ..Default::default()
+                })),
+            }
+            .encode_to_vec()
+        };
+        assert_eq!(account_story_view_receipts(&empty).unwrap(), None);
+        assert_eq!(
+            account_story_view_receipts(&story(OptionalBool::Enabled)).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            account_story_view_receipts(&story(OptionalBool::Disabled)).unwrap(),
+            Some(false)
+        );
     }
 
     #[test]
