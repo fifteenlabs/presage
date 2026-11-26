@@ -566,7 +566,7 @@ fn item_author(
 }
 
 /// Restored state for a backup message row that the wire `Content` cannot
-/// carry: read state and per-recipient send status. Arrival time is not among
+/// carry: read and viewed state and per-recipient send status. Arrival time is not among
 /// them — it is stamped at save time from [`ImportedContent`], which also
 /// reaches the rows this hook cannot address: directionless updates, and
 /// reactions, whose row is keyed by their own timestamp rather than the item's.
@@ -576,7 +576,17 @@ pub struct BackupMessageState {
     pub ts: u64,
     /// `Some` for incoming rows, `None` for outgoing.
     pub read: Option<bool>,
+    /// An incoming view-once the primary already opened.
+    pub viewed: bool,
     pub send_states: Vec<(String, BackupSendStatus, u64)>,
+}
+
+/// The primary exports a view-once's attachment only while it is unopened, so
+/// one without an attachment in the archive was opened. This reads the
+/// archive, not the converted pointer: an unopened attachment the importer
+/// cannot fetch converts to no pointer either.
+fn opened_view_once(item: &ChatItem) -> bool {
+    matches!(&item.item, Some(Item::ViewOnceMessage(vo)) if vo.attachment.is_none())
 }
 
 /// Extract read / per-recipient send state from a backup `ChatItem` so the
@@ -596,6 +606,7 @@ fn chat_item_backup_state(
             thread,
             ts: chat_item_sent_ms(item),
             read: Some(inc.read),
+            viewed: opened_view_once(item),
             send_states: Vec::new(),
         }),
         DirectionalDetails::Outgoing(out) => {
@@ -624,6 +635,7 @@ fn chat_item_backup_state(
                 thread,
                 ts: item.date_sent,
                 read: None,
+                viewed: false,
                 send_states,
             })
         }
@@ -654,6 +666,7 @@ pub fn chat_item_backup_states(
                 thread: thread.clone(),
                 ts: version.date_sent,
                 read: Some(true),
+                viewed: false,
                 send_states: Vec::new(),
             });
     chat_item_backup_state(item, recipients, chats)
@@ -889,7 +902,8 @@ fn sticker_message_to_contents(
 /// off to the shared envelope/reactions wrapper. The primary exports the
 /// attachment only into a link-and-sync archive and only while the message is
 /// unopened, so an opened one (or one from any other backup) still imports as
-/// a view-once row, just without media — the way Signal Desktop imports it.
+/// a view-once row, just without media, and [`chat_item_backup_states`] marks
+/// an incoming opened one viewed.
 fn view_once_message_to_contents(
     vo: &backup::ViewOnceMessage,
     item: &ChatItem,
@@ -2554,15 +2568,73 @@ mod tests {
                 sort_order: 0,
             });
         }
+        let rows = imported(&item);
+        let [view_once, reaction] = rows.as_slice() else {
+            panic!(
+                "expected the view-once and its reaction, got {} rows",
+                rows.len()
+            );
+        };
+        let (ContentBody::DataMessage(view_once_dm), ContentBody::DataMessage(reaction_dm)) =
+            (&view_once.content.body, &reaction.content.body)
+        else {
+            panic!("expected two DataMessage rows");
+        };
+        let target = reaction_dm.reaction.as_ref().expect("a reaction");
+        assert_eq!(target.target_sent_timestamp, view_once_dm.timestamp);
         assert_eq!(
-            imported(&item).len(),
-            2,
-            "expected the view-once and its reaction"
+            target.target_author_aci,
+            Some(view_once.content.metadata.sender.service_id_string())
         );
 
         let mut pinned_view_once = pinned(incoming_item(), None);
         pinned_view_once.item = view_once_item(None).item;
-        assert!(pin_of(&pinned_view_once).is_some());
+        let pin = pin_of(&pinned_view_once).expect("pin");
+        let row = imported_row(&pinned_view_once);
+        let (sender, dm) = imported_update(&pinned_view_once);
+        assert_eq!(pin.thread, row.thread);
+        assert_eq!(Some(pin.ts), dm.timestamp);
+        assert_eq!(pin.author, sender);
+    }
+
+    #[test]
+    fn an_opened_view_once_is_restored_viewed_and_an_unopened_one_is_not() {
+        let viewed = |item: &ChatItem| {
+            let states = chat_item_backup_states(item, &sender_recipients(), &sender_chats());
+            let [state] = states.as_slice() else {
+                panic!("expected one state, got {}", states.len());
+            };
+            state.viewed
+        };
+
+        assert!(viewed(&view_once_item(None)), "opened on the phone");
+        assert!(
+            !viewed(&view_once_item(Some(transit_photo("k-1")))),
+            "unopened, its photo in the archive"
+        );
+
+        let mut unfetchable = transit_photo("k-1");
+        if let Some(locator) = unfetchable
+            .pointer
+            .as_mut()
+            .and_then(|pointer| pointer.locator_info.as_mut())
+        {
+            locator.transit_cdn_key = None;
+        }
+        let unfetchable = view_once_item(Some(unfetchable));
+        assert!(
+            imported_update(&unfetchable).1.attachments.is_empty(),
+            "imports without media, like an opened one"
+        );
+        assert!(!viewed(&unfetchable), "but it is still unopened");
+
+        let mut sent = view_once_item(None);
+        sent.directional_details = Some(DirectionalDetails::Outgoing(Default::default()));
+        assert!(!viewed(&sent), "the recipient's view is a send state");
+
+        let mut text = incoming_item();
+        text.item = Some(text_message("hi"));
+        assert!(!viewed(&text));
     }
 
     #[test]

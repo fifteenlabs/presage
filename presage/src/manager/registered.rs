@@ -3391,6 +3391,7 @@ impl<S: Store> Manager<S, Registered> {
                     &state.thread,
                     state.ts,
                     state.read,
+                    state.viewed,
                     &state.send_states,
                 )
                 .await
