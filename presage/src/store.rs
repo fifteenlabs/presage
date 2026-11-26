@@ -405,7 +405,8 @@ pub trait ContentsStore: Send + Sync {
     /// Restore per-message read / delivery state decoded from a linked-device
     /// backup `ChatItem` (the wire `Content` produced by the converter can't
     /// carry either). `read` is `Some` for incoming (was it read on the primary
-    /// device), `None` for outgoing. `send_states` is the per-recipient
+    /// device), `None` for outgoing. `viewed` is set for an incoming view-once
+    /// the primary already opened. `send_states` is the per-recipient
     /// `(recipient_service_id, status, updated_at_ms)` for outgoing (empty for
     /// incoming). Arrival time is not restored here — it is stamped as the row
     /// is written, by [`Self::save_message_received_at`]. Called once per
@@ -416,6 +417,7 @@ pub trait ContentsStore: Send + Sync {
         _thread: &Thread,
         _ts: u64,
         _read: Option<bool>,
+        _viewed: bool,
         _send_states: &[(String, BackupSendStatus, u64)],
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send {
         async { Ok(()) }
