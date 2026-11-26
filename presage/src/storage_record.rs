@@ -525,14 +525,11 @@ pub fn set_account_phone_number_sharing(
     } else {
         PHONE_NUMBER_SHARING_NOBODY
     };
-    set_record_field(
+    set_varint_field_or_remove(
         record,
         STORAGE_RECORD_ACCOUNT,
         ACCOUNT_RECORD_PHONE_NUMBER_SHARING_MODE,
-        Some(&encode_varint_field(
-            ACCOUNT_RECORD_PHONE_NUMBER_SHARING_MODE,
-            mode,
-        )),
+        mode,
     )
 }
 

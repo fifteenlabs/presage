@@ -289,7 +289,7 @@ impl<S: Store> Manager<S, Registered> {
     /// Returns the current identified websocket, or creates a new one
     ///
     /// A new one is created if the current websocket is closed, or if there is none yet.
-    pub(super) async fn identified_websocket(
+    async fn identified_websocket(
         &self,
         require_unused: bool,
     ) -> Result<SignalWebSocket<websocket::Identified>, Error<S::Error>> {
@@ -317,6 +317,15 @@ impl<S: Store> Manager<S, Registered> {
                 Ok(ws)
             }
         }
+    }
+
+    /// An [`AccountManager`] for our own account, on the identified websocket.
+    pub(super) async fn own_account_manager(&self) -> Result<AccountManager, Error<S::Error>> {
+        Ok(AccountManager::new(
+            self.identified_push_service(),
+            self.identified_websocket(false).await?,
+            Some(self.state.profile_key()),
+        ))
     }
 
     /// Returns the current unidentified websocket, or creates a new one

@@ -14,15 +14,14 @@
 //! by asking for it again.
 
 use libsignal_service::proto::sync_message;
-use libsignal_service::AccountManager;
 use tracing::info;
 
 use crate::model::account::{AccountSetting, AccountSettings};
 use crate::storage_record::{
     set_account_phone_number_sharing, set_account_read_receipts, set_account_typing_indicators,
-    set_account_unlisted_phone_number, StorageRecordEditError,
+    set_account_unlisted_phone_number,
 };
-use crate::store::{StorageRecordKey, Store};
+use crate::store::Store;
 use crate::{Error, Manager};
 
 use super::Registered;
@@ -122,26 +121,5 @@ impl<S: Store> Manager<S, Registered> {
             .set_phone_number_discoverability(settings.discoverable_by_phone_number)
             .await?;
         Ok(true)
-    }
-
-    /// Publish `edit` of the account record, or nothing when it changes no
-    /// byte.
-    async fn edit_account_record(
-        &mut self,
-        edit: impl Fn(&[u8]) -> Result<Vec<u8>, StorageRecordEditError>,
-    ) -> Result<(), Error<S::Error>> {
-        self.update_storage_record(&StorageRecordKey::Account, |record| {
-            let edited = edit(record)?;
-            Ok((edited != record).then_some(edited))
-        })
-        .await
-    }
-
-    async fn own_account_manager(&self) -> Result<AccountManager, Error<S::Error>> {
-        Ok(AccountManager::new(
-            self.identified_push_service(),
-            self.identified_websocket(false).await?,
-            Some(self.state.profile_key()),
-        ))
     }
 }

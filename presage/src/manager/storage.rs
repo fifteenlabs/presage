@@ -137,8 +137,22 @@ impl<S: Store> Manager<S, Registered> {
             return Ok(());
         }
         let avatar_url_path = profile.avatar.as_deref().unwrap_or("");
+        self.edit_account_record(|record| {
+            set_account_profile(record, given_name, family_name, avatar_url_path)
+        })
+        .await
+    }
+
+    /// Publish `edit` of the account record, or nothing when it changes no
+    /// byte.
+    ///
+    /// Callers must hold the storage-service lock.
+    pub(super) async fn edit_account_record(
+        &mut self,
+        edit: impl Fn(&[u8]) -> Result<Vec<u8>, StorageRecordEditError>,
+    ) -> Result<(), Error<S::Error>> {
         self.update_storage_record(&StorageRecordKey::Account, |record| {
-            let edited = set_account_profile(record, given_name, family_name, avatar_url_path)?;
+            let edited = edit(record)?;
             Ok((edited != record).then_some(edited))
         })
         .await
