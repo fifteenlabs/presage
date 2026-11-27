@@ -65,6 +65,10 @@ pub enum Error<S: std::error::Error> {
     ChatFolderInvalidName,
     #[error("no chat folder with that identifier")]
     ChatFolderUnknown,
+    /// Every Signal client keeps an account that shows its number to everybody
+    /// findable by it, and offers no way to hide one without the other.
+    #[error("an account that shares its phone number with everybody stays findable by it")]
+    UnlistedWhileSharingPhoneNumber,
     /// The "All chats" folder is structural: every client expects exactly one.
     #[error("the all-chats folder cannot be deleted")]
     ChatFolderUndeletable,

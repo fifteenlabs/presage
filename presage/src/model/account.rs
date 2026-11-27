@@ -1,11 +1,12 @@
-//! Account-wide chat state from the storage service's `AccountRecord`.
+//! Account-wide state from the storage service's `AccountRecord`.
 //!
-//! The record holds far more than this — profile, privacy, payments, backup
-//! settings — and presage models none of it. [`AccountChatState`] is only the
-//! part that decides how the chat list looks: which chats are pinned, whether
-//! Note to Self is archived, and whether a muted chat stays archived when a
-//! message arrives. Publishing edits those fields in the stored record bytes
-//! (see [`crate::storage_record`]); the record is never rebuilt from this.
+//! The record holds far more than presage models: profile, payments, backup
+//! settings and more. Two parts are read here. [`AccountChatState`] decides
+//! how the chat list looks: which chats are pinned, whether Note to Self is
+//! archived, and whether a muted chat stays archived when a message arrives.
+//! [`AccountSettings`] is the privacy a linked device can honour and change.
+//! Publishing edits those fields in the stored record bytes (see
+//! [`crate::storage_record`]); the record is never rebuilt from either.
 
 use libsignal_service::prelude::ProtobufMessage;
 use libsignal_service::proto::account_record::{
@@ -14,8 +15,9 @@ use libsignal_service::proto::account_record::{
 use libsignal_service::protocol::ServiceId;
 
 use crate::storage_record::{
-    account_keep_muted_chats_archived, account_note_to_self_archived, account_pinned_conversations,
-    StorageRecordEditError,
+    account_keep_muted_chats_archived, account_note_to_self_archived, account_phone_number_sharing,
+    account_pinned_conversations, account_read_receipts, account_story_view_receipts,
+    account_typing_indicators, account_unlisted_phone_number, StorageRecordEditError,
 };
 use crate::store::Thread;
 
@@ -129,6 +131,60 @@ impl AccountChatState {
     }
 }
 
+/// The account's privacy settings that every device shares, as the
+/// `AccountRecord` holds them.
+///
+/// Only settings a linked device can both honour and change. The registration
+/// lock and sealed sender from anyone also live on the account, but only the
+/// primary may set them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountSettings {
+    /// `readReceipts`. Off, no read or viewed receipt is sent, and none
+    /// received is shown.
+    pub read_receipts: bool,
+    /// `typingIndicators`. Off, no typing indicator is sent, and none
+    /// received is shown.
+    pub typing_indicators: bool,
+    /// "Who can see my number" is everybody: `phoneNumberSharingMode` is
+    /// `EVERYBODY`. Contacts' clients read our profile's copy of this flag.
+    pub phone_number_sharing: bool,
+    /// "Who can find me by number" is everybody: `unlistedPhoneNumber` is
+    /// unset. The chat server keeps its own copy, which is what the
+    /// contact-discovery service consults.
+    pub discoverable_by_phone_number: bool,
+    /// Whether viewing a story sends its author a viewed receipt. The story
+    /// settings' own `storyViewReceiptsEnabled` when set, and read receipts
+    /// otherwise, as Signal-Desktop's `areStoryViewReceiptsEnabled` resolves
+    /// it. Read only: the story settings are not offered here.
+    pub story_view_receipts: bool,
+}
+
+impl AccountSettings {
+    /// What an encoded `StorageRecord { account }` says.
+    pub fn from_record(record: &[u8]) -> Result<Self, StorageRecordEditError> {
+        let read_receipts = account_read_receipts(record)?;
+        Ok(Self {
+            read_receipts,
+            typing_indicators: account_typing_indicators(record)?,
+            phone_number_sharing: account_phone_number_sharing(record)?,
+            discoverable_by_phone_number: !account_unlisted_phone_number(record)?,
+            story_view_receipts: account_story_view_receipts(record)?.unwrap_or(read_receipts),
+        })
+    }
+}
+
+/// One change to [`AccountSettings`], for
+/// [`Manager::update_account_setting`](crate::Manager::update_account_setting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountSetting {
+    ReadReceipts(bool),
+    TypingIndicators(bool),
+    /// Share the number with everybody (`true`) or nobody.
+    PhoneNumberSharing(bool),
+    /// Let everybody (`true`) or nobody find the account by its number.
+    DiscoverableByPhoneNumber(bool),
+}
+
 #[cfg(test)]
 mod tests {
     use libsignal_service::prelude::Uuid;
@@ -206,5 +262,50 @@ mod tests {
                 PinnedConversation::for_thread(&Thread::Group([3u8; 32]))
             ]
         );
+    }
+
+    #[test]
+    fn an_account_that_never_chose_is_findable_and_shares_nothing() {
+        use libsignal_service::proto::{storage_record::Record, AccountRecord, StorageRecord};
+
+        let record = StorageRecord {
+            record: Some(Record::Account(AccountRecord::default())),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            AccountSettings::from_record(&record).unwrap(),
+            AccountSettings {
+                read_receipts: false,
+                typing_indicators: false,
+                phone_number_sharing: false,
+                discoverable_by_phone_number: true,
+                story_view_receipts: false,
+            }
+        );
+    }
+
+    #[test]
+    fn story_view_receipts_follow_read_receipts_until_set() {
+        use libsignal_service::proto::{
+            storage_record::Record, AccountRecord, OptionalBool, StorageRecord,
+        };
+
+        let settings = |read_receipts, story: OptionalBool| {
+            let record = StorageRecord {
+                record: Some(Record::Account(AccountRecord {
+                    read_receipts,
+                    story_view_receipts_enabled: story.into(),
+                    ..Default::default()
+                })),
+            }
+            .encode_to_vec();
+            AccountSettings::from_record(&record)
+                .unwrap()
+                .story_view_receipts
+        };
+        assert!(settings(true, OptionalBool::Unset));
+        assert!(!settings(false, OptionalBool::Unset));
+        assert!(settings(false, OptionalBool::Enabled));
+        assert!(!settings(true, OptionalBool::Disabled));
     }
 }
